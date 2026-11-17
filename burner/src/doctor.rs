@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::{self, Config};
+use crate::net;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum Level {
@@ -44,7 +45,7 @@ pub fn run(cfg: &Config) -> bool {
 
     kvm(&mut r);
     cgroups(&mut r);
-    tools(&mut r, root);
+    tools(&mut r);
     network(&mut r, cfg);
     memory(&mut r, cfg);
     disk(&mut r, cfg);
@@ -120,7 +121,7 @@ fn cgroups(r: &mut Report) {
     }
 }
 
-fn tools(r: &mut Report, root: bool) {
+fn tools(r: &mut Report) {
     for t in ["ip", "nft", "mkfs.ext4"] {
         if which(t) {
             r.line(Level::Ok, t, "found");
@@ -133,17 +134,7 @@ fn tools(r: &mut Report, root: bool) {
             r.line(Level::Fail, t, format!("not found, install {pkg}"));
         }
     }
-    // a host firewall that drops forwarded traffic needs one allow rule for the VM subnet
-    if root
-        && which("ufw")
-        && run_ok("ufw", &["status"]).is_some_and(|o| o.contains("Status: active"))
-    {
-        r.line(
-            Level::Warn,
-            "firewall",
-            "ufw is active: it drops routed traffic, burner adds its own allow rule on install",
-        );
-    } else if which("firewall-cmd")
+    if which("firewall-cmd")
         && run_ok("firewall-cmd", &["--state"]).is_some_and(|o| o.trim() == "running")
     {
         r.line(
@@ -182,7 +173,7 @@ fn network(r: &mut Report, cfg: &Config) {
     let Ok(subnet) = cfg.subnet() else { return };
     let clashes = routes()
         .into_iter()
-        .filter(|(dst, _)| dst.1 > 0 && config::overlaps(subnet, *dst))
+        .filter(|(dst, dev)| dst.1 > 0 && !net::is_tap(dev) && config::overlaps(subnet, *dst))
         .map(|(dst, dev)| format!("{}/{} on {dev}", dst.0, dst.1))
         .collect::<Vec<_>>();
     if clashes.is_empty() {
@@ -197,6 +188,21 @@ fn network(r: &mut Report, cfg: &Config) {
                 clashes.join(", ")
             ),
         );
+    }
+
+    // ufw's forward policy drops VM traffic unless it has a rule for the subnet
+    if is_root() {
+        match net::ufw_rule_missing(cfg) {
+            Ok(Some(cmd)) => r.line(
+                Level::Warn,
+                "firewall",
+                format!("ufw is active and has no rule for burner: {cmd}"),
+            ),
+            Ok(None) if which("ufw") => {
+                r.line(Level::Ok, "firewall", "ufw allows the VM subnet out")
+            }
+            _ => {}
+        }
     }
 
     if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() == "1") {

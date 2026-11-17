@@ -308,6 +308,11 @@ pub fn tap_down(cfg: &Config, i: u32) {
     }
 }
 
+pub fn is_tap(dev: &str) -> bool {
+    dev.strip_prefix(TAP_PREFIX)
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// tap indexes that exist on the host right now
 pub fn taps_present() -> Vec<u32> {
     std::fs::read_dir("/sys/class/net")
