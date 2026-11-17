@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PATH: &str = "/etc/burner/config.toml";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub paths: Paths,
@@ -47,16 +47,6 @@ pub struct Limits {
     pub ttl_shell_secs: u32,
     pub max_vms: u32,
     pub total_mem_mib: u32,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            paths: Paths::default(),
-            net: Net::default(),
-            limits: Limits::default(),
-        }
-    }
 }
 
 impl Default for Paths {
