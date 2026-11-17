@@ -1,0 +1,134 @@
+#!/bin/sh
+# burner guest init (pid 1). everything here runs inside the VM.
+# drives: vda base (ro), vdb scratch ext4 (rw), vdc job tar (raw, ro), vdd result tar (raw, rw)
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+halt() {
+    sync
+    if command -v busybox >/dev/null 2>&1; then busybox reboot -f; fi
+    reboot -f 2>/dev/null
+    sleep 3; echo b > /proc/sysrq-trigger
+}
+
+if [ "${1:-}" != stage2 ]; then
+    mount -t proc proc /proc
+    mount -t devtmpfs dev /dev 2>/dev/null
+    if ! mount -t ext4 -o noatime /dev/vdb /overlay; then
+        echo "burner-init: scratch mount failed" > /dev/console; halt
+    fi
+    mkdir -p /overlay/upper /overlay/work
+    mount -t overlay overlay -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /mnt || {
+        echo "burner-init: overlay failed" > /dev/console; halt; }
+    mkdir -p /mnt/rom
+    # toolchains: one read-only drive each (vde, vdf, ...), with a writable overlay on scratch
+    tcs=$(sed -n 's/.*burner\.tc=\([a-z0-9,]*\).*/\1/p' /proc/cmdline)
+    set -- e f g h
+    for name in $(echo "$tcs" | tr ',' ' '); do
+        dev=/dev/vd$1; shift
+        mkdir -p "/overlay/tc-ro/$name" "/overlay/tc/$name/up" "/overlay/tc/$name/wk" "/mnt/opt/tc/$name"
+        mount -t ext4 -o ro "$dev" "/overlay/tc-ro/$name" &&
+        mount -t overlay overlay -o "lowerdir=/overlay/tc-ro/$name,upperdir=/overlay/tc/$name/up,workdir=/overlay/tc/$name/wk" \
+            "/mnt/opt/tc/$name" || echo "burner-init: toolchain $name failed to mount" > /dev/console
+    done
+    cd /mnt || halt
+    pivot_root . rom || { echo "burner-init: pivot failed" > /dev/console; halt; }
+    exec /sbin/burner-init stage2
+fi
+
+# stage 2: on the overlay root
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sys /sys 2>/dev/null
+mount -t devtmpfs dev /dev 2>/dev/null
+exec < /dev/console > /dev/console 2>&1
+mkdir -p /dev/pts /tmp /run; mount -t devpts devpts /dev/pts 2>/dev/null
+mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null
+umount -l /rom 2>/dev/null
+hostname burner 2>/dev/null
+dns=$(sed -n 's/.*burner\.dns=\([0-9.,]*\).*/\1/p' /proc/cmdline)
+if [ -n "$dns" ]; then
+    rm -f /etc/resolv.conf
+    for ip in $(echo "$dns" | tr ',' ' '); do echo "nameserver $ip"; done > /etc/resolv.conf
+fi
+
+# toolchain environment, for jobs and login shells
+: > /etc/profile.d/burner-tc.sh 2>/dev/null || { mkdir -p /etc/profile.d; : > /etc/profile.d/burner-tc.sh; }
+for d in /opt/tc/*/; do
+    [ -f "$d/env" ] && cat "$d/env" >> /etc/profile.d/burner-tc.sh
+done
+# shellcheck disable=SC1091
+. /etc/profile.d/burner-tc.sh
+
+if grep -q 'burner\.shell=1' /proc/cmdline; then
+    # interactive: a login shell on the serial console, the VM ends when it exits
+    exec < /dev/ttyS0 > /dev/ttyS0 2>&1
+    tty=$(sed -n 's/.*burner\.tty=\([0-9]*x[0-9]*\).*/\1/p' /proc/cmdline)
+    [ -n "$tty" ] && stty rows "${tty%x*}" cols "${tty#*x}" 2>/dev/null
+    term=$(sed -n 's/.*burner\.term=\([a-z0-9.+-]*\).*/\1/p' /proc/cmdline)
+    export TERM="${term:-xterm}" HOME=/root
+    cd /root 2>/dev/null || cd /
+    sh=/bin/sh; [ -x /bin/bash ] && sh=/bin/bash
+    # shellcheck disable=SC1091
+    name=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
+    tcs=""; for d in /opt/tc/*/; do [ -d "$d" ] && tcs="$tcs $(basename "$d")"; done
+    printf '\nburner: fresh %s VM%s. nothing is kept when you exit.\n\n' "$name" "${tcs:+, toolchains:$tcs}"
+    if command -v setsid >/dev/null 2>&1; then setsid -c "$sh" -l; else "$sh" -l; fi
+    dmesg -n 1 2>/dev/null
+    halt
+fi
+
+token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
+mkdir -p /job /work /out /result
+# rc and the log live in their own small tmpfs, so a full scratch disk can't lose them
+mount -t tmpfs -o size=24m,mode=0700 tmpfs /result
+LOG=/var/tmp/burner-log.txt
+
+# raw console: no \n -> \r\n, so the live bytes match the log exactly
+stty -opost 2>/dev/null
+
+fail() {   # sandbox-side failure before the command ran
+    echo "BURNER-$token-BEGIN"; echo "burner: $1"; echo "BURNER-$token-END"
+    echo "burner: $1" > /result/log.txt
+    echo 125 > /result/rc
+}
+
+if ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
+    fail "job disk unreadable"
+elif [ -f /job/input.tar ] && ! tar -x -C /work -f /job/input.tar 2>/result/untar.err; then
+    fail "input tar did not unpack: $(head -c 300 /result/untar.err)"
+else
+    rm -f /job/input.tar /result/untar.err
+    stdin=/dev/null; [ -f /job/stdin ] && stdin=/job/stdin
+    cd /work || cd /
+    export HOME=/root TERM=dumb LANG=C.UTF-8 BURNER=1
+    echo "BURNER-$token-BEGIN"
+    # the serial console is slow (nested virt), so only the first 64K goes out live.
+    # the full log goes back on the result disk and the host prints the rest.
+    { /bin/sh /job/run.sh < "$stdin"; echo $? > /result/rc; } 2>&1 \
+        | tee "$LOG" | { head -c 65536; cat > /dev/null; }
+    total=$(wc -c < "$LOG" 2>/dev/null || echo 0)
+    live=$(( total < 65536 ? total : 65536 ))
+    last=""
+    [ "$live" -gt 0 ] && last=$(dd if="$LOG" bs=1 skip=$((live - 1)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$live" -gt 0 ] && [ "$last" != 0a ]; then
+        printf '\nBURNER-%s-ENDN\n' "$token"     # N: the newline before the marker is ours, not output
+    else
+        printf 'BURNER-%s-END\n' "$token"
+    fi
+    if [ "$total" -gt 16777216 ]; then
+        tail -c 16777216 "$LOG" > /result/log.txt
+        echo $((total - 16777216)) > /result/log_skipped
+    else
+        cat "$LOG" > /result/log.txt 2>/dev/null
+    fi
+    rm -f "$LOG"
+    [ -f /result/rc ] || echo 125 > /result/rc
+fi
+
+cd / || halt
+# result + /out straight onto the raw result disk, no copies on scratch
+if ! tar -c -f /dev/vdd result out 2>/dev/null; then
+    echo "result over the 256M cap, /out dropped" > /result/error
+    tar -c -f /dev/vdd result 2>/dev/null
+fi
+halt
