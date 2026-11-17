@@ -1,0 +1,13 @@
+[Unit]
+Description=burner VM network (nft table, forwarding)
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/burner net up
+ExecStop=/usr/local/bin/burner net down
+
+[Install]
+WantedBy=multi-user.target
