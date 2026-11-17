@@ -1,0 +1,349 @@
+//! `burner doctor`: can this machine run burner, and if not, what to fix.
+
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::process::Command;
+
+use crate::config::{self, Config};
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+enum Level {
+    Ok,
+    Warn,
+    Fail,
+}
+
+struct Report {
+    worst: Level,
+}
+
+impl Report {
+    fn line(&mut self, level: Level, what: &str, detail: impl AsRef<str>) {
+        let tag = match level {
+            Level::Ok => "ok  ",
+            Level::Warn => "warn",
+            Level::Fail => "FAIL",
+        };
+        println!("{tag}  {what:<12} {}", detail.as_ref());
+        self.worst = self.worst.max(level);
+    }
+}
+
+/// returns true when nothing failed
+pub fn run(cfg: &Config) -> bool {
+    let mut r = Report { worst: Level::Ok };
+    let root = is_root();
+    if !root {
+        r.line(
+            Level::Warn,
+            "user",
+            "not root, some checks are skipped (run with sudo for all of them)",
+        );
+    }
+
+    kvm(&mut r);
+    cgroups(&mut r);
+    tools(&mut r, root);
+    network(&mut r, cfg);
+    memory(&mut r, cfg);
+    disk(&mut r, cfg);
+    install(&mut r, cfg);
+
+    println!();
+    match r.worst {
+        Level::Ok => println!("all good"),
+        Level::Warn => println!("works, see the warnings above"),
+        Level::Fail => println!("not ready, fix the FAIL lines first"),
+    }
+    r.worst != Level::Fail
+}
+
+fn is_root() -> bool {
+    fs::metadata("/proc/self")
+        .map(|m| m.uid() == 0)
+        .unwrap_or(false)
+}
+
+fn kvm(r: &mut Report) {
+    match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+    {
+        Ok(_) => r.line(Level::Ok, "kvm", "/dev/kvm usable"),
+        Err(e) if Path::new("/dev/kvm").exists() => r.line(
+            Level::Fail,
+            "kvm",
+            format!("/dev/kvm exists but can't be opened ({e}), run as root"),
+        ),
+        Err(_) => r.line(
+            Level::Fail,
+            "kvm",
+            "no /dev/kvm. enable virtualization in the bios, or nested virt if this is a VM",
+        ),
+    }
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    if cpuinfo
+        .lines()
+        .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"))
+    {
+        r.line(
+            Level::Warn,
+            "nested",
+            "this machine is itself a VM: VMs run nested, slower and at the host's mercy",
+        );
+    }
+}
+
+fn cgroups(r: &mut Report) {
+    let Ok(ctrls) = fs::read_to_string("/sys/fs/cgroup/cgroup.controllers") else {
+        r.line(
+            Level::Fail,
+            "cgroups",
+            "cgroup v2 is not mounted at /sys/fs/cgroup (v1-only systems aren't supported)",
+        );
+        return;
+    };
+    let missing: Vec<_> = ["cpu", "memory", "pids"]
+        .into_iter()
+        .filter(|c| !ctrls.split_whitespace().any(|x| x == *c))
+        .collect();
+    if missing.is_empty() {
+        r.line(Level::Ok, "cgroups", "v2 with cpu, memory and pids");
+    } else {
+        r.line(
+            Level::Fail,
+            "cgroups",
+            format!("v2 is missing controllers: {}", missing.join(", ")),
+        );
+    }
+}
+
+fn tools(r: &mut Report, root: bool) {
+    for t in ["ip", "nft", "mkfs.ext4"] {
+        if which(t) {
+            r.line(Level::Ok, t, "found");
+        } else {
+            let pkg = match t {
+                "ip" => "iproute2",
+                "nft" => "nftables",
+                _ => "e2fsprogs",
+            };
+            r.line(Level::Fail, t, format!("not found, install {pkg}"));
+        }
+    }
+    // a host firewall that drops forwarded traffic needs one allow rule for the VM subnet
+    if root
+        && which("ufw")
+        && run_ok("ufw", &["status"]).is_some_and(|o| o.contains("Status: active"))
+    {
+        r.line(
+            Level::Warn,
+            "firewall",
+            "ufw is active: it drops routed traffic, burner adds its own allow rule on install",
+        );
+    } else if which("firewall-cmd")
+        && run_ok("firewall-cmd", &["--state"]).is_some_and(|o| o.trim() == "running")
+    {
+        r.line(
+            Level::Warn,
+            "firewall",
+            "firewalld is running: VM traffic needs its zone set up (not automated yet)",
+        );
+    }
+}
+
+fn network(r: &mut Report, cfg: &Config) {
+    let uplink = match cfg.uplink() {
+        Ok(u) => u,
+        Err(e) => {
+            r.line(Level::Fail, "uplink", format!("{e:#}"));
+            return;
+        }
+    };
+    match config::iface_addrs(&uplink) {
+        Ok(a) if !a.is_empty() => {
+            let list: Vec<_> = a.iter().map(|x| x.to_string()).collect();
+            r.line(
+                Level::Ok,
+                "uplink",
+                format!("{uplink} ({})", list.join(", ")),
+            )
+        }
+        Ok(_) => r.line(
+            Level::Fail,
+            "uplink",
+            format!("{uplink} has no ipv4 address"),
+        ),
+        Err(e) => r.line(Level::Fail, "uplink", format!("{uplink}: {e:#}")),
+    }
+
+    let Ok(subnet) = cfg.subnet() else { return };
+    let clashes = routes()
+        .into_iter()
+        .filter(|(dst, _)| dst.1 > 0 && config::overlaps(subnet, *dst))
+        .map(|(dst, dev)| format!("{}/{} on {dev}", dst.0, dst.1))
+        .collect::<Vec<_>>();
+    if clashes.is_empty() {
+        r.line(Level::Ok, "subnet", format!("{} is free", cfg.net.subnet));
+    } else {
+        r.line(
+            Level::Fail,
+            "subnet",
+            format!(
+                "{} overlaps {}, pick another net.subnet",
+                cfg.net.subnet,
+                clashes.join(", ")
+            ),
+        );
+    }
+
+    if fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() == "1") {
+        r.line(Level::Ok, "forwarding", "ipv4 forwarding on");
+    } else {
+        r.line(
+            Level::Warn,
+            "forwarding",
+            "ipv4 forwarding off, burner turns it on when it sets up the network",
+        );
+    }
+}
+
+/// (destination, device) for every ipv4 route
+fn routes() -> Vec<((std::net::Ipv4Addr, u8), String)> {
+    let Some(out) = run_ok("ip", &["-j", "-4", "route", "show", "table", "all"]) else {
+        return Vec::new();
+    };
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|rt| {
+            let dst = rt["dst"].as_str()?;
+            let dev = rt["dev"].as_str().unwrap_or("-").to_string();
+            let cidr = if dst.contains('/') {
+                dst.to_string()
+            } else {
+                format!("{dst}/32")
+            };
+            config::parse_cidr(&cidr).ok().map(|c| (c, dev))
+        })
+        .collect()
+}
+
+fn memory(r: &mut Report, cfg: &Config) {
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| {
+        meminfo
+            .lines()
+            .find(|l| l.starts_with(name))
+            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    };
+    let (Some(total), Some(avail)) = (field("MemTotal:"), field("MemAvailable:")) else {
+        r.line(Level::Warn, "memory", "couldn't read /proc/meminfo");
+        return;
+    };
+    let want = u64::from(cfg.limits.total_mem_mib);
+    let level = if avail >= want + 512 {
+        Level::Ok
+    } else {
+        Level::Warn
+    };
+    r.line(
+        level,
+        "memory",
+        format!("{avail} MiB free of {total}, VMs may use up to {want} (limits.total_mem_mib)"),
+    );
+}
+
+fn disk(r: &mut Report, cfg: &Config) {
+    let dir = existing_parent(&cfg.paths.root);
+    let Some(out) = run_ok("df", &["-Pm", &dir]) else {
+        return;
+    };
+    let free = out
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().nth(3)?.parse::<u64>().ok());
+    // images + one full-size scratch disk per possible VM
+    let want = 2048 + u64::from(cfg.limits.disk_gib) * 1024 * u64::from(cfg.limits.max_vms);
+    match free {
+        Some(f) if f >= want => r.line(Level::Ok, "disk", format!("{f} MiB free on {dir}")),
+        Some(f) => r.line(
+            Level::Warn,
+            "disk",
+            format!("{f} MiB free on {dir}, full-size VMs may need {want}"),
+        ),
+        None => r.line(
+            Level::Warn,
+            "disk",
+            format!("couldn't read free space on {dir}"),
+        ),
+    }
+}
+
+fn install(r: &mut Report, cfg: &Config) {
+    let root = &cfg.paths.root;
+    for (what, rel) in [
+        ("firecracker", "bin/firecracker"),
+        ("jailer", "bin/jailer"),
+        ("kernel", "kernel/vmlinux"),
+    ] {
+        let p = root.join(rel);
+        if p.exists() {
+            let ver = if rel.starts_with("bin/") {
+                run_ok(&p.to_string_lossy(), &["--version"])
+            } else {
+                None
+            };
+            let detail = ver
+                .and_then(|v| v.lines().next().map(str::to_string))
+                .unwrap_or_else(|| p.display().to_string());
+            r.line(Level::Ok, what, detail);
+        } else {
+            r.line(
+                Level::Warn,
+                what,
+                format!("{} not installed yet", p.display()),
+            );
+        }
+    }
+    let images = fs::read_dir(root.join("images"))
+        .map(|d| {
+            d.filter_map(|e| e.ok())
+                .filter(|e| e.path().join("rootfs.ext4").exists())
+                .count()
+        })
+        .unwrap_or(0);
+    if images > 0 {
+        r.line(Level::Ok, "images", format!("{images} installed"));
+    } else {
+        r.line(Level::Warn, "images", "none installed yet");
+    }
+}
+
+fn existing_parent(p: &Path) -> String {
+    p.ancestors()
+        .find(|a| a.exists())
+        .unwrap_or(Path::new("/"))
+        .display()
+        .to_string()
+}
+
+fn which(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
+        .unwrap_or(false)
+        || ["/usr/sbin", "/sbin"]
+            .iter()
+            .any(|d| Path::new(d).join(cmd).is_file())
+}
+
+fn run_ok(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}

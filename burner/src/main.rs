@@ -1,4 +1,5 @@
 mod config;
+mod doctor;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,6 +23,8 @@ struct Cli {
 enum Cmd {
     /// print the config burner would use, defaults filled in
     Config,
+    /// check that this machine can run burner, and say what to fix
+    Doctor,
 }
 
 fn main() -> ExitCode {
@@ -42,5 +45,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             print!("{}", toml::to_string_pretty(&cfg)?);
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Doctor => Ok(if doctor::run(&cfg) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }),
     }
 }
