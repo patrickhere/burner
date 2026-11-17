@@ -73,7 +73,7 @@ pub struct RunArgs {
     #[arg(long, default_value = "none")]
     net: String,
     /// one argument runs as a shell string; several are quoted as they are
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
     #[arg(skip)]
     shell: bool,
