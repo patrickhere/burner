@@ -2,6 +2,7 @@ mod cgroup;
 mod config;
 mod doctor;
 mod ledger;
+mod net;
 mod output;
 mod result;
 mod run;
@@ -33,6 +34,13 @@ enum Cmd {
     Doctor,
     /// run one command in a fresh VM and hand back its output and exit code
     Run(run::RunArgs),
+    /// a root shell in a fresh VM, gone when you exit
+    Shell(run::ShellArgs),
+    /// set up or remove the VM network (nft table, forwarding)
+    Net {
+        #[arg(value_parser = ["up", "down", "show"])]
+        action: String,
+    },
     /// list running VMs
     Ls {
         #[arg(long)]
@@ -76,6 +84,23 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ExitCode::from(1)
         }),
         Cmd::Run(a) => Ok(run::main(&cfg, a)),
+        Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
+        Cmd::Net { action } => match action.as_str() {
+            "show" => {
+                print!("{}", net::ruleset(&cfg)?);
+                Ok(ExitCode::SUCCESS)
+            }
+            "down" => {
+                net::down();
+                Ok(ExitCode::SUCCESS)
+            }
+            _ => {
+                for note in net::up(&cfg)? {
+                    eprintln!("burner: {note}");
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Cmd::Ls { json } => run::ls(&cfg, json),
         Cmd::Kill { id } => run::kill(&cfg, &id),
         Cmd::Images => {

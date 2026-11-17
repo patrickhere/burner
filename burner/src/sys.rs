@@ -130,3 +130,30 @@ pub fn user_ids(name: &str) -> Option<(u32, u32)> {
         (f.len() > 3 && f[0] == name).then(|| Some((f[2].parse().ok()?, f[3].parse().ok()?)))?
     })
 }
+
+pub fn term_size(fd: i32) -> Option<(u16, u16)> {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ fills a winsize
+    let ok = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0;
+    (ok && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
+}
+
+pub fn save_tty() -> Option<libc::termios> {
+    // SAFETY: zeroed termios is a valid out-parameter
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: fd 0 and a valid termios pointer
+    (unsafe { libc::tcgetattr(0, &mut t) } == 0).then_some(t)
+}
+
+/// firecracker puts the terminal in raw mode; put it back even when it was killed
+pub fn restore_tty(t: Option<&libc::termios>) {
+    if let Some(t) = t {
+        // SAFETY: fd 0 and a termios we read earlier
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
+    }
+}

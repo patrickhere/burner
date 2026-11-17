@@ -23,6 +23,7 @@ use serde_json::json;
 use crate::cgroup;
 use crate::config::Config;
 use crate::ledger::{Ident, Ledger, Vm, valid_id};
+use crate::net;
 use crate::output::{Dest, Out, escape_controls};
 use crate::result;
 use crate::sys;
@@ -68,9 +69,64 @@ pub struct RunArgs {
     /// a label for burner ls
     #[arg(long)]
     tag: Option<String>,
+    /// network: none, web (http/https and dns) or open (any port but mail). never the LAN
+    #[arg(long, default_value = "none")]
+    net: String,
     /// one argument runs as a shell string; several are quoted as they are
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
     cmd: Vec<String>,
+    #[arg(skip)]
+    shell: bool,
+}
+
+#[derive(Args)]
+pub struct ShellArgs {
+    /// image to boot, default ubuntu if it's installed, else alpine
+    spec: Option<String>,
+    #[arg(long)]
+    cpus: Option<u32>,
+    /// memory in MiB
+    #[arg(long)]
+    mem: Option<u32>,
+    /// scratch disk in GiB
+    #[arg(long)]
+    disk: Option<u32>,
+    /// time limit: 30m, 1h
+    #[arg(long)]
+    ttl: Option<String>,
+    /// network: none, web or open
+    #[arg(long, default_value = "web")]
+    net: String,
+    #[arg(long)]
+    tag: Option<String>,
+}
+
+pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
+    if !(sys::is_tty(0) && sys::is_tty(1)) {
+        eprintln!("burner: burner shell needs a terminal (over ssh: ssh -t)");
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let img = a.spec.unwrap_or_else(|| {
+        if images(cfg).iter().any(|i| i == "ubuntu") {
+            "ubuntu".into()
+        } else {
+            "alpine".into()
+        }
+    });
+    let ra = RunArgs {
+        img,
+        cpus: a.cpus,
+        mem: a.mem,
+        disk: a.disk,
+        ttl: a.ttl,
+        input: Input::None,
+        result: None,
+        tag: a.tag,
+        net: a.net,
+        cmd: vec!["true".into()],
+        shell: true,
+    };
+    main(cfg, ra)
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -218,6 +274,8 @@ struct Plan {
     ttl: u32,
     tag: String,
     cmd: String,
+    net: net::Mode,
+    shell: bool,
 }
 
 fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
@@ -242,10 +300,18 @@ fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     let vcpus = pick("cpus", a.cpus, d.vcpus, 1, 1, l.vcpus)?;
     let mem_mib = pick("mem", a.mem, d.mem_mib, 512, 128, l.mem_mib)?;
     let disk_gib = pick("disk", a.disk, d.disk_gib, 2, 1, l.disk_gib)?;
-    let ttl = match &a.ttl {
-        Some(t) => parse_ttl(t, l.ttl_secs)?,
-        None => d.ttl_secs.unwrap_or(600).clamp(10, l.ttl_secs),
+    let max_ttl = if a.shell {
+        l.ttl_shell_secs
+    } else {
+        l.ttl_secs
     };
+    let ttl = match &a.ttl {
+        Some(t) => parse_ttl(t, max_ttl)?,
+        None if a.shell => 3600.min(max_ttl),
+        None => d.ttl_secs.unwrap_or(600).clamp(10, max_ttl),
+    };
+    let net = net::Mode::parse(&a.net)
+        .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net)))?;
     let tag = a.tag.clone().unwrap_or_else(|| "-".into());
     if tag != "-" && !valid_name(&tag) {
         return Err(usage(
@@ -270,6 +336,8 @@ fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         ttl,
         tag,
         cmd,
+        net,
+        shell: a.shell,
     })
 }
 
@@ -351,7 +419,7 @@ fn run_vm(
     let job = run_dir.join("job.tar");
     build_job(&job, &p.cmd, a.input, spool.as_deref())?;
 
-    take_slot(cfg, p, id)?;
+    let net_slot = take_slot(cfg, p, id)?;
     *held = Some(());
 
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
@@ -384,17 +452,50 @@ fn run_vm(
     }
 
     let token = sys::random_hex(8)?;
+    let mut boot = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token}"
+    );
+    let mut ifaces = Vec::new();
+    if let Some(i) = net_slot {
+        let s = net::tap_up(cfg, i, p.net, uid, gid)?;
+        let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
+        ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
+                           "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
+        let dns: Vec<String> = cfg.net.resolvers.iter().map(|r| r.to_string()).collect();
+        boot += &format!(
+            " ip={}::{}:255.255.255.252:burner:eth0:off burner.dns={}",
+            s.guest,
+            s.host,
+            dns.join(",")
+        );
+    }
+    let saved_tty = p.shell.then(sys::save_tty).flatten();
+    if p.shell {
+        let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
+        let term = std::env::var("TERM").ok().filter(|t| {
+            !t.is_empty()
+                && t.len() <= 32
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+        });
+        boot += &format!(
+            " burner.shell=1 burner.tty={}x{} burner.term={}",
+            rows.min(500),
+            cols.min(1000),
+            term.as_deref().unwrap_or("xterm")
+        );
+    }
     let drive = |id: &str, path: &str, ro: bool, mbps: u64, ops: u64| {
         json!({"drive_id": id, "path_on_host": path, "is_root_device": id == "rootfs", "is_read_only": ro,
                "rate_limiter": {"bandwidth": {"size": mbps << 20, "refill_time": 1000},
                                 "ops": {"size": ops, "refill_time": 1000}}})
     };
     let vmcfg = json!({
-        "boot-source": {"kernel_image_path": "vmlinux",
-            "boot_args": format!("console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token}")},
+        "boot-source": {"kernel_image_path": "vmlinux", "boot_args": boot},
         "drives": [drive("rootfs", "rootfs.ext4", true, 200, 5000), drive("scratch", "scratch.ext4", false, 100, 3000),
                    drive("job", "job.tar", true, 200, 3000), drive("result", "result.raw", false, 100, 3000)],
         "machine-config": {"vcpu_count": p.vcpus, "mem_size_mib": p.mem_mib},
+        "network-interfaces": ifaces,
     });
     fs::write(root.join("vm.json"), serde_json::to_vec(&vmcfg)?)?;
     fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o644))?;
@@ -415,7 +516,14 @@ fn run_vm(
         return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
     }
     let fclog = File::create(jail.join("firecracker.log"))?;
-    let mut child = Command::new(cfg.paths.root.join("bin/jailer"))
+    let mut jailer = Command::new(cfg.paths.root.join("bin/jailer"));
+    if !p.shell {
+        // own process group so a ctrl-c meant for burner doesn't hit the VM first.
+        // a shell stays in the foreground group: firecracker sets the terminal raw,
+        // and from a background group that would stop it with SIGTTOU
+        jailer.process_group(0);
+    }
+    let mut child = jailer
         .args(["--id", id, "--exec-file"])
         .arg(cfg.paths.root.join("bin/firecracker"))
         .args([
@@ -447,14 +555,45 @@ fn run_vm(
             "--level",
             "Error",
         ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdin(if p.shell {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
+        .stdout(if p.shell {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
         .stderr(fclog)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .process_group(0)
         .spawn()
         .context("starting the jailer")?;
+    if p.shell {
+        // the terminal is wired straight to the VM console; firecracker sets it raw
+        let outcome = supervise(&mut child, deadline, cfg, id);
+        teardown(cfg, id, Some(&mut child));
+        *held = None;
+        sys::restore_tty(saved_tty.as_ref());
+        log_line(&format!(
+            "end {id} tag={} secs={:.1} shell",
+            p.tag,
+            t0.elapsed().as_secs_f64()
+        ));
+        return Ok(match outcome {
+            Outcome::Done => 0,
+            Outcome::Timeout => {
+                eprintln!("burner: shell closed at the {} min limit", p.ttl / 60);
+                EXIT_TIMEOUT
+            }
+            Outcome::Cancelled => {
+                eprintln!("burner: killed by burner kill");
+                EXIT_INTERRUPTED
+            }
+            Outcome::Interrupted => EXIT_INTERRUPTED,
+        });
+    }
     let mut stdout = child.stdout.take().context("no console pipe")?;
 
     let mut outcome = stream(
@@ -612,7 +751,7 @@ fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result
     Ok(())
 }
 
-fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<()> {
+fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<Option<u32>> {
     let l = &cfg.limits;
     let vm = Vm {
         id: id.into(),
@@ -621,7 +760,7 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<()> {
         vcpus: p.vcpus,
         mem_mib: p.mem_mib,
         disk_gib: p.disk_gib,
-        net: "none".into(),
+        net: p.net.name().into(),
         ttl_secs: p.ttl,
         wrapper: Some(Ident::me()),
         status: "preparing".into(),
@@ -644,14 +783,30 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<()> {
             let busy: Vec<_> = led.all().into_iter().filter(Vm::holds_slot).collect();
             let used: u32 = busy.iter().map(|v| v.mem_mib).sum();
             if (busy.len() as u32) < l.max_vms && used + p.mem_mib <= l.total_mem_mib {
+                let mut vm = vm.clone();
+                if p.net != net::Mode::None {
+                    let taken: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
+                    vm.net_slot = Some(
+                        (0..cfg.net_slots()?)
+                            .find(|i| !taken.contains(i))
+                            .context("no free network slot")?,
+                    );
+                }
                 if !led.create(&vm)? {
                     anyhow::bail!("run id collision");
                 }
                 log_line(&format!(
-                    "start {id} tag={} img={} vcpus={} mem={} disk={} ttl={}",
-                    p.tag, p.img, p.vcpus, p.mem_mib, p.disk_gib, p.ttl
+                    "start {id} tag={} img={} vcpus={} mem={} disk={} ttl={} net={} shell={}",
+                    p.tag,
+                    p.img,
+                    p.vcpus,
+                    p.mem_mib,
+                    p.disk_gib,
+                    p.ttl,
+                    p.net.name(),
+                    p.shell
                 ));
-                return Ok(());
+                return Ok(vm.net_slot);
             }
             if !waited {
                 eprintln!(
@@ -914,6 +1069,9 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
         return false;
     }
     cgroup::remove(id);
+    if let Some(i) = led.get(id).and_then(|v| v.net_slot) {
+        net::tap_down(cfg, i);
+    }
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
     if jail.exists() && fs::remove_dir_all(&jail).is_err() {
         let _ = led.update(id, |v| {
@@ -1093,6 +1251,13 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .and_then(|t| unix_now.duration_since(t).ok())
             .is_some_and(|d| d.as_secs() > secs)
     };
+    let used: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
+    for i in net::taps_present() {
+        if !used.contains(&i) {
+            net::tap_down(cfg, i);
+            log_line(&format!("reap orphan tap {i}"));
+        }
+    }
     for base in [
         cfg.paths.root.join("jail/firecracker"),
         PathBuf::from("/sys/fs/cgroup").join(cgroup::PARENT),
