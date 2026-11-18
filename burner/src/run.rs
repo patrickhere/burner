@@ -1192,7 +1192,11 @@ fn stream(
         // a newline is held back in case the guest's own one before ENDN comes
         // next. the guest prints that newline and the marker in one printf, so
         // 200ms of quiet means it's real: let it out, or a line reader waits on it
-        let wait = if held_nl { Duration::from_millis(200) } else { Duration::from_secs(1) };
+        let wait = if held_nl {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        };
         if !sys::readable(fd, deadline.left().min(wait)) {
             if held_nl && st == St::Body {
                 flush_held(&mut held_nl);
