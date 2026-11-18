@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
+use crate::cgroup;
 use crate::config::{self, Config};
+use crate::ledger::Ledger;
+use crate::sys;
 
 pub const TABLE: &str = "burner";
 pub const NAT_TABLE: &str = "burner_nat";
@@ -59,34 +62,112 @@ pub fn slot(cfg: &Config, i: u32) -> Result<Slot> {
     })
 }
 
+/// always blocked, on any network
+const SPECIAL: &[&str] = &[
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.168.0.0/16",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+];
+
+/// everything a VM must never reach: the special ranges, every address and
+/// attached network on the host, every route that isn't the default one (a LAN
+/// on public addresses, a vpn, a docker network), the VM subnet and net.block.
+/// what's left is the internet through the default route
+pub fn blocked(cfg: &Config) -> Result<Vec<String>> {
+    let mut nets: Vec<(u32, u8)> = Vec::new();
+    let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
+    for s in SPECIAL
+        .iter()
+        .map(|s| s.to_string())
+        .chain(cfg.net.block.iter().cloned())
+    {
+        add(config::parse_cidr(&s).with_context(|| format!("net.block {s:?}"))?);
+    }
+    add(cfg.subnet()?);
+    for (addr, prefix) in local_addrs()? {
+        add((addr, 32));
+        add((addr, prefix));
+    }
+    for dst in route_dsts()? {
+        if dst.1 > 0 {
+            add(dst);
+        }
+    }
+    Ok(collapse(nets))
+}
+
+/// drop entries covered by a wider one, so nft gets no overlapping intervals
+fn collapse(mut nets: Vec<(u32, u8)>) -> Vec<String> {
+    nets.sort_by_key(|&(n, p)| (p, n));
+    nets.dedup();
+    let mut out: Vec<(u32, u8)> = Vec::new();
+    for (n, p) in nets {
+        if !out
+            .iter()
+            .any(|&(on, op)| op <= p && n & config::mask(op) == on)
+        {
+            out.push((n, p));
+        }
+    }
+    out.sort();
+    out.iter()
+        .map(|&(n, p)| format!("{}/{p}", Ipv4Addr::from(n)))
+        .collect()
+}
+
+fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
+    let out = Command::new("ip")
+        .args(["-j", "-4", "addr", "show"])
+        .output()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    let mut addrs = Vec::new();
+    for link in v.as_array().into_iter().flatten() {
+        for a in link["addr_info"].as_array().into_iter().flatten() {
+            let ip = a["local"].as_str().and_then(|s| s.parse().ok());
+            let prefix = a["prefixlen"].as_u64().map(|p| p.min(32) as u8);
+            if let (Some(ip), Some(p)) = (ip, prefix) {
+                addrs.push((ip, p));
+            }
+        }
+    }
+    Ok(addrs)
+}
+
+fn route_dsts() -> Result<Vec<(Ipv4Addr, u8)>> {
+    let out = Command::new("ip")
+        .args(["-j", "-4", "route", "show", "table", "all"])
+        .output()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    Ok(v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let dst = r["dst"].as_str()?;
+            let (ip, p) = match dst.split_once('/') {
+                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok()?),
+                None if dst == "default" => return None,
+                None => (dst.parse().ok()?, 32),
+            };
+            Some((ip, p))
+        })
+        .collect())
+}
+
 /// the full nft ruleset for this config
 pub fn ruleset(cfg: &Config) -> Result<String> {
     let uplink = cfg.uplink()?;
-    let mut own: Vec<String> = config::iface_addrs(&uplink)?
-        .iter()
-        .map(|a| a.to_string())
-        .collect();
-    own.sort();
-    own.dedup();
-    let blocked = [
-        "0.0.0.0/8",
-        "10.0.0.0/8",
-        "100.64.0.0/10",
-        "127.0.0.0/8",
-        "169.254.0.0/16",
-        "172.16.0.0/12",
-        "192.0.0.0/24",
-        "192.168.0.0/16",
-        "198.18.0.0/15",
-        "224.0.0.0/4",
-        "240.0.0.0/4",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain(own)
-    .chain(std::iter::once(cfg.net.subnet.clone()))
-    .collect::<Vec<_>>()
-    .join(", ");
+    let blocked = blocked(cfg)?.join(", ");
     let resolvers = cfg
         .net
         .resolvers
@@ -182,11 +263,41 @@ fn run(prog: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// load the ruleset and turn on forwarding. safe to run again
+fn net_lock(cfg: &Config) -> Result<sys::Lock> {
+    std::fs::create_dir_all(&cfg.paths.state)?;
+    Ok(sys::Lock::exclusive(&cfg.paths.state.join("net.lock"))?)
+}
+
+fn table_exists() -> bool {
+    run("nft", &["list", "table", "inet", TABLE]).is_ok()
+}
+
+/// load the ruleset and turn on forwarding. safe to run again: the reload is
+/// one nft transaction, and running VMs get their tap entries back right after
 pub fn up(cfg: &Config) -> Result<Vec<String>> {
+    let _lock = net_lock(cfg)?;
     let rules = ruleset(cfg)?;
     nft(&rules, true)?;
     nft(&rules, false)?;
+    let mut readd = String::new();
+    for v in Ledger::open(&cfg.paths.state)?.all() {
+        let (Some(i), Some(mode)) = (v.net_slot, Mode::parse(&v.net)) else {
+            continue;
+        };
+        let s = slot(cfg, i)?;
+        if mode != Mode::None && std::path::Path::new("/sys/class/net").join(&s.tap).exists() {
+            readd += &format!(
+                "add element inet {TABLE} tap_ip {{ {} . {} }}\nadd element inet {TABLE} mode_{} {{ {} }}\n",
+                s.tap,
+                s.guest,
+                mode.name(),
+                s.tap
+            );
+        }
+    }
+    if !readd.is_empty() {
+        nft(&readd, false)?;
+    }
     let mut notes = Vec::new();
     if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() != "1") {
         std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
@@ -200,9 +311,53 @@ pub fn up(cfg: &Config) -> Result<Vec<String>> {
     Ok(notes)
 }
 
-pub fn down() {
+/// take the network away. VMs that have one are killed and their taps removed
+/// first, so no tap is ever up without the filter in front of it
+pub fn down(cfg: &Config) -> Result<usize> {
+    let _lock = net_lock(cfg)?;
+    let mut killed = 0;
+    for v in Ledger::open(&cfg.paths.state)?.all() {
+        if v.net_slot.is_some() {
+            cgroup::kill(&v.id);
+            killed += 1;
+        }
+    }
+    for i in taps_present() {
+        tap_down(cfg, i);
+    }
+    if !taps_present().is_empty() {
+        bail!("some taps couldn't be removed, leaving the filter in place");
+    }
     let _ = run("nft", &["delete", "table", "inet", TABLE]);
     let _ = run("nft", &["delete", "table", "ip", NAT_TABLE]);
+    Ok(killed)
+}
+
+/// from the reaper: keep the blocked set current as routes and addresses change,
+/// and if something wiped the table while taps are up, put it back or kill them
+pub fn check(cfg: &Config) {
+    let has_taps = !taps_present().is_empty();
+    if !table_exists() {
+        if !has_taps {
+            return;
+        }
+        sys::syslog("nft table missing with taps up, reloading");
+        if up(cfg).is_err() {
+            sys::syslog("reload failed, stopping VMs that have a network");
+            let _ = down(cfg);
+        }
+        return;
+    }
+    let Ok(_lock) = net_lock(cfg) else { return };
+    if let Ok(b) = blocked(cfg) {
+        let script = format!(
+            "flush set inet {TABLE} blocked4\nadd element inet {TABLE} blocked4 {{ {} }}\n",
+            b.join(", ")
+        );
+        if nft(&script, false).is_err() {
+            sys::syslog("couldn't refresh the blocked set");
+        }
+    }
 }
 
 /// the ufw command still needed, if ufw is active and lacks it
@@ -227,7 +382,8 @@ pub fn ufw_rule_missing(cfg: &Config) -> Result<Option<String>> {
 }
 
 pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Slot> {
-    if run("nft", &["list", "table", "inet", TABLE]).is_err() {
+    let _lock = net_lock(cfg)?;
+    if !table_exists() {
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
     }
     let s = slot(cfg, i)?;
@@ -332,6 +488,21 @@ pub fn taps_present() -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsing() {
+        let v = collapse(vec![
+            (0x0a000000, 8),
+            (0x0a010000, 16),
+            (0x0a010203, 32),
+            (0xc0a80000, 16),
+            (0x0a000000, 8),
+        ]);
+        assert_eq!(
+            v,
+            vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()]
+        );
+    }
 
     #[test]
     fn slots() {

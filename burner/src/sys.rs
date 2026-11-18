@@ -157,3 +157,34 @@ pub fn restore_tty(t: Option<&libc::termios>) {
         unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
     }
 }
+
+/// fire-and-forget to the system log. never blocks, so it's safe under a lock
+pub fn syslog(msg: &str) {
+    use std::os::unix::net::UnixDatagram;
+    if let Ok(s) = UnixDatagram::unbound() {
+        let _ = s.set_nonblocking(true);
+        // facility daemon (3), severity info (6)
+        let _ = s.send_to(format!("<30>burner: {msg}").as_bytes(), "/dev/log");
+    }
+}
+
+/// bytes free for root on the filesystem holding `path`
+pub fn free_bytes(path: &std::path::Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: zeroed statvfs is a valid out-parameter, c is NUL-terminated
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+/// reserve the full size on disk now, so a guest filling its disk can't fill the host's
+pub fn preallocate(f: &File, size: u64) -> io::Result<()> {
+    // SAFETY: valid fd, offset 0, mode 0 allocates blocks and extends the file
+    if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}

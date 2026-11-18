@@ -35,6 +35,9 @@ pub struct Net {
     pub resolvers: Vec<Ipv4Addr>,
     /// bytes per second, each direction, per VM
     pub rate: u64,
+    /// extra destinations VMs may never reach, on top of private ranges and
+    /// everything the host itself has a route to
+    pub block: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +68,7 @@ impl Default for Net {
             uplink: String::new(),
             resolvers: vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)],
             rate: 2_500_000,
+            block: Vec::new(),
         }
     }
 }

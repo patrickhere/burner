@@ -91,7 +91,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
             "down" => {
-                net::down();
+                let n = net::down(&cfg)?;
+                if n > 0 {
+                    eprintln!("burner: stopped {n} VMs that had a network");
+                }
                 Ok(ExitCode::SUCCESS)
             }
             _ => {
