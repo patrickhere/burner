@@ -138,14 +138,16 @@ pub fn escape_controls(b: &[u8]) -> Vec<u8> {
     out
 }
 
-/// passes what a shell needs to draw (text, colors, cursor movement) and drops
-/// what a hostile guest could use against the terminal or the person at it:
-/// OSC (titles, clipboard, hyperlinks), DCS/APC/PM/SOS strings, and window ops.
-/// keeps its state across reads
+/// an allowlist for what the VM may send to the caller's terminal in `burner
+/// shell`: text, colors, cursor movement, erasing and a few screen modes. it
+/// drops every query (the terminal would type the answer into the VM), mouse
+/// reporting, OSC/DCS/APC/PM/SOS strings (titles, clipboard, hyperlinks), C1
+/// controls and anything it doesn't know. keeps its state across reads
 #[derive(Default)]
 pub struct TermFilter {
     st: FState,
     seq: Vec<u8>,
+    utf8: Vec<u8>,
 }
 
 #[derive(Default, PartialEq)]
@@ -153,7 +155,7 @@ enum FState {
     #[default]
     Text,
     Esc,
-    EscInter,
+    Charset,
     Csi,
     Str,
     StrEsc,
@@ -161,64 +163,144 @@ enum FState {
 
 const SEQ_MAX: usize = 64;
 
+/// undoes every mode the filter lets through, sent when the shell ends
+pub const TERM_RESET: &[u8] =
+    b"\x1b[?1049l\x1b[r\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
+
+/// private modes (CSI ? n h/l) a shell or editor needs that make the terminal
+/// send nothing back: cursor keys, autowrap, blink, cursor shown, alt screen,
+/// bracketed paste
+const PRIVATE_MODES: &[u32] = &[1, 7, 12, 25, 47, 1047, 1048, 1049, 2004];
+
+/// CSI finals that only move the cursor, erase, scroll or set colors
+const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefgmr";
+
 impl TermFilter {
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         for &b in input {
-            match self.st {
-                FState::Text => {
-                    if b == 0x1b {
-                        self.st = FState::Esc;
-                        self.seq.clear();
-                        self.seq.push(b);
-                    } else {
-                        out.push(b);
+            self.byte(b, &mut out);
+        }
+        out
+    }
+
+    fn byte(&mut self, b: u8, out: &mut Vec<u8>) {
+        match self.st {
+            FState::Text => self.text(b, out),
+            FState::Esc => {
+                self.seq.push(b);
+                match b {
+                    b'[' => self.st = FState::Csi,
+                    b']' | b'P' | b'_' | b'^' | b'X' => self.st = FState::Str,
+                    b'(' | b')' => self.st = FState::Charset,
+                    0x1b => self.start_esc(),
+                    // save/restore cursor, reverse index, keypad modes
+                    b'7' | b'8' | b'M' | b'=' | b'>' => {
+                        out.extend_from_slice(&self.seq);
+                        self.st = FState::Text;
                     }
+                    _ => self.st = FState::Text,
                 }
-                FState::Esc => {
-                    self.seq.push(b);
-                    match b {
-                        b'[' => self.st = FState::Csi,
-                        b']' | b'P' | b'_' | b'^' | b'X' => self.st = FState::Str,
-                        b'(' | b')' | b'*' | b'+' | b'#' | b'%' => self.st = FState::EscInter,
-                        _ => {
-                            out.extend_from_slice(&self.seq);
-                            self.st = FState::Text;
-                        }
-                    }
-                }
-                FState::EscInter => {
-                    self.seq.push(b);
+            }
+            FState::Charset => {
+                self.seq.push(b);
+                // only ascii and line drawing
+                if b == b'B' || b == b'0' {
                     out.extend_from_slice(&self.seq);
+                }
+                self.st = FState::Text;
+            }
+            FState::Csi => {
+                if b == 0x1b {
+                    return self.start_esc();
+                }
+                if b < 0x20 {
+                    // a control inside a sequence: drop the sequence, act on the control
+                    self.st = FState::Text;
+                    return self.text(b, out);
+                }
+                self.seq.push(b);
+                if (0x40..=0x7e).contains(&b) {
+                    if csi_allowed(&self.seq[2..]) {
+                        out.extend_from_slice(&self.seq);
+                    }
+                    self.st = FState::Text;
+                } else if self.seq.len() > SEQ_MAX {
                     self.st = FState::Text;
                 }
-                FState::Csi => {
-                    self.seq.push(b);
-                    if (0x40..=0x7e).contains(&b) {
-                        // CSI ... t is window manipulation (resize, move, report title)
-                        if b != b't' {
-                            out.extend_from_slice(&self.seq);
-                        }
-                        self.st = FState::Text;
-                    } else if self.seq.len() > SEQ_MAX {
-                        self.st = FState::Text; // runaway sequence, drop it
-                    }
-                }
-                FState::Str => match b {
-                    0x07 => self.st = FState::Text,
-                    0x1b => self.st = FState::StrEsc,
-                    _ => {}
-                },
-                FState::StrEsc => {
-                    self.st = if b == b'\\' {
-                        FState::Text
-                    } else {
-                        FState::Str
-                    }
+            }
+            FState::Str => match b {
+                0x07 => self.st = FState::Text,
+                0x1b => self.st = FState::StrEsc,
+                _ => {}
+            },
+            FState::StrEsc => {
+                self.st = if b == b'\\' {
+                    FState::Text
+                } else {
+                    FState::Str
                 }
             }
         }
-        out
+    }
+
+    fn start_esc(&mut self) {
+        self.utf8.clear();
+        self.seq.clear();
+        self.seq.push(0x1b);
+        self.st = FState::Esc;
+    }
+
+    fn text(&mut self, b: u8, out: &mut Vec<u8>) {
+        if b < 0x80 {
+            self.utf8.clear(); // a cut-off multibyte char is dropped
+            match b {
+                0x1b => self.start_esc(),
+                b'\t' | b'\n' | b'\r' | 0x08 | 0x07 => out.push(b),
+                0x20..=0x7e => out.push(b),
+                _ => {}
+            }
+            return;
+        }
+        self.utf8.push(b);
+        match std::str::from_utf8(&self.utf8) {
+            Ok(s) => {
+                // C1 controls (U+0080..U+009F) act like ESC sequences on some terminals
+                if !s.chars().all(|c| ('\u{80}'..='\u{9f}').contains(&c)) {
+                    out.extend_from_slice(&self.utf8);
+                }
+                self.utf8.clear();
+            }
+            Err(e) if e.error_len().is_none() && self.utf8.len() < 4 => {} // needs more bytes
+            Err(_) => self.utf8.clear(),
+        }
+    }
+}
+
+/// `body` is everything after ESC [, final byte included
+fn csi_allowed(body: &[u8]) -> bool {
+    let (&fin, rest) = body.split_last().expect("csi has a final byte");
+    if rest.iter().any(|b| (0x20..=0x2f).contains(b)) {
+        return false; // intermediates: cursor style, soft reset, and so on
+    }
+    match rest.first() {
+        Some(b'?') => {
+            matches!(fin, b'h' | b'l')
+                && std::str::from_utf8(&rest[1..]).is_ok_and(|p| {
+                    p.split(';')
+                        .all(|m| m.parse().is_ok_and(|n| PRIVATE_MODES.contains(&n)))
+                })
+        }
+        Some(b'>' | b'<' | b'=') => false,
+        _ => {
+            let digits = rest
+                .iter()
+                .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':');
+            match fin {
+                b'h' | b'l' => rest == b"4", // insert mode, used by line editors
+                _ => digits && CSI_FINALS.contains(&fin),
+            }
+        }
     }
 }
 
@@ -239,6 +321,58 @@ mod tests {
         assert_eq!(f.feed(b"\x1b[8;100;100t!"), b"!".to_vec());
         assert_eq!(f.feed(b"\x1bPq#0;2;0;0;0\x1b\\ok"), b"ok".to_vec());
         assert_eq!(f.feed(b"\x1b(Bz"), b"\x1b(Bz".to_vec());
+    }
+
+    #[test]
+    fn filter_queries_and_modes() {
+        let mut f = TermFilter::default();
+        // queries: the terminal would type the answer into the VM
+        for q in [
+            &b"\x1b[6n"[..],
+            b"\x1b[c",
+            b"\x1b[>c",
+            b"\x1b[?6n",
+            b"\x1b[>0q",
+            b"\x1b[18t",
+            b"\x1b[?u",
+        ] {
+            assert_eq!(f.feed(q), b"".to_vec(), "{q:?}");
+        }
+        // mouse reporting and other modes outside the list
+        assert_eq!(f.feed(b"\x1b[?1000h\x1b[?1006h\x1b[?9h"), b"".to_vec());
+        assert_eq!(
+            f.feed(b"\x1b[?1049h\x1b[?25l\x1b[?2004h"),
+            b"\x1b[?1049h\x1b[?25l\x1b[?2004h".to_vec()
+        );
+        assert_eq!(f.feed(b"\x1b[?1049;1000h"), b"".to_vec());
+        assert_eq!(f.feed(b"\x1b[2 q\x1b[!p\x1b[5b"), b"".to_vec());
+        assert_eq!(
+            f.feed(b"\x1b[2J\x1b[1;1H\x1b[K"),
+            b"\x1b[2J\x1b[1;1H\x1b[K".to_vec()
+        );
+        // unknown escapes and a second ESC mid-sequence
+        assert_eq!(f.feed(b"\x1bc\x1b#8x"), b"8x".to_vec());
+        assert_eq!(f.feed(b"\x1b[1\x1b[31mr"), b"\x1b[31mr".to_vec());
+        // a control inside a CSI ends it
+        assert_eq!(f.feed(b"\x1b[1\nz"), b"\nz".to_vec());
+    }
+
+    #[test]
+    fn filter_utf8_and_c1() {
+        let mut f = TermFilter::default();
+        assert_eq!(
+            f.feed("h\u{e9}llo \u{2713}".as_bytes()),
+            "h\u{e9}llo \u{2713}".as_bytes().to_vec()
+        );
+        // 8-bit OSC and CSI, raw and utf-8 encoded
+        assert_eq!(f.feed(b"a\x9d0;x\x9cb"), b"a0;xb".to_vec());
+        assert_eq!(f.feed("a\u{9b}6nb".as_bytes()), b"a6nb".to_vec());
+        // a char split across reads
+        let v = "\u{2713}".as_bytes();
+        assert_eq!(f.feed(&v[..1]), b"".to_vec());
+        assert_eq!(f.feed(&v[1..]), v.to_vec());
+        assert_eq!(f.feed(b"\xff\xfeok"), b"ok".to_vec());
+        assert_eq!(f.feed(b"\x00\x0e\x7fok"), b"ok".to_vec());
     }
 
     #[test]

@@ -1126,13 +1126,14 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
     let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
     let _ = sys::set_nonblocking(vin_fd);
     let _ = sys::set_nonblocking(vout_fd);
+    sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
     let _ = sys::set_raw(0);
     let screen = Out::new_unescaped(Dest::Stdout);
     let mut filter = crate::output::TermFilter::default();
     let mut to_vm: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16384];
     let mut next_check = Instant::now();
-    let mut stdin_open = true;
+    let (mut stdin_open, mut console_open) = (true, true);
     let outcome = loop {
         if deadline.passed() {
             break Outcome::Timeout;
@@ -1146,11 +1147,13 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
                 break Outcome::Cancelled;
             }
         }
-        let fds = if stdin_open && to_vm.len() < 65536 {
-            vec![0, vout_fd]
-        } else {
-            vec![vout_fd]
-        };
+        let mut fds = Vec::new();
+        if stdin_open && console_open && to_vm.len() < 65536 {
+            fds.push(0);
+        }
+        if console_open {
+            fds.push(vout_fd);
+        }
         let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(200)));
         if ready.contains(&0) {
             match io::stdin().lock().read(&mut buf) {
@@ -1169,17 +1172,23 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
         }
         if ready.contains(&vout_fd) {
             match vout.read(&mut buf) {
-                Ok(0) => break child_outcome(child),
-                Ok(n) => screen.put(&filter.feed(&buf[..n]), None),
+                Ok(n) if n > 0 => screen.put(&filter.feed(&buf[..n]), None),
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break child_outcome(child),
+                // console gone: keep watching the deadline and kills until firecracker exits
+                _ => console_open = false,
             }
         } else if matches!(child.try_wait(), Ok(Some(_))) {
             break child_outcome(child);
         }
     };
+    // a kill that landed as the VM was exiting still counts as a kill
+    let outcome = match outcome {
+        Outcome::Done | Outcome::Failed if cancelled(cfg, id) => Outcome::Cancelled,
+        o => o,
+    };
+    screen.put(crate::output::TERM_RESET, None);
     screen.drain(Instant::now() + Duration::from_secs(2));
     outcome
 }
