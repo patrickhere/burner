@@ -184,11 +184,20 @@ fn run_vm(
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
     let root = jail.join("root");
     fs::create_dir_all(jail.parent().context("jail path")?)?;
+    // only root walks these: firecracker sees nothing above its chroot. the job
+    // tar and the VM config sit in here before the jailer locks the root down,
+    // and other users on the host must not read them meanwhile
+    for d in [
+        cfg.paths.root.join("jail"),
+        cfg.paths.root.join("jail/firecracker"),
+    ] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
+    }
     // fresh dirs only: a jail left over from anything else is never reused
     fs::create_dir(&jail).context("creating the jail (left over from an earlier run?)")?;
     fs::create_dir(&root)?;
     for d in [&jail, &root] {
-        fs::set_permissions(d, fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
     }
     // hard links, not copies: instant, and the jailer can't follow a symlink out.
     // that needs the kernel, images and jail on one filesystem under paths.root
@@ -208,6 +217,7 @@ fn run_vm(
     )
     .context(same_fs)?;
     fs::rename(&job, root.join("job.tar"))?;
+    chown(root.join("job.tar"), Some(uid), Some(uid))?;
     let scratch = root.join("scratch.ext4");
     reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
     prep_ok(cfg, id)?;
@@ -273,7 +283,8 @@ fn run_vm(
         "network-interfaces": ifaces,
     });
     fs::write(root.join("vm.json"), serde_json::to_vec(&vmcfg)?)?;
-    fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o600))?;
+    chown(root.join("vm.json"), Some(uid), Some(uid))?;
 
     let deadline = Deadline::in_secs(p.ttl);
     let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
@@ -294,7 +305,11 @@ fn run_vm(
     if is_interrupted() {
         return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
     }
-    let fclog = File::create(jail.join("firecracker.log"))?;
+    let fclog = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(jail.join("firecracker.log"))?;
     // bin is a symlink the installer switches in one rename; resolve it once so
     // this launch uses a jailer and a firecracker from the same release
     let bin = fs::canonicalize(cfg.paths.root.join("bin")).context("no firecracker installed")?;
@@ -618,7 +633,7 @@ fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result
     let f = b.into_inner()?;
     let len = f.metadata()?.len();
     f.set_len(((len >> 20) + 1) << 20)?;
-    fs::set_permissions(job, fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(job, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 

@@ -58,6 +58,12 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // as root, helpers (ip, nft, mkfs.ext4, curl) never come from the caller's
+    // PATH: sudo doesn't always reset it
+    // SAFETY: first thing in main, before any thread exists
+    if unsafe { libc::geteuid() } == 0 {
+        unsafe { std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin") };
+    }
     let cli = Cli::parse();
     if let Cmd::ParseResult { emit } = &cli.cmd {
         return result::child_main(emit == "1");

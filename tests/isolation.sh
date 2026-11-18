@@ -230,6 +230,30 @@ sudo pkill -CONT -f '^sudo burner run --ttl 15s --tag stopme'
   && ok "stopped wrapper: slot freed $((e - s))s after it stopped" \
   || bad "stopped wrapper" "vid=$vid still=$(sudo burner ls | grep -c ' stopme ')"
 
+# 22 other users on the host can't read a run's input or config
+printf 'secret-input\n' > "$T/in.txt"
+( while :; do sudo -u nobody cat /var/lib/burner/jail/firecracker/*/root/job.tar /var/lib/burner/jail/firecracker/*/root/vm.json 2>/dev/null; done > "$T/peek" ) &
+peeker=$!
+for _ in 1 2 3; do tar -C "$T" -cf - in.txt | sudo burner run --in tar -- 'cat in.txt' >/dev/null 2>&1; done
+sudo burner run -- 'sleep 10' </dev/null >/dev/null 2>&1 &
+sleeper=$!
+sleep 5
+nobody_ls=$(sudo -u nobody ls /var/lib/burner/jail 2>/dev/null; echo "rc=$?")
+kill "$peeker" 2>/dev/null; wait "$peeker" 2>/dev/null
+wait "$sleeper"
+[ ! -s "$T/peek" ] && [ "${nobody_ls##*rc=}" != 0 ] \
+  && ok "job input and VM config unreadable to other users" \
+  || bad "jail permissions" "peek=$(wc -c < "$T/peek") ls=$nobody_ls"
+
+# 23 as root, helpers never come from the caller's PATH
+mkdir -p "$T/evil"
+printf '#!/bin/sh\ntouch %s/pwned\nexit 1\n' "$T" > "$T/evil/mkfs.ext4"
+chmod 755 "$T/evil" "$T/evil/mkfs.ext4"
+out=$(sudo env PATH="$T/evil:$PATH" /usr/local/bin/burner run -- 'echo fine' </dev/null 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$out" = fine ] && [ ! -e "$T/pwned" ] \
+  && ok "a PATH passed through sudo isn't used for helpers" \
+  || bad "PATH" "rc=$rc out=$out pwned=$([ -e "$T/pwned" ] && echo yes)"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]
