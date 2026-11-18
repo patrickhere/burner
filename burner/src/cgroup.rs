@@ -72,7 +72,8 @@ pub fn prepare(id: &str) -> std::io::Result<std::ffi::CString> {
 
 /// in a forked child: move this process into the cgroup. only open and write,
 /// which are async-signal-safe
-/// runs between fork and exec. the child dies with burner from here on, and
+/// runs between fork and exec. the jailer dies with burner until it drops to the
+/// VM's uid (that clears PDEATHSIG), after that the reaper stops firecracker. it
 /// refuses to go on if burner already died, so a jailer can never start outside
 /// the cgroup with nobody left to account for it
 pub fn join_from_child(procs: &std::ffi::CStr, parent: libc::pid_t) -> std::io::Result<()> {

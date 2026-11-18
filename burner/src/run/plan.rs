@@ -121,7 +121,7 @@ pub(super) enum ResultMode {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ImageDefaults {
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
@@ -156,17 +156,21 @@ pub fn images(cfg: &Config) -> Vec<String> {
     names
 }
 
-fn image_defaults(cfg: &Config, img: &str) -> ImageDefaults {
-    fs::read_to_string(
-        cfg.paths
-            .root
-            .join("images")
-            .join(img)
-            .join("defaults.toml"),
-    )
-    .ok()
-    .and_then(|t| toml::from_str(&t).ok())
-    .unwrap_or_default()
+/// an image without a defaults.toml uses the config's. one that doesn't parse
+/// is an error, like the config: a typo shouldn't quietly mean other limits
+fn image_defaults(cfg: &Config, img: &str) -> Result<ImageDefaults> {
+    let path = cfg
+        .paths
+        .root
+        .join("images")
+        .join(img)
+        .join("defaults.toml");
+    match fs::read_to_string(&path) {
+        Ok(t) => toml::from_str(&t)
+            .map_err(|e| Exit(EXIT_SANDBOX, format!("{}: {}", path.display(), e.message())).into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ImageDefaults::default()),
+        Err(e) => Err(Exit(EXIT_SANDBOX, format!("{}: {e}", path.display())).into()),
+    }
 }
 
 pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
@@ -227,7 +231,7 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     if !valid_name(&a.img) || !images(cfg).contains(&a.img) {
         return Err(usage(format!("unknown image {:?} (burner images)", a.img)));
     }
-    let d = image_defaults(cfg, &a.img);
+    let d = image_defaults(cfg, &a.img)?;
     let l = &cfg.limits;
     let pick = |flag: &str,
                 given: Option<u32>,

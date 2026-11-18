@@ -160,7 +160,10 @@ install -d -m 0755 /etc/burner
 if [ -s /etc/burner/config.toml ]; then
     "$BIN" config >/dev/null || die "/etc/burner/config.toml has errors (above), fix it and run this again"
 else
-    "$BIN" config > /etc/burner/config.toml.new
+    # only what you change goes in here, so a later release's new defaults
+    # still reach this box
+    printf '%s\n' "# burner settings. anything not set here uses the default," \
+        "# burner config prints them all with the defaults filled in" > /etc/burner/config.toml.new
     mv -f /etc/burner/config.toml.new /etc/burner/config.toml
 fi
 

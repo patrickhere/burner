@@ -244,8 +244,8 @@ table inet {TABLE} {{
         iifname @mode_web meta l4proto {{ tcp, udp }} th dport 53 ip daddr @resolvers meter {TABLE}_dns_web {{ iifname limit rate 20/second burst 50 packets }} accept
         iifname @mode_open meta l4proto {{ tcp, udp }} th dport 53 ip daddr @resolvers meter {TABLE}_dns_open {{ iifname limit rate 20/second burst 50 packets }} accept
         iifname "{t}*" meta l4proto {{ tcp, udp }} th dport 53 drop
-        iifname @mode_web icmp type echo-request limit rate 5/second accept
-        iifname @mode_open icmp type echo-request limit rate 5/second accept
+        iifname @mode_web icmp type echo-request meter {TABLE}_ping_web {{ iifname limit rate 5/second burst 10 packets }} accept
+        iifname @mode_open icmp type echo-request meter {TABLE}_ping_open {{ iifname limit rate 5/second burst 10 packets }} accept
         iifname @mode_web tcp dport {{ 80, 443 }} ct state new meter {TABLE}_web {{ iifname limit rate 20/second burst 40 packets }} accept
         iifname @mode_open tcp dport {{ 25, 465, 587 }} drop
         iifname @mode_open ct state new meter {TABLE}_open {{ iifname limit rate 50/second burst 100 packets }} accept
