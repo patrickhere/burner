@@ -457,6 +457,8 @@ impl Deadline {
 }
 
 enum Outcome {
+    /// the caller typed ~. in burner shell
+    Detached,
     Done,
     Failed,
     Timeout,
@@ -728,6 +730,11 @@ fn run_vm(
                 set_status("exited", None);
                 0
             }
+            Outcome::Detached => {
+                set_status("detached", None);
+                eprintln!("burner: left the shell, VM stopped");
+                0
+            }
             Outcome::Failed => {
                 set_status("sandbox_error", None);
                 eprintln!("burner: the VM stopped with an error, see the system log");
@@ -765,7 +772,7 @@ fn run_vm(
         outcome = supervise(&mut child, deadline, cfg, id);
     }
     let code = match outcome {
-        Outcome::Timeout | Outcome::Cancelled | Outcome::Interrupted => {
+        Outcome::Timeout | Outcome::Cancelled | Outcome::Interrupted | Outcome::Detached => {
             teardown(cfg, id, Some(&mut child));
             *held = None;
             match outcome {
@@ -1333,6 +1340,7 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
     let _ = sys::set_raw(0);
     let screen = Out::new_unescaped(Dest::Stdout);
     let mut filter = crate::output::TermFilter::default();
+    let mut escape = Escape::default();
     let mut to_vm: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16384];
     let mut next_check = Instant::now();
@@ -1361,7 +1369,11 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
         if ready.contains(&0) {
             match io::stdin().lock().read(&mut buf) {
                 Ok(0) | Err(_) => stdin_open = false,
-                Ok(n) => to_vm.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    if escape.feed(&buf[..n], &mut to_vm) {
+                        break Outcome::Detached;
+                    }
+                }
             }
         }
         if let Some(w) = vin.as_mut()
@@ -1400,6 +1412,41 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
     screen.put(crate::output::TERM_RESET, None);
     screen.drain(Instant::now() + Duration::from_secs(2));
     outcome
+}
+
+/// ssh-style escape for burner shell: `~` right after enter (or at the start)
+/// is held, `~.` leaves, `~~` sends one `~`, anything else goes through as is.
+/// a way out when the guest hangs and ctrl-c only reaches the VM
+#[derive(Default)]
+struct Escape {
+    mid_line: bool,
+    tilde: bool,
+}
+
+impl Escape {
+    /// true when the caller asked to leave
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+        for &b in input {
+            if self.tilde {
+                self.tilde = false;
+                match b {
+                    b'.' => return true,
+                    b'~' => {
+                        out.push(b'~');
+                        self.mid_line = true;
+                        continue;
+                    }
+                    _ => out.push(b'~'),
+                }
+            } else if b == b'~' && !self.mid_line {
+                self.tilde = true;
+                continue;
+            }
+            out.push(b);
+            self.mid_line = !matches!(b, b'\r' | b'\n');
+        }
+        false
+    }
 }
 
 fn child_outcome(child: &mut Child) -> Outcome {
@@ -1841,6 +1888,21 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_escape() {
+        let run = |chunks: &[&[u8]]| {
+            let (mut e, mut out) = (Escape::default(), Vec::new());
+            let left = chunks.iter().any(|c| e.feed(c, &mut out));
+            (left, out)
+        };
+        assert_eq!(run(&[b"~."]), (true, vec![]));
+        assert!(run(&[b"ls\r", b"~", b"."]).0);
+        assert_eq!(run(&[b"a~."]), (false, b"a~.".to_vec()));
+        assert_eq!(run(&[b"~~x"]), (false, b"~x".to_vec()));
+        assert_eq!(run(&[b"~x"]), (false, b"~x".to_vec()));
+        assert_eq!(run(&[b"\r~."]), (true, b"\r".to_vec()));
+    }
 
     #[test]
     fn ttl() {
