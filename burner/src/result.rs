@@ -210,7 +210,8 @@ pub fn child_main(emit: bool) -> ExitCode {
             n: 0,
         })
     });
-    if let Err(e) = walk(src, logf, out.as_mut(), &mut meta) {
+    let mut src = src;
+    if let Err(e) = prescan(&mut src).and_then(|()| walk(src, logf, out.as_mut(), &mut meta)) {
         meta.problem = Some(e.to_string());
         meta.fatal = true;
     }
@@ -227,6 +228,64 @@ pub fn child_main(emit: bool) -> ExitCode {
 
 fn fatal(msg: &str) -> io::Error {
     io::Error::other(msg.to_string())
+}
+
+/// a first pass over the raw headers before the tar crate sees them: only the
+/// entry types busybox tar writes, small long-name and pax records, a bounded
+/// number of headers, and every size in range. the crate would otherwise load
+/// extension records and sparse maps before any of burner's limits apply
+fn prescan(src: &mut File) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let len = src.metadata()?.len().min(RESULT_SIZE);
+    let (mut off, mut headers) = (0u64, 0u32);
+    let mut h = [0u8; 512];
+    while off + 512 <= len {
+        src.seek(SeekFrom::Start(off))?;
+        src.read_exact(&mut h)?;
+        if h.iter().all(|&b| b == 0) {
+            break; // end of archive
+        }
+        headers += 1;
+        if headers > MEMBERS * 3 {
+            return Err(fatal("result has too many headers"));
+        }
+        let size = octal(&h[124..136]).ok_or_else(|| fatal("result header has a bad size"))?;
+        let max = match h[156] {
+            b'0' | 0 | b'7' => RESULT_SIZE,
+            b'1' | b'2' | b'3' | b'4' | b'5' | b'6' => 0,
+            b'L' | b'K' => 4096,
+            b'x' => 64 << 10,
+            t => {
+                return Err(fatal(&format!(
+                    "result has a tar entry of type {:?}",
+                    t as char
+                )));
+            }
+        };
+        if size > max {
+            return Err(fatal("result has an oversized tar header"));
+        }
+        off = size
+            .div_ceil(512)
+            .checked_mul(512)
+            .and_then(|b| off.checked_add(512 + b))
+            .filter(|o| *o <= len)
+            .ok_or_else(|| fatal("result tar runs past the end of the disk"))?;
+    }
+    src.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+/// a tar size field: octal digits, padded with spaces or NULs. base-256 sizes
+/// are only needed past 8G and get refused
+fn octal(f: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(f)
+        .ok()?
+        .trim_matches(|c| c == ' ' || c == '\0');
+    if s.is_empty() {
+        return Some(0);
+    }
+    u64::from_str_radix(s, 8).ok()
 }
 
 fn walk(
@@ -432,12 +491,9 @@ mod tests {
         fs::create_dir(&dir)?;
         fs::write(dir.join("raw"), bytes)?;
         let mut meta = Meta::default();
-        let res = walk(
-            File::open(dir.join("raw"))?,
-            File::create(dir.join("log"))?,
-            None,
-            &mut meta,
-        );
+        let mut src = File::open(dir.join("raw"))?;
+        let res = prescan(&mut src)
+            .and_then(|()| walk(src, File::create(dir.join("log"))?, None, &mut meta));
         let _ = fs::remove_dir_all(&dir);
         res.map(|()| meta)
     }
@@ -451,6 +507,32 @@ mod tests {
         assert!(walk_bytes(&tar_of(&[("out/a", b"x"), ("out/a", b"y")])).is_err());
         let err = walk_bytes(&tar_of(&[("result/rc", b"0\n"), ("result/error", b"boom")])).unwrap();
         assert!(err.guest_error);
+    }
+
+    fn with_type(t: tar::EntryType, size: u64) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        h.set_path("out/x").unwrap();
+        h.set_entry_type(t);
+        h.set_size(size);
+        h.set_cksum();
+        let mut v = h.as_bytes().to_vec();
+        v.resize(512 + size.div_ceil(512) as usize * 512 + 1024, 0);
+        v
+    }
+
+    #[test]
+    fn prescan_types() {
+        assert!(walk_bytes(&with_type(tar::EntryType::GNUSparse, 0)).is_err());
+        assert!(walk_bytes(&with_type(tar::EntryType::XGlobalHeader, 10)).is_err());
+        assert!(walk_bytes(&with_type(tar::EntryType::GNULongName, 100_000)).is_err());
+        assert!(walk_bytes(&with_type(tar::EntryType::Regular, 10)).is_ok());
+        // a long name, as busybox tar writes it
+        let long = format!("out/{}", "d/".repeat(80) + "f");
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_size(1);
+        b.append_data(&mut h, &long, &b"z"[..]).unwrap();
+        assert!(walk_bytes(&b.into_inner().unwrap()).is_ok());
     }
 
     #[test]
