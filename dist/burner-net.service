@@ -2,6 +2,8 @@
 Description=burner VM network (nft table, forwarding)
 After=network-online.target ufw.service
 Wants=network-online.target
+# a boot without a default route yet fails net up; keep trying instead of giving up
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -9,6 +11,8 @@ RemainAfterExit=yes
 ExecStart=/usr/local/bin/burner net up
 ExecReload=/usr/local/bin/burner net up
 ExecStop=/usr/local/bin/burner net down
+Restart=on-failure
+RestartSec=30s
 
 [Install]
 WantedBy=multi-user.target

@@ -410,7 +410,11 @@ fn services(r: &mut Report, cfg: &Config) {
         .is_some_and(|c| c.contains("policy drop"));
     let ufw_ok = matches!(net::ufw_rule_missing(cfg), Ok(None))
         && run_ok("ufw", &["status"]).is_some_and(|s| s.contains("Status: active"));
-    if drops && !ufw_ok {
+    // or someone already added accept rules for the subnet (docker's DOCKER-USER chain)
+    let own_rule = run_ok("nft", &["list", "table", "ip", "filter"]).is_some_and(|t| {
+        t.contains(&format!("ip saddr {}", cfg.net.subnet)) && t.contains("accept")
+    });
+    if drops && !ufw_ok && !own_rule {
         let up = cfg.uplink().unwrap_or_else(|_| "UPLINK".into());
         r.line(
             Level::Warn,

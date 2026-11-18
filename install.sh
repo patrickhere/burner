@@ -16,6 +16,28 @@ BIN=/usr/local/bin/burner
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# sudo ./install.sh --uninstall: everything this script put on the machine, except
+# /etc/burner (your config) and the docker images tools/build-image left behind
+uninstall() {
+    [ "$(id -u)" = 0 ] || die "run as root (sudo ./install.sh --uninstall)"
+    if [ -x "$BIN" ] && "$BIN" ls --json 2>/dev/null | grep -q '"id"'; then
+        die "VMs are running (burner ls), stop them first"
+    fi
+    systemctl disable --now burner-reap.timer burner-net.service 2>/dev/null || true
+    if [ -x "$BIN" ]; then "$BIN" net down >/dev/null 2>&1 || true; fi
+    rm -f /etc/systemd/system/burner-net.service /etc/systemd/system/burner-reap.service \
+        /etc/systemd/system/burner-reap.timer
+    systemctl daemon-reload
+    rm -rf "$ROOT" /run/burner
+    rm -f "$BIN"
+    for u in burner-parse burner; do
+        id "$u" >/dev/null 2>&1 && userdel "$u"
+    done
+    echo "removed burner. left in place: /etc/burner, the ufw rule if you added one, docker images named burner-img-*"
+    exit 0
+}
+[ "${1:-}" = --uninstall ] && uninstall
+
 [ "$(id -u)" = 0 ] || die "run as root (sudo ./install.sh)"
 [ "$(uname -s)" = Linux ] || die "burner only runs on linux"
 case "$(uname -m)" in

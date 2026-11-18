@@ -12,7 +12,7 @@ sudo burner run -- 'uname -a; exit 3'      # run one thing, get its output and e
 ## what it does
 
 - `burner shell [image]` -> a login shell on the VM's console, your terminal size passed in. 60 min max
-- `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the output, returns its exit code, deletes the VM
+- `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https and dns only, or any port but mail. the LAN, the host and other VMs are always blocked
 - `burner ls`, `burner kill ID`, `burner images`, `burner doctor`
@@ -68,6 +68,15 @@ sudo burner doctor
 ```
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, `burner config` shows them with defaults filled in.
+
+## when something breaks
+
+- `sudo burner doctor` first. it checks kvm, the tools, the network setup, the reaper and the install, and says what to fix
+- burner logs to syslog under the `burner` tag: `journalctl -t burner`. every run logs a start and an end line with its id, and the reaper says what it cleaned up
+- the network: `systemctl status burner-net`, and `sudo burner net show` for the rules. a VM with no internet on a docker host is usually docker's FORWARD drop policy, doctor prints the two lines that fix it
+- `cleanup-failed` in `burner ls` means a VM stopped but something of it (its cgroup, tap or jail dir) couldn't be removed yet. the reaper retries every 30s and the slot stays taken until it's gone
+- wrappers can pass `--status-fd N` to get one JSON line saying how the run ended, so a command that exits 124 itself isn't mistaken for a timeout. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
+- `sudo ./install.sh --uninstall` takes it all back off, except `/etc/burner`
 
 ## tests
 

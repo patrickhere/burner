@@ -12,7 +12,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -75,6 +75,15 @@ pub struct RunArgs {
     #[arg(long, default_value = "none")]
     net: String,
     /// one argument runs as a shell string; several are quoted as they are
+    /// write one JSON line to this fd when done: how the run ended, the guest's
+    /// exit code if it has one, the VM id. for wrappers that need to tell a
+    /// timeout from a command that exited 124 itself. sudo closes fds above 2,
+    /// so through sudo use 2: the line is then the last thing on stderr
+    #[arg(long, value_name = "FD")]
+    status_fd: Option<i32>,
+    /// fail right away instead of queueing when every slot is taken
+    #[arg(long)]
+    no_wait: bool,
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
     #[arg(skip)]
@@ -128,6 +137,8 @@ pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
         result: None,
         tag: a.tag,
         net_default: a.net.is_none(),
+        status_fd: None,
+        no_wait: false,
         net: a.net.unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
@@ -282,6 +293,7 @@ struct Plan {
     cmd: String,
     net: net::Mode,
     shell: bool,
+    no_wait: bool,
 }
 
 fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
@@ -362,21 +374,64 @@ fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         cmd,
         net,
         shell: a.shell,
+        no_wait: a.no_wait,
     })
+}
+
+/// how the run ended, for --status-fd. set where burner decides it
+static STATUS: Mutex<Option<(&str, Option<i32>)>> = Mutex::new(None);
+static RUN_ID: OnceLock<String> = OnceLock::new();
+
+fn set_status(outcome: &'static str, rc: Option<i32>) {
+    if let Ok(mut s) = STATUS.lock() {
+        *s = Some((outcome, rc));
+    }
 }
 
 pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     interrupted();
-    match run(cfg, &a) {
-        Ok(code) => ExitCode::from(code),
+    if let Some(fd) = a.status_fd {
+        // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
+        // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
+        let ok =
+            fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
+        if !ok {
+            eprintln!("burner: --status-fd {fd} isn't an open file descriptor (2, or above 2)");
+            return ExitCode::from(EXIT_USAGE);
+        }
+    }
+    let t0 = Instant::now();
+    let code = match run(cfg, &a) {
+        Ok(code) => code,
         Err(e) => {
             eprintln!("burner: {e:#}");
             match e.downcast_ref::<Exit>() {
-                Some(Exit(code, _)) => ExitCode::from(*code),
-                None => ExitCode::from(EXIT_SANDBOX),
+                Some(Exit(code, _)) => *code,
+                None => EXIT_SANDBOX,
             }
         }
+    };
+    if let Some(fd) = a.status_fd {
+        let (outcome, rc) = STATUS.lock().ok().and_then(|s| *s).unwrap_or(match code {
+            EXIT_USAGE => ("usage", None),
+            EXIT_INTERRUPTED => ("interrupted", None),
+            _ => ("sandbox_error", None),
+        });
+        let line = json!({"outcome": outcome, "rc": rc, "exit": code, "id": RUN_ID.get(),
+                          "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0})
+        .to_string()
+            + "\n";
+        let mut b = line.as_bytes();
+        while !b.is_empty() {
+            // SAFETY: write(2) of a live buffer to an fd checked at start
+            let n = unsafe { libc::write(fd, b.as_ptr().cast(), b.len()) };
+            if n <= 0 {
+                break;
+            }
+            b = &b[n as usize..];
+        }
     }
+    ExitCode::from(code)
 }
 
 /// a point in boot time (CLOCK_BOOTTIME, keeps counting through suspend). the
@@ -415,6 +470,7 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     fs::create_dir_all(&runs)?;
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
     let (id, run_dir) = alloc_id(&runs)?;
+    let _ = RUN_ID.set(id.clone());
     let mut vm = None;
     let res = run_vm(cfg, a, &p, &id, &run_dir, uid, gid, &mut vm);
     if vm.is_some() {
@@ -640,6 +696,14 @@ fn run_vm(
     if p.shell {
         let outcome = relay(&mut child, deadline, cfg, id);
         sys::restore_tty(saved_tty.as_ref());
+        if matches!(outcome, Outcome::Failed) {
+            // the jail and its firecracker.log are gone after teardown
+            let tail = tail_of(&jail.join("firecracker.log"), 1500);
+            log_line(&format!(
+                "{id}: firecracker failed: {}",
+                String::from_utf8_lossy(&escape_controls(&tail)).trim()
+            ));
+        }
         teardown(cfg, id, Some(&mut child));
         *held = None;
         log_line(&format!(
@@ -648,20 +712,29 @@ fn run_vm(
             t0.elapsed().as_secs_f64()
         ));
         return Ok(match outcome {
-            Outcome::Done => 0,
+            Outcome::Done => {
+                set_status("exited", None);
+                0
+            }
             Outcome::Failed => {
+                set_status("sandbox_error", None);
                 eprintln!("burner: the VM stopped with an error, see the system log");
                 EXIT_SANDBOX
             }
             Outcome::Timeout => {
+                set_status("timeout", None);
                 eprintln!("burner: shell closed at the {} min limit", p.ttl / 60);
                 EXIT_TIMEOUT
             }
             Outcome::Cancelled => {
+                set_status("killed", None);
                 eprintln!("burner: killed by burner kill");
                 EXIT_INTERRUPTED
             }
-            Outcome::Interrupted => EXIT_INTERRUPTED,
+            Outcome::Interrupted => {
+                set_status("interrupted", None);
+                EXIT_INTERRUPTED
+            }
         });
     }
     let mut stdout = child.stdout.take().context("no console pipe")?;
@@ -685,6 +758,7 @@ fn run_vm(
             *held = None;
             match outcome {
                 Outcome::Timeout => {
+                    set_status("timeout", None);
                     diag.put(
                         format!("burner: killed at the {}s time limit\n", p.ttl).as_bytes(),
                         None,
@@ -692,10 +766,12 @@ fn run_vm(
                     EXIT_TIMEOUT
                 }
                 Outcome::Cancelled => {
+                    set_status("killed", None);
                     diag.put(b"burner: killed by burner kill\n", None);
                     EXIT_INTERRUPTED
                 }
                 _ => {
+                    set_status("interrupted", None);
                     diag.put(b"burner: interrupted, sandbox stopped\n", None);
                     EXIT_INTERRUPTED
                 }
@@ -733,6 +809,10 @@ fn run_vm(
             if meta.guest_error {
                 code = EXIT_SANDBOX;
             }
+            match meta.rc {
+                Some(rc) if !meta.guest_error => set_status("exited", Some(rc)),
+                _ => set_status("sandbox_error", None),
+            }
             if let (Some(out), false) = (&tar_out, meta.fatal) {
                 // a tar that didn't arrive whole is a failed run, whatever the guest said
                 if !deliver(&tar_path, out, until) || !out.complete(until) {
@@ -741,6 +821,7 @@ fn run_vm(
                         None,
                     );
                     code = EXIT_SANDBOX;
+                    set_status("sandbox_error", None);
                 }
             }
             code
@@ -887,7 +968,8 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
                     anyhow::bail!("run id collision");
                 }
                 log_line(&format!(
-                    "start {id} tag={} img={} vcpus={} mem={} disk={} ttl={} net={} shell={}",
+                    "start {id} by uid {} tag={} img={} vcpus={} mem={} disk={} ttl={} net={} shell={}",
+                    caller_uid(),
                     p.tag,
                     p.img,
                     p.vcpus,
@@ -898,6 +980,14 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
                     p.shell
                 ));
                 return Ok(vm.net_slot);
+            }
+            if p.no_wait {
+                set_status("busy", None);
+                return Err(Exit(
+                    EXIT_SANDBOX,
+                    format!("no free slot ({} running) and --no-wait", busy.len()),
+                )
+                .into());
             }
             if !waited {
                 // queued, never written while the ledger lock is held
@@ -986,6 +1076,7 @@ fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
     }
     let v = ledger::peek(&cfg.paths.state, id);
     if v.as_ref().is_none_or(|v| v.cancel) {
+        set_status("killed", None);
         return Err(Exit(EXIT_INTERRUPTED, "killed by burner kill".into()).into());
     }
     if v.is_some_and(|v| {
@@ -1451,6 +1542,15 @@ fn tail_of(path: &Path, n: u64) -> Vec<u8> {
     let mut v = Vec::new();
     let _ = f.read_to_end(&mut v);
     v
+}
+
+/// who asked for the run: the sudo caller when there is one, else our own uid
+fn caller_uid() -> String {
+    std::env::var("SUDO_UID")
+        .ok()
+        .filter(|u| u.bytes().all(|b| b.is_ascii_digit()) && !u.is_empty())
+        // SAFETY: getuid can't fail
+        .unwrap_or_else(|| unsafe { libc::getuid() }.to_string())
 }
 
 pub fn log_line(msg: &str) {
