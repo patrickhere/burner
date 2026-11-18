@@ -1,0 +1,455 @@
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::path::Path;
+use std::process::{Child, ChildStdout};
+use std::time::{Duration, Instant};
+
+use super::{Deadline, Outcome, is_interrupted};
+use crate::cgroup;
+use crate::config::Config;
+use crate::ledger;
+use crate::output::{Dest, Out, escape_controls};
+use crate::result;
+use crate::sys;
+
+const SERIAL_CAP: u64 = 1 << 20;
+const LIVE_BYTES: u64 = 65536;
+
+/// copy the console between the BEGIN/END markers to `out`, byte for byte.
+/// the markers are only presentation: the guest knows the token and can end its
+/// own live output early, which hides nothing but its own output
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stream(
+    stdout: &mut ChildStdout,
+    child: &mut Child,
+    token: &str,
+    deadline: Deadline,
+    out: &Out,
+    diag: &Out,
+    cfg: &Config,
+    id: &str,
+) -> Outcome {
+    let begin = format!("BURNER-{token}-BEGIN\n").into_bytes();
+    let end = format!("BURNER-{token}-END").into_bytes();
+    let end_n = [end.as_slice(), b"N"].concat();
+    let fd = stdout.as_raw_fd();
+    let _ = sys::set_nonblocking(fd);
+    #[derive(PartialEq)]
+    enum St {
+        Pre,
+        Body,
+        Capped,
+        Done,
+    }
+    let mut st = St::Pre;
+    // pre_line: whether pre[0] starts a line, kept across trims
+    let (mut pre, mut pre_line, mut pending) = (Vec::new(), true, Vec::new());
+    let (mut held_nl, mut at_line_start, mut raw_total) = (false, true, 0u64);
+    let mut next_check = Instant::now();
+    let mut chunk = vec![0u8; 65536];
+    let flush_held = |held: &mut bool| {
+        if *held {
+            out.put(b"\n", None);
+            *held = false;
+        }
+    };
+    loop {
+        if deadline.passed() {
+            return Outcome::Timeout;
+        }
+        if is_interrupted() {
+            return Outcome::Interrupted;
+        }
+        if Instant::now() >= next_check {
+            next_check = Instant::now() + Duration::from_secs(1);
+            if cancelled(cfg, id) {
+                return Outcome::Cancelled;
+            }
+        }
+        // a newline is held back in case the guest's own one before ENDN comes
+        // next. the guest prints that newline and the marker in one printf, so
+        // 200ms of quiet means it's real: let it out, or a line reader waits on it
+        let wait = if held_nl {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        };
+        if !sys::readable(fd, deadline.left().min(wait)) {
+            if held_nl && st == St::Body {
+                flush_held(&mut held_nl);
+            }
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            continue;
+        }
+        let n = match stdout.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        };
+        // the part of this read still under the console cap
+        let take = n.min(SERIAL_CAP.saturating_sub(raw_total) as usize);
+        raw_total += n as u64;
+        let data = &chunk[..take];
+        match st {
+            St::Pre => {
+                pre.extend_from_slice(data);
+                if let Some(i) = find_at_line_start(&pre, &begin, pre_line) {
+                    st = St::Body;
+                    pending = pre.split_off(i + begin.len());
+                    pre.truncate(i);
+                } else {
+                    let keep = 8192 + begin.len();
+                    if pre.len() > keep {
+                        let cut = pre.len() - keep;
+                        pre_line = pre[cut - 1] == b'\n';
+                        pre.drain(..cut);
+                    }
+                }
+            }
+            St::Body => pending.extend_from_slice(data),
+            _ => {}
+        }
+        if st == St::Body {
+            // scan with an offset and compact once, instead of draining per line
+            let mut start = 0;
+            loop {
+                let Some(off) = pending[start..].iter().position(|&b| b == b'\n') else {
+                    let rest = &pending[start..];
+                    if !rest.is_empty() && !(at_line_start && end_n.starts_with(rest)) {
+                        flush_held(&mut held_nl);
+                        out.put(rest, None);
+                        at_line_start = false;
+                        start = pending.len();
+                    }
+                    break;
+                };
+                let line = &pending[start..start + off];
+                start += off + 1;
+                if at_line_start && line == end.as_slice() {
+                    flush_held(&mut held_nl);
+                    st = St::Done;
+                    break;
+                }
+                if at_line_start && line == end_n.as_slice() {
+                    held_nl = false; // that newline was added by the guest init
+                    st = St::Done;
+                    break;
+                }
+                flush_held(&mut held_nl);
+                out.put(line, None);
+                held_nl = true;
+                at_line_start = true;
+            }
+            pending.drain(..start);
+        }
+        if raw_total >= SERIAL_CAP && st == St::Body {
+            flush_held(&mut held_nl);
+            out.put(&pending, None);
+            pending.clear();
+            diag.put(b"burner: console over 1M, live output stopped\n", None);
+            st = St::Capped;
+        }
+    }
+    if st == St::Body {
+        flush_held(&mut held_nl);
+        out.put(&pending, None);
+    }
+    if st == St::Pre {
+        diag.put(
+            b"burner: VM ended before the job started; last console lines:\n",
+            None,
+        );
+        let tail = &pre[pre.len().saturating_sub(2000)..];
+        diag.put(&escape_controls(tail), None);
+        diag.put(b"\n", None);
+    }
+    Outcome::Done
+}
+
+/// first `needle` that starts a line. `first_is_line` says whether hay[0] does
+fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<usize> {
+    let mut from = 0;
+    while let Some(off) = hay
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
+        let i = from + off;
+        if (i == 0 && first_is_line) || (i > 0 && hay[i - 1] == b'\n') {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// `burner shell`: the caller's terminal goes raw and burner copies bytes both
+/// ways. keystrokes go to the VM as they are; what the VM prints goes through a
+/// filter so it can't set titles, the clipboard or anything else on the terminal
+pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
+    let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Outcome::Failed;
+    };
+    let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
+    // blocking pipes would let a stuck VM freeze the loop that enforces the ttl
+    if sys::set_nonblocking(vin_fd).is_err() || sys::set_nonblocking(vout_fd).is_err() {
+        return Outcome::Failed;
+    }
+    let mut vin = Some(vin);
+    sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
+    let _ = sys::set_raw(0);
+    let screen = Out::new_unescaped(Dest::Stdout);
+    let mut filter = crate::output::TermFilter::default();
+    let mut escape = Escape::default();
+    let mut to_vm: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 16384];
+    let mut next_check = Instant::now();
+    let (mut stdin_open, mut console_open) = (true, true);
+    let outcome = loop {
+        if deadline.passed() {
+            break Outcome::Timeout;
+        }
+        if is_interrupted() {
+            break Outcome::Interrupted;
+        }
+        if Instant::now() >= next_check {
+            next_check = Instant::now() + Duration::from_secs(1);
+            if cancelled(cfg, id) {
+                break Outcome::Cancelled;
+            }
+        }
+        let mut fds = Vec::new();
+        if stdin_open && console_open && to_vm.len() < 65536 {
+            fds.push(0);
+        }
+        if console_open {
+            fds.push(vout_fd);
+        }
+        let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(200)));
+        if ready.contains(&0) {
+            match io::stdin().lock().read(&mut buf) {
+                Ok(0) | Err(_) => stdin_open = false,
+                Ok(n) => {
+                    if escape.feed(&buf[..n], &mut to_vm) {
+                        break Outcome::Detached;
+                    }
+                }
+            }
+        }
+        if let Some(w) = vin.as_mut()
+            && !to_vm.is_empty()
+        {
+            match w.write(&to_vm) {
+                Ok(n) => {
+                    to_vm.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => to_vm.clear(),
+            }
+        }
+        // caller's input ended and everything is sent: the VM sees eof too
+        if !stdin_open && to_vm.is_empty() {
+            vin = None;
+        }
+        if ready.contains(&vout_fd) {
+            match vout.read(&mut buf) {
+                Ok(n) if n > 0 => screen.put(&filter.feed(&buf[..n]), None),
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
+                // console gone: keep watching the deadline and kills until firecracker exits
+                _ => console_open = false,
+            }
+        } else if matches!(child.try_wait(), Ok(Some(_))) {
+            break child_outcome(child);
+        }
+    };
+    // a kill that landed as the VM was exiting still counts as a kill
+    let outcome = match outcome {
+        Outcome::Done | Outcome::Failed if cancelled(cfg, id) => Outcome::Cancelled,
+        o => o,
+    };
+    screen.put(crate::output::TERM_RESET, None);
+    screen.drain(Instant::now() + Duration::from_secs(2));
+    outcome
+}
+
+/// ssh-style escape for burner shell: `~` right after enter (or at the start)
+/// is held, `~.` leaves, `~~` sends one `~`, anything else goes through as is.
+/// a way out when the guest hangs and ctrl-c only reaches the VM
+#[derive(Default)]
+struct Escape {
+    mid_line: bool,
+    tilde: bool,
+}
+
+impl Escape {
+    /// true when the caller asked to leave
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+        for &b in input {
+            if self.tilde {
+                self.tilde = false;
+                match b {
+                    b'.' => return true,
+                    b'~' => {
+                        out.push(b'~');
+                        self.mid_line = true;
+                        continue;
+                    }
+                    _ => out.push(b'~'),
+                }
+            } else if b == b'~' && !self.mid_line {
+                self.tilde = true;
+                continue;
+            }
+            out.push(b);
+            self.mid_line = !matches!(b, b'\r' | b'\n');
+        }
+        false
+    }
+}
+
+fn child_outcome(child: &mut Child) -> Outcome {
+    match child.wait() {
+        Ok(s) if s.success() => Outcome::Done,
+        _ => Outcome::Failed,
+    }
+}
+
+fn cancelled(cfg: &Config, id: &str) -> bool {
+    // unreadable counts as cancelled: nothing keeps running on a record nobody can read
+    ledger::peek_strict(&cfg.paths.state, id).map_or(true, |v| v.is_none_or(|v| v.cancel))
+}
+
+/// after the console closed: the VM must be gone before its result disk is read
+pub(super) fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
+    let mut next_check = Instant::now();
+    let status = loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            break st;
+        }
+        let now = Instant::now();
+        if deadline.passed() {
+            return Outcome::Timeout;
+        }
+        if is_interrupted() {
+            return Outcome::Interrupted;
+        }
+        if now >= next_check {
+            next_check = now + Duration::from_secs(1);
+            if cancelled(cfg, id) {
+                return Outcome::Cancelled;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let end = Instant::now() + Duration::from_secs(5);
+    while cgroup::populated(id) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if cgroup::populated(id) {
+        cgroup::kill(id);
+        return Outcome::Timeout;
+    }
+    if status.success() {
+        Outcome::Done
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// what the guest didn't stream live: log bytes past the first LIVE_BYTES
+pub(super) fn print_rest(meta: &result::Meta, log: &Path, out: &Out, diag: &Out, until: Instant) {
+    let Ok(mut f) = File::open(log) else { return };
+    let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = match meta.skipped {
+        0 => LIVE_BYTES,
+        s if s <= LIVE_BYTES => LIVE_BYTES - s,
+        s => {
+            diag.put(
+                format!(
+                    "burner: output was {} bytes; the {} bytes after the first 64K are not kept, showing the last 16M\n",
+                    s + size,
+                    s - LIVE_BYTES
+                )
+                .as_bytes(),
+                None,
+            );
+            0
+        }
+    };
+    if size <= start || f.seek(SeekFrom::Start(start)).is_err() {
+        return;
+    }
+    deliver_from(&mut f, out, until);
+}
+
+/// false when the file couldn't be read in full before the deadline
+pub(super) fn deliver(path: &Path, out: &Out, until: Instant) -> bool {
+    File::open(path).is_ok_and(|mut f| deliver_from(&mut f, out, until))
+}
+
+fn deliver_from(f: &mut File, out: &Out, until: Instant) -> bool {
+    let want = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    let pos = f.stream_position().unwrap_or(0);
+    let (mut sent, mut buf) = (0u64, vec![0u8; 1 << 20]);
+    loop {
+        if Instant::now() >= until || is_interrupted() {
+            return false;
+        }
+        match f.read(&mut buf) {
+            Ok(0) => return pos + sent == want,
+            Ok(n) => {
+                out.put(&buf[..n], Some(until));
+                sent += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_escape() {
+        let run = |chunks: &[&[u8]]| {
+            let (mut e, mut out) = (Escape::default(), Vec::new());
+            let left = chunks.iter().any(|c| e.feed(c, &mut out));
+            (left, out)
+        };
+        assert_eq!(run(&[b"~."]), (true, vec![]));
+        assert!(run(&[b"ls\r", b"~", b"."]).0);
+        assert_eq!(run(&[b"a~."]), (false, b"a~.".to_vec()));
+        assert_eq!(run(&[b"~~x"]), (false, b"~x".to_vec()));
+        assert_eq!(run(&[b"~x"]), (false, b"~x".to_vec()));
+        assert_eq!(run(&[b"\r~."]), (true, b"\r".to_vec()));
+    }
+
+    #[test]
+    fn markers() {
+        assert_eq!(
+            find_at_line_start(b"xBEGIN\nBEGIN\n", b"BEGIN\n", true),
+            Some(7)
+        );
+        assert_eq!(find_at_line_start(b"BEGIN\n", b"BEGIN\n", true), Some(0));
+        assert_eq!(find_at_line_start(b"noise BEGIN\n", b"BEGIN\n", true), None);
+        // after a trim, the buffer's first byte may sit mid-line
+        assert_eq!(find_at_line_start(b"BEGIN\n", b"BEGIN\n", false), None);
+        assert_eq!(
+            find_at_line_start(b"BEGIN\nBEGIN\n", b"BEGIN\n", false),
+            Some(6)
+        );
+    }
+}
