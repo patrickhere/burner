@@ -7,6 +7,9 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAP: usize = 8 << 20;
+/// what one queued chunk costs beyond its bytes (the Vec and the channel slot),
+/// so a flood of tiny writes can't hold far more memory than the cap says
+const CHUNK_COST: usize = 128;
 
 pub struct Out {
     tx: mpsc::Sender<Vec<u8>>,
@@ -49,7 +52,7 @@ impl Out {
                 {
                     b.store(true, Ordering::Relaxed);
                 }
-                q.fetch_sub(chunk.len(), Ordering::Relaxed);
+                q.fetch_sub(chunk.len() + CHUNK_COST, Ordering::Relaxed);
             }
         });
         Out {
@@ -73,8 +76,9 @@ impl Out {
         };
         loop {
             let q = self.queued.load(Ordering::Relaxed);
-            if q + b.len() <= QUEUE_CAP {
-                self.queued.fetch_add(b.len(), Ordering::Relaxed);
+            if q + b.len() + CHUNK_COST <= QUEUE_CAP {
+                self.queued
+                    .fetch_add(b.len() + CHUNK_COST, Ordering::Relaxed);
                 let _ = self.tx.send(b);
                 return;
             }

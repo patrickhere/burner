@@ -1151,12 +1151,15 @@ fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<
 /// ways. keystrokes go to the VM as they are; what the VM prints goes through a
 /// filter so it can't set titles, the clipboard or anything else on the terminal
 fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
-    let (Some(mut vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
+    let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
         return Outcome::Failed;
     };
     let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
-    let _ = sys::set_nonblocking(vin_fd);
-    let _ = sys::set_nonblocking(vout_fd);
+    // blocking pipes would let a stuck VM freeze the loop that enforces the ttl
+    if sys::set_nonblocking(vin_fd).is_err() || sys::set_nonblocking(vout_fd).is_err() {
+        return Outcome::Failed;
+    }
+    let mut vin = Some(vin);
     sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
     let _ = sys::set_raw(0);
     let screen = Out::new_unescaped(Dest::Stdout);
@@ -1192,14 +1195,20 @@ fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outco
                 Ok(n) => to_vm.extend_from_slice(&buf[..n]),
             }
         }
-        if !to_vm.is_empty() {
-            match vin.write(&to_vm) {
+        if let Some(w) = vin.as_mut()
+            && !to_vm.is_empty()
+        {
+            match w.write(&to_vm) {
                 Ok(n) => {
                     to_vm.drain(..n);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(_) => to_vm.clear(),
             }
+        }
+        // caller's input ended and everything is sent: the VM sees eof too
+        if !stdin_open && to_vm.is_empty() {
+            vin = None;
         }
         if ready.contains(&vout_fd) {
             match vout.read(&mut buf) {
