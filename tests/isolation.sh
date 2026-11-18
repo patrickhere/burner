@@ -43,7 +43,7 @@ awk -v c="$cores" 'BEGIN{exit !(c <= 1.05)}' && [ "$rc" = 124 ] && [ $((e-s)) -l
 
 # 5 disk flood: scratch fills, job sees ENOSPC, host disk untouched
 before=$(df --output=used -B1M / | tail -1)
-out=$(sudo burner run --disk 1 -- 'dd if=/dev/zero of=/var/tmp/fill bs=1M count=3000 2>&1 | tail -1; echo dd_done' </dev/null 2>&1); rc=$?
+out=$(sudo burner run --disk 1 -- 'dd if=/dev/zero of=/var/tmp/fill bs=1M count=3000 2>&1; echo dd_done' </dev/null 2>&1); rc=$?
 after=$(df --output=used -B1M / | tail -1)
 echo "$out" | grep -q dd_done && echo "$out" | grep -qiE 'no space|space left|I/O error' && [ $((after-before)) -lt 200 ] \
   && ok "disk flood capped at scratch size (host delta $((after-before))M after run)" \
@@ -149,6 +149,7 @@ sleep 20; held=$(sudo burner ls | grep -c '^burner-'); wait; e=$(date +%s)
   && ok "idle stdin refused after $((e-s))s without holding a slot" || bad "idle stdin" "rc=$(cat "$T/idle.rc") held=$held"
 
 # 17 a reader that never reads: the VM still ends and the slot is freed
+# shellcheck disable=SC2216
 ( sudo burner run --ttl 60s -- 'head -c 30000000 /dev/zero' | sleep 100 ) >/dev/null 2>&1 &
 bg=$!
 sleep 45; held=$(sudo burner ls | grep -c '^burner-')
