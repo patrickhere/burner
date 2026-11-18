@@ -31,6 +31,32 @@ pub struct Meta {
     pub problem: Option<String>,
     pub skipped: u64,
     pub fatal: bool,
+    /// the guest reported a failure of its own (log capture, result write):
+    /// the run fails even if the command succeeded
+    #[serde(default)]
+    pub guest_error: bool,
+}
+
+/// reads exactly `left` bytes or fails: a member whose body runs past the end
+/// of the disk would otherwise come out short and padded
+struct Exact<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0 {
+            return Ok(0);
+        }
+        let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        if n == 0 {
+            return Err(fatal("result cut off inside a file"));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
 }
 
 /// parent side: parse the already-open result disk in a limited child, write the
@@ -211,7 +237,7 @@ fn walk(
 ) -> io::Result<()> {
     let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 16, src));
     let (mut count, mut total, mut logged) = (0u32, 0u64, 0u64);
-    let mut seen = HashSet::new();
+    let (mut seen, mut files, mut dirs) = (HashSet::new(), HashSet::new(), HashSet::new());
     for e in ar
         .entries()
         .map_err(|e| fatal(&format!("result unreadable ({e})")))?
@@ -229,9 +255,25 @@ fn walk(
             meta.problem = Some("result had unsafe entries, dropped".into());
             continue;
         };
+        // twice the same path, or a file where another entry needs a directory,
+        // can't be unpacked as one tree: not a result burner hands back
         if !seen.insert(name.clone()) {
-            meta.problem = Some(format!("result had {name} twice, kept the first"));
-            continue;
+            return Err(fatal(&format!("result has {name} twice")));
+        }
+        let parents: Vec<String> = name
+            .match_indices('/')
+            .map(|(i, _)| name[..i].to_string())
+            .collect();
+        if parents.iter().any(|p| files.contains(p)) || (kind.is_file() && dirs.contains(&name)) {
+            return Err(fatal(&format!(
+                "result has {name} both as a file and a directory"
+            )));
+        }
+        dirs.extend(parents);
+        if kind.is_file() {
+            files.insert(name.clone());
+        } else {
+            dirs.insert(name.clone());
         }
         let mtime = e.header().mtime().unwrap_or(0).min(1 << 33);
         if kind.is_dir() {
@@ -254,7 +296,8 @@ fn walk(
                 meta.skipped = read_small(&mut e)?.trim().parse().unwrap_or(0)
             }
             "result/error" if size <= 1000 => {
-                meta.problem = Some(read_small(&mut e)?.trim().to_string())
+                meta.problem = Some(read_small(&mut e)?.trim().to_string());
+                meta.guest_error = true;
             }
             "result/log.txt" => {
                 logged = logged
@@ -262,7 +305,11 @@ fn walk(
                     .filter(|l| *l <= LOG_CAP)
                     .ok_or_else(|| fatal("log over the cap"))?;
                 let mut buf = Vec::with_capacity(size as usize);
-                e.read_to_end(&mut buf)?;
+                Exact {
+                    inner: &mut e,
+                    left: size,
+                }
+                .read_to_end(&mut buf)?;
                 logf.write_all(&buf)?;
                 if let Some(b) = out.as_deref_mut() {
                     let mut h = header(tar::EntryType::Regular, 0o644, size, mtime);
@@ -277,7 +324,14 @@ fn walk(
                         0o644
                     };
                     let mut h = header(tar::EntryType::Regular, mode, size, mtime);
-                    b.append_data(&mut h, n, &mut e)?;
+                    b.append_data(
+                        &mut h,
+                        n,
+                        Exact {
+                            inner: &mut e,
+                            left: size,
+                        },
+                    )?;
                 }
             }
             _ => {}
@@ -344,6 +398,7 @@ impl Write for Capped {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn names() {
@@ -359,5 +414,49 @@ mod tests {
         assert_eq!(clean_name(Path::new("out/../../x")), None);
         assert_eq!(clean_name(Path::new("/etc/passwd")), None);
         assert_eq!(clean_name(Path::new(".")), None);
+    }
+
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, body) in entries {
+            let mut h = tar::Header::new_ustar();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            b.append_data(&mut h, name, *body).unwrap();
+        }
+        b.into_inner().unwrap()
+    }
+
+    fn walk_bytes(bytes: &[u8]) -> io::Result<Meta> {
+        let dir = std::env::temp_dir().join(format!("burner-walk-{}", sys::random_hex(6)?));
+        fs::create_dir(&dir)?;
+        fs::write(dir.join("raw"), bytes)?;
+        let mut meta = Meta::default();
+        let res = walk(
+            File::open(dir.join("raw"))?,
+            File::create(dir.join("log"))?,
+            None,
+            &mut meta,
+        );
+        let _ = fs::remove_dir_all(&dir);
+        res.map(|()| meta)
+    }
+
+    #[test]
+    fn result_trees() {
+        let ok = walk_bytes(&tar_of(&[("result/rc", b"3\n"), ("out/a/b", b"x")])).unwrap();
+        assert_eq!(ok.rc, Some(3));
+        assert!(walk_bytes(&tar_of(&[("out/a", b"x"), ("out/a/b", b"y")])).is_err());
+        assert!(walk_bytes(&tar_of(&[("out/a/b", b"y"), ("out/a", b"x")])).is_err());
+        assert!(walk_bytes(&tar_of(&[("out/a", b"x"), ("out/a", b"y")])).is_err());
+        let err = walk_bytes(&tar_of(&[("result/rc", b"0\n"), ("result/error", b"boom")])).unwrap();
+        assert!(err.guest_error);
+    }
+
+    #[test]
+    fn cut_off_body() {
+        let full = tar_of(&[("result/log.txt", &[b'a'; 4000])]);
+        // header plus part of the body: the member claims more than the disk has
+        assert!(walk_bytes(&full[..512 + 1000]).is_err());
     }
 }

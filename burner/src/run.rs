@@ -330,6 +330,11 @@ fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     if a.input != Input::None && sys::is_tty(0) {
         return Err(usage("--in stdin and --in tar need piped input"));
     }
+    if a.result.is_some() && sys::is_tty(1) {
+        return Err(usage(
+            "--result tar writes a tar to stdout, redirect it to a file",
+        ));
+    }
     Ok(Plan {
         img: a.img.clone(),
         vcpus,
@@ -696,10 +701,12 @@ fn run_vm(
                 diag.put(b"\n", None);
             }
             let mut code = meta.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX);
+            if meta.guest_error {
+                code = EXIT_SANDBOX;
+            }
             if let (Some(out), false) = (&tar_out, meta.fatal) {
-                deliver(&tar_path, out, until);
                 // a tar that didn't arrive whole is a failed run, whatever the guest said
-                if !out.complete(until) {
+                if !deliver(&tar_path, out, until) || !out.complete(until) {
                     diag.put(
                         b"burner: result tar not fully delivered, failing the run\n",
                         None,
@@ -1334,19 +1341,28 @@ fn print_rest(meta: &result::Meta, log: &Path, out: &Out, diag: &Out, until: Ins
     deliver_from(&mut f, out, until);
 }
 
-fn deliver(path: &Path, out: &Out, until: Instant) {
-    if let Ok(mut f) = File::open(path) {
-        deliver_from(&mut f, out, until);
-    }
+/// false when the file couldn't be read in full before the deadline
+fn deliver(path: &Path, out: &Out, until: Instant) -> bool {
+    File::open(path).is_ok_and(|mut f| deliver_from(&mut f, out, until))
 }
 
-fn deliver_from(f: &mut File, out: &Out, until: Instant) {
-    let mut buf = vec![0u8; 1 << 20];
-    while let Ok(n) = f.read(&mut buf) {
-        if n == 0 {
-            break;
+fn deliver_from(f: &mut File, out: &Out, until: Instant) -> bool {
+    let want = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+    let pos = f.stream_position().unwrap_or(0);
+    let (mut sent, mut buf) = (0u64, vec![0u8; 1 << 20]);
+    loop {
+        if Instant::now() >= until || is_interrupted() {
+            return false;
         }
-        out.put(&buf[..n], Some(until));
+        match f.read(&mut buf) {
+            Ok(0) => return pos + sent == want,
+            Ok(n) => {
+                out.put(&buf[..n], Some(until));
+                sent += n as u64;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
     }
 }
 

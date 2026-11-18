@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck shell=busybox
 # burner guest init (pid 1). everything here runs inside the VM.
 # drives: vda base (ro), vdb scratch ext4 (rw), vdc job tar (raw, ro), vdd result tar (raw, rw)
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -95,12 +96,21 @@ fail() {   # sandbox-side failure before the command ran
 
 # reads the job's output from stdin: the first 64K to the console and /result/head,
 # the rest into 4M chunks, keeping only the newest 5. prints the total byte count
+# any failure goes in /result/error, which fails the run. the job's output is
+# still drained so the job itself never gets SIGPIPE
 capture() {
-    dd bs=65536 count=1 iflag=fullblock 2>/dev/null | tee /result/head
-    total=$(wc -c < /result/head)
+    set -o pipefail
+    if ! dd bs=65536 count=1 iflag=fullblock 2>/dev/null | tee /result/head; then
+        echo "log capture failed" > /result/error
+    fi
+    total=$(wc -c < /result/head 2>/dev/null || echo 0)
     n=0
     while :; do
-        dd of="$C/$n" bs=1048576 count=4 iflag=fullblock 2>/dev/null
+        if ! dd of="$C/$n" bs=1048576 count=4 iflag=fullblock 2>/dev/null; then
+            echo "log capture failed" > /result/error
+            cat > /dev/null
+            break
+        fi
         size=$(wc -c < "$C/$n" 2>/dev/null || echo 0)
         [ "$size" -gt 0 ] || { rm -f "$C/$n"; break; }
         rm -f "$C/$((n - 5))"
@@ -137,7 +147,7 @@ else
     [ "$i" = 0 ] && parts=/result/head
     while [ "$i" -lt "$n" ]; do parts="$parts $C/$i"; i=$((i + 1)); done
     # shellcheck disable=SC2086
-    cat $parts | tail -c 16777216 > /result/log.txt || echo "log assembly failed" > /result/error
+    (set -o pipefail; cat $parts | tail -c 16777216 > /result/log.txt) || echo "log assembly failed" > /result/error
     kept=$(wc -c < /result/log.txt 2>/dev/null || echo 0)
     [ "$total" -gt "$kept" ] && echo $((total - kept)) > /result/log_skipped
     rm -rf "$C" /result/head /result/total
@@ -146,8 +156,10 @@ fi
 
 cd / || halt
 # result + /out straight onto the raw result disk, no copies on scratch
+# a run whose /out didn't make it back has failed, whatever the command returned.
+# if even the small tar fails, the host finds no exit code and fails the run too
 if ! tar -c -f /dev/vdd result out 2>/dev/null; then
     echo "result over the 256M cap, /out dropped" > /result/error
-    tar -c -f /dev/vdd result 2>/dev/null
+    tar -c -f /dev/vdd result 2>/dev/null || echo "burner-init: result disk write failed" > /dev/console
 fi
 halt
