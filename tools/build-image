@@ -27,4 +27,6 @@ sudo install -d -m 0755 "$dest"
 sudo install -m 0644 "$work/rootfs.ext4" "$dest/rootfs.ext4.new"
 sudo mv -f "$dest/rootfs.ext4.new" "$dest/rootfs.ext4"
 [ -f "$src/images/$name/defaults.toml" ] && sudo install -m 0644 "$src/images/$name/defaults.toml" "$dest/defaults.toml"
+# what burner doctor compares against its own copy, to spot images built from an older init
+sudo install -m 0644 "$src/guest/init" "$dest/init"
 echo "$name: $(du -h "$dest/rootfs.ext4" | cut -f1) ($mb M content) -> $dest"

@@ -10,6 +10,8 @@ use crate::config::{self, Config};
 use crate::net;
 use crate::sys;
 
+const GUEST_INIT: &[u8] = include_bytes!("../../guest/init");
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum Level {
     Ok,
@@ -341,13 +343,27 @@ fn install(r: &mut Report, cfg: &Config) {
             "burner or burner-parse missing, install.sh creates them",
         ),
     }
-    let images = fs::read_dir(root.join("images"))
-        .map(|d| {
-            d.filter_map(|e| e.ok())
-                .filter(|e| e.path().join("rootfs.ext4").exists())
-                .count()
-        })
-        .unwrap_or(0);
+    // images carry a copy of the guest init they were built with; one from an
+    // older burner still runs the old init inside every VM
+    let mut images = 0;
+    for e in fs::read_dir(root.join("images"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if !e.path().join("rootfs.ext4").exists() {
+            continue;
+        }
+        images += 1;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if fs::read(e.path().join("init")).ok().as_deref() != Some(GUEST_INIT) {
+            r.line(
+                Level::Warn,
+                "images",
+                format!("{name} was built with a different guest init, rebuild it: tools/build-image {name}"),
+            );
+        }
+    }
     if images > 0 {
         r.line(Level::Ok, "images", format!("{images} installed"));
     } else {

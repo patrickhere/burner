@@ -100,16 +100,25 @@ account burner-parse
 getent group kvm >/dev/null && usermod -aG kvm burner
 
 # 2. install: each file goes in under a temp name and is renamed into place
-root_only "$ROOT"
-root_only /etc/burner
-root_only "$(dirname "$BIN")"
-install -d -m 0755 "$ROOT" "$ROOT/bin" "$ROOT/kernel" "$ROOT/images"
+install -d -m 0755 "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images"
+for d in "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images" /etc/burner "$(dirname "$BIN")"; do
+    root_only "$d"
+done
 put() { # mode src dest
     install -m "$1" "$2" "$3.new"
     mv -f "$3.new" "$3"
 }
-put 0755 "$fc" "$ROOT/bin/firecracker"
-put 0755 "$jailer" "$ROOT/bin/jailer"
+# firecracker and the jailer go in a directory per release, and $ROOT/bin is a
+# symlink switched with one rename: a launch never pairs two different versions
+rel="$ROOT/fc/$FC_VERSION"
+install -d -m 0755 "$rel"
+put 0755 "$fc" "$rel/firecracker"
+put 0755 "$jailer" "$rel/jailer"
+if [ -d "$ROOT/bin" ] && [ ! -L "$ROOT/bin" ]; then
+    mv "$ROOT/bin" "$ROOT/fc/pre-$FC_VERSION.old"   # an install from before versioned dirs
+fi
+ln -sfn "fc/$FC_VERSION" "$ROOT/bin.new"
+mv -fT "$ROOT/bin.new" "$ROOT/bin"
 put 0644 "$work/vmlinux" "$ROOT/kernel/vmlinux-$KERNEL_VERSION"
 ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux.new"
 mv -fT "$ROOT/kernel/vmlinux.new" "$ROOT/kernel/vmlinux"
@@ -136,3 +145,8 @@ echo
 "$BIN" doctor || die "burner doctor found problems, see the FAIL lines above"
 echo
 [ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: tools/build-image alpine (needs docker)"
+# a changed guest/init only reaches VMs through a rebuilt image
+for img in "$ROOT"/images/*/; do
+    [ -d "$img" ] || continue
+    cmp -s "$src/guest/init" "$img/init" || echo "rebuild $(basename "$img") to pick up the new guest init: tools/build-image $(basename "$img")"
+done

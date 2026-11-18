@@ -565,7 +565,10 @@ fn run_vm(
         return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
     }
     let fclog = File::create(jail.join("firecracker.log"))?;
-    let mut jailer = Command::new(cfg.paths.root.join("bin/jailer"));
+    // bin is a symlink the installer switches in one rename; resolve it once so
+    // this launch uses a jailer and a firecracker from the same release
+    let bin = fs::canonicalize(cfg.paths.root.join("bin")).context("no firecracker installed")?;
+    let mut jailer = Command::new(bin.join("jailer"));
     // own process group so a ctrl-c meant for burner doesn't hit the VM first.
     // firecracker never sees the caller's terminal, even for a shell: burner relays it
     jailer.process_group(0);
@@ -576,7 +579,7 @@ fn run_vm(
     }
     let mut child = jailer
         .args(["--id", id, "--exec-file"])
-        .arg(cfg.paths.root.join("bin/firecracker"))
+        .arg(bin.join("firecracker"))
         .args([
             "--uid",
             &uid.to_string(),
