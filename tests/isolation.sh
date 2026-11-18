@@ -214,6 +214,22 @@ s=$(date +%s); out=$(sudo burner run --ttl 20s -- 'echo before; sleep 300' </dev
   && ok "a job that really runs on still ends at the ttl with its output (rc $rc)" \
   || bad "ttl with output" "rc=$rc out=$out secs=$((e - s))"
 
+# 21 a stopped wrapper (ctrl-z) doesn't hold its slot: a minute past the
+# deadline the reaper kills it, and the pass after that frees the VM
+( sudo burner run --ttl 15s --tag stopme -- 'sleep 300' </dev/null >/dev/null 2>&1 & )
+vid=""
+for _ in $(seq 30); do vid=$(sudo burner ls | awk '/ stopme /{print $1}'); [ -n "$vid" ] && break; sleep 1; done
+sudo pkill -STOP -f '^burner run --ttl 15s --tag stopme'
+s=$(date +%s)
+for _ in $(seq 60); do sudo burner ls | grep -q ' stopme ' || break; sleep 5; done
+e=$(date +%s)
+# sudo stops itself along with its stopped child, wake it so it can exit
+sudo pkill -CONT -f '^sudo burner run --ttl 15s --tag stopme'
+[ -n "$vid" ] && ! sudo burner ls | grep -q ' stopme ' && ! sudo test -d "/sys/fs/cgroup/burner/$vid" \
+  && ! sudo test -e "/var/lib/burner/jail/firecracker/$vid" \
+  && ok "stopped wrapper: slot freed $((e - s))s after it stopped" \
+  || bad "stopped wrapper" "vid=$vid still=$(sudo burner ls | grep -c ' stopme ')"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]

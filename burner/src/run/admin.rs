@@ -253,6 +253,14 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
+/// a wrapper that's still alive a minute past its VM's deadline without having
+/// torn it down is stopped (ctrl-z) or stuck: a healthy one has deleted or
+/// re-marked the entry within 15s of the VM ending
+fn wrapper_stuck(v: &ledger::Vm, now: f64) -> bool {
+    matches!(v.status, Status::Running | Status::Preparing)
+        && v.deadline_boot.is_some_and(|d| now > d + 60.0)
+}
+
 /// run every 30s from a timer: stop VMs past their deadline, clean up after
 /// wrappers that died, keep the network filter current. the ledger lock is only
 /// held for reads and the final deletes, never across subprocesses or file removal
@@ -266,7 +274,6 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
     };
     let now = sys::boottime();
     let vms = Ledger::open(&cfg.paths.state)?.all();
-    let known: Vec<String> = vms.iter().map(|v| v.id.clone()).collect();
     let mut done = Vec::new();
     for v in &vms {
         if !valid_id(&v.id) {
@@ -285,6 +292,18 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
                 && sys::signal_ident(w, libc::SIGTERM)
             {
                 log_line(&format!("reap {}: setup stuck, stopping its wrapper", v.id));
+            }
+            // its slot, tap and jail stay taken while the wrapper lives, so a
+            // stopped one would hold them forever. the next pass cleans up
+            if let Some(n) = now_v.filter(|n| wrapper_stuck(n, now))
+                && let Some(w) = n.wrapper.as_ref()
+                && w.alive()
+                && sys::signal_ident(w, libc::SIGKILL)
+            {
+                log_line(&format!(
+                    "reap {}: wrapper still there a minute past the deadline, killed it",
+                    v.id
+                ));
             }
         }
         if v.wrapper.as_ref().is_some_and(Ident::alive) {
@@ -349,6 +368,13 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             ));
         }
     }
+    // read again: a pass can take minutes, and a VM admitted since the first
+    // read is not an orphan
+    let known: Vec<String> = Ledger::open(&cfg.paths.state)?
+        .all()
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
     for i in net::reap_orphan_taps(cfg) {
         log_line(&format!("reap orphan tap {i}"));
     }
@@ -394,4 +420,32 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         format!("{}\n", sys::boottime()),
     );
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stuck_wrappers() {
+        let vm = |status, deadline| ledger::Vm {
+            status,
+            deadline_boot: deadline,
+            ..Default::default()
+        };
+        assert!(wrapper_stuck(&vm(Status::Running, Some(100.0)), 161.0));
+        assert!(wrapper_stuck(&vm(Status::Preparing, Some(100.0)), 161.0));
+        assert!(
+            !wrapper_stuck(&vm(Status::Running, Some(100.0)), 159.0),
+            "still in its grace minute"
+        );
+        assert!(
+            !wrapper_stuck(&vm(Status::CleanupFailed, Some(100.0)), 500.0),
+            "teardown already ran"
+        );
+        assert!(
+            !wrapper_stuck(&vm(Status::Running, None), 500.0),
+            "no deadline yet"
+        );
+    }
 }

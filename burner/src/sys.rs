@@ -34,7 +34,13 @@ pub fn boottime() -> f64 {
 pub fn proc_start(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 2..];
-    after_comm.split_whitespace().nth(19)?.parse().ok()
+    let mut f = after_comm.split_whitespace();
+    // a zombie has exited, it only waits for its parent to notice. a parent
+    // that is stopped itself (sudo, after ctrl-z) may never do that
+    if matches!(f.next(), Some("Z" | "X")) {
+        return None;
+    }
+    f.nth(18)?.parse().ok()
 }
 
 pub fn random_hex(bytes: usize) -> io::Result<String> {
