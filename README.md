@@ -35,19 +35,33 @@ burner ──jailer──> firecracker VM ──tap──> nft ──nat──> 
 
 - every VM runs under firecracker's jailer as the unprivileged `burner` user, in its own cgroup with cpu, memory and pid caps
 - the image is mounted read-only with an overlay on a throwaway scratch disk. the command goes in as a raw tar on its own disk
-- results come back as a raw tar the guest writes to another disk. the host never mounts anything the guest wrote: the tar is read by a separate burner process running as `burner` with hard rlimits, and only regular files and directories get through
+- results come back as a raw tar the guest writes to another disk. the host never mounts anything the guest wrote: the tar is read by a separate burner process running as its own user, `burner-parse`, with hard rlimits, and only regular files and directories get through
 - each VM gets a tap and its own /30. one nft table only lets those taps out the uplink, minus private ranges and the host's own addresses. bandwidth and disk io are capped per VM
 - the time limit is enforced by burner and backed up by a reaper timer, and a VM's slot is only freed once its cgroup is empty
 
 nothing from the host goes into a VM unless you pipe it in. `--net web` means anything that goes in can leave, so don't pipe in secrets.
 
+## what it protects against
+
+i run it on a box that's only reachable over a VPN. yours might sit on a home LAN or have a public IP. burner assumes the code in the VM is hostile and the host could be any of those.
+
+- burner has no daemon and listens on no port. it's a command you run as root. if you put it behind a web app, a bot or a shared ssh account, everyone who can reach that can boot VMs, and the limits in `/etc/burner/config.toml` (`max_vms`, memory, disk, time) are the only thing between them and your host
+- a VM can't reach the host on any address, its LAN, other VMs, or anything behind a route that isn't the default one (VPNs, docker networks, tailnets). the blocked list is built from the host's own routes and addresses and refreshed every minute, so a VPN that comes up later gets blocked too
+- guest packets are checked before conntrack: wrong source address, fragments and floods are dropped at the tap. connections a VM leaves behind are cleared before its slot is reused
+- no ipv6 in VMs at all
+- on a host with a public IP, VM traffic leaves from that IP. whatever a VM does on the internet looks like you did it. `run` has no network unless you ask, `--net open` still blocks mail ports, and every VM is rate limited, but that's damage control. if strangers can start VMs, use `--net none` or `web` only
+- everything the guest sends back is treated as hostile: console output is escaped, the shell goes through a filter that strips terminal tricks (window titles, clipboard writes, escape replies), and the result tar is parsed by a separate unprivileged user with hard limits
+- a VM that hangs, a wrapper that gets killed, a full disk or a crash mid-run all end with the VM stopped and its slot freed by the reaper
+
+what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel and burner's pinned firecracker updated), side channels between VMs on the same cpu, and anything you pipe in yourself.
+
 ## install
 
-linux on x86_64 or aarch64 with kvm, cgroup v2, nftables and iproute2. aarch64 is untested so far.
+linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack. aarch64 is untested so far.
 
 ```
 cargo build --release
-sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), user, units
+sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), users, units
 tools/build-image alpine         # an image to boot, needs docker
 sudo burner doctor
 ```
