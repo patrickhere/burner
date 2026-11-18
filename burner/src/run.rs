@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crate::cgroup;
 use crate::config::Config;
-use crate::ledger::{Ident, Ledger, Vm, valid_id};
+use crate::ledger::{self, Ident, Ledger, Vm, valid_id};
 use crate::net;
 use crate::output::{Dest, Out, escape_controls};
 use crate::result;
@@ -387,7 +387,10 @@ fn alloc_id(runs: &Path) -> Result<(String, PathBuf)> {
         let id = format!("burner-{}", sys::random_hex(6)?);
         let dir = runs.join(&id);
         match fs::create_dir(&dir) {
-            Ok(()) => return Ok((id, dir)),
+            Ok(()) => {
+                fs::write(dir.join("owner"), serde_json::to_vec(&Ident::me())?)?;
+                return Ok((id, dir));
+            }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),
         }
@@ -419,7 +422,7 @@ fn run_vm(
     let job = run_dir.join("job.tar");
     build_job(&job, &p.cmd, a.input, spool.as_deref())?;
 
-    let net_slot = take_slot(cfg, p, id)?;
+    let net_slot = take_slot(cfg, p, id, &diag)?;
     *held = Some(());
 
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
@@ -442,10 +445,10 @@ fn run_vm(
     )?;
     fs::rename(&job, root.join("job.tar"))?;
     let scratch = root.join("scratch.ext4");
-    sparse(&scratch, u64::from(p.disk_gib) << 30)?;
+    reserve(&scratch, u64::from(p.disk_gib) << 30)?;
     mkfs(&scratch)?;
     let raw = root.join("result.raw");
-    sparse(&raw, result::RESULT_SIZE)?;
+    reserve(&raw, result::RESULT_SIZE)?;
     for f in [&scratch, &raw] {
         chown(f, Some(uid), Some(gid))?;
         fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
@@ -501,6 +504,7 @@ fn run_vm(
     fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o644))?;
 
     let deadline = Instant::now() + Duration::from_secs(u64::from(p.ttl));
+    let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
     {
         let led = Ledger::open(&cfg.paths.state)?;
         let cur = led.get(id).context("ledger entry vanished")?;
@@ -522,6 +526,10 @@ fn run_vm(
         // a shell stays in the foreground group: firecracker sets the terminal raw,
         // and from a background group that would stop it with SIGTTOU
         jailer.process_group(0);
+    }
+    // SAFETY: join_from_child only calls open, write and close
+    unsafe {
+        jailer.pre_exec(move || cgroup::join_from_child(&procs));
     }
     let mut child = jailer
         .args(["--id", id, "--exec-file"])
@@ -751,7 +759,7 @@ fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result
     Ok(())
 }
 
-fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<Option<u32>> {
+fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>> {
     let l = &cfg.limits;
     let vm = Vm {
         id: id.into(),
@@ -809,10 +817,15 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<Option<u32>> {
                 return Ok(vm.net_slot);
             }
             if !waited {
-                eprintln!(
-                    "burner: waiting for a slot ({} running, {used} of {} MiB in use)",
-                    busy.len(),
-                    l.total_mem_mib
+                // queued, never written while the ledger lock is held
+                diag.put(
+                    format!(
+                        "burner: waiting for a slot ({} running, {used} of {} MiB in use)\n",
+                        busy.len(),
+                        l.total_mem_mib
+                    )
+                    .as_bytes(),
+                    None,
                 );
                 waited = true;
             }
@@ -824,8 +837,23 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str) -> Result<Option<u32>> {
     }
 }
 
-fn sparse(path: &Path, size: u64) -> Result<()> {
-    File::create(path)?.set_len(size)?;
+/// a disk file with all its blocks reserved up front, so a guest filling it
+/// can never fill the host. keeps 1 GiB free for everything else
+fn reserve(path: &Path, size: u64) -> Result<()> {
+    let free = sys::free_bytes(path.parent().unwrap_or(Path::new("/")))?;
+    if free < size + (1 << 30) {
+        return Err(Exit(
+            EXIT_SANDBOX,
+            format!(
+                "not enough disk: this VM needs {} MiB, {} MiB free",
+                size >> 20,
+                free >> 20
+            ),
+        )
+        .into());
+    }
+    let f = File::create(path)?;
+    sys::preallocate(&f, size).context("reserving disk space")?;
     Ok(())
 }
 
@@ -1006,10 +1034,7 @@ fn find_at_line_start(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn cancelled(cfg: &Config, id: &str) -> bool {
-    Ledger::open(&cfg.paths.state)
-        .ok()
-        .and_then(|l| l.get(id))
-        .is_none_or(|v| v.cancel)
+    ledger::peek(&cfg.paths.state, id).is_none_or(|v| v.cancel)
 }
 
 /// after the console closed: the VM must be gone before its result disk is read
@@ -1058,22 +1083,26 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
         std::thread::sleep(Duration::from_millis(100));
     }
     let stopped = done(&mut child) && !cgroup::populated(id);
-    let Ok(led) = Ledger::open(&cfg.paths.state) else {
-        return false;
-    };
     if !stopped {
-        let _ = led.update(id, |v| v.status = "cleanup-failed".into());
+        if let Ok(led) = Ledger::open(&cfg.paths.state) {
+            let _ = led.update(id, |v| v.status = "cleanup-failed".into());
+        }
         log_line(&format!(
             "teardown {id}: VM did not stop, slot kept for the reaper"
         ));
         return false;
     }
+    // the slow parts (subprocesses, deleting files) happen without the ledger lock
     cgroup::remove(id);
-    if let Some(i) = led.get(id).and_then(|v| v.net_slot) {
+    if let Some(i) = ledger::peek(&cfg.paths.state, id).and_then(|v| v.net_slot) {
         net::tap_down(cfg, i);
     }
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
-    if jail.exists() && fs::remove_dir_all(&jail).is_err() {
+    let jail_gone = !jail.exists() || fs::remove_dir_all(&jail).is_ok();
+    let Ok(led) = Ledger::open(&cfg.paths.state) else {
+        return false;
+    };
+    if !jail_gone {
         let _ = led.update(id, |v| {
             v.status = "cleanup-failed".into();
             v.wrapper = None;
@@ -1138,12 +1167,7 @@ fn tail_of(path: &Path, n: u64) -> Vec<u8> {
 }
 
 pub fn log_line(msg: &str) {
-    // journald picks this up via the logger tool; a missing logger isn't worth failing over
-    let _ = Command::new("logger")
-        .args(["-t", "burner", msg])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    sys::syslog(msg);
 }
 
 // ---- ls, kill, reap ----
@@ -1215,31 +1239,62 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// run every minute from a timer: stop VMs past their deadline, clean up after wrappers that died
+/// run every minute from a timer: stop VMs past their deadline, clean up after
+/// wrappers that died, keep the network filter current. the ledger lock is only
+/// held for reads and the final deletes, never across subprocesses or file removal
 pub fn reap(cfg: &Config) -> Result<ExitCode> {
     let now = sys::boottime();
-    let led = Ledger::open(&cfg.paths.state)?;
-    let known: Vec<String> = led.all().iter().map(|v| v.id.clone()).collect();
-    for v in led.all() {
+    let vms = Ledger::open(&cfg.paths.state)?.all();
+    let known: Vec<String> = vms.iter().map(|v| v.id.clone()).collect();
+    let mut done = Vec::new();
+    for v in &vms {
         if !valid_id(&v.id) {
             continue;
         }
         if v.deadline_boot.is_some_and(|d| now > d + 60.0) {
             cgroup::kill(&v.id);
         }
-        if !v.wrapper.as_ref().is_some_and(Ident::alive) {
-            cgroup::kill(&v.id);
-            if cgroup::populated(&v.id) {
+        if v.wrapper.as_ref().is_some_and(Ident::alive) {
+            continue;
+        }
+        cgroup::kill(&v.id);
+        let until = Instant::now() + Duration::from_secs(3);
+        while cgroup::populated(&v.id) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if cgroup::populated(&v.id) {
+            continue;
+        }
+        cgroup::remove(&v.id);
+        if let Some(i) = v.net_slot {
+            net::tap_down(cfg, i);
+        }
+        let jail = cfg.paths.root.join("jail/firecracker").join(&v.id);
+        let _ = fs::remove_dir_all(cfg.paths.root.join("run").join(&v.id));
+        done.push((
+            v.id.clone(),
+            !jail.exists() || fs::remove_dir_all(&jail).is_ok(),
+        ));
+    }
+    {
+        let led = Ledger::open(&cfg.paths.state)?;
+        for v in &vms {
+            if !v.wrapper.as_ref().is_some_and(Ident::alive) && cgroup::populated(&v.id) {
                 let _ = led.update(&v.id, |x| x.status = "cleanup-failed".into());
-                continue;
             }
-            cgroup::remove(&v.id);
-            let jail = cfg.paths.root.join("jail/firecracker").join(&v.id);
-            if !jail.exists() || fs::remove_dir_all(&jail).is_ok() {
-                led.delete(&v.id);
-                log_line(&format!("reap {} (wrapper gone)", v.id));
-            } else {
-                let _ = led.update(&v.id, |x| x.status = "cleanup-failed".into());
+        }
+        for (id, clean) in &done {
+            // only if nobody revived it meanwhile
+            if led
+                .get(id)
+                .is_some_and(|v| !v.wrapper.as_ref().is_some_and(Ident::alive))
+            {
+                if *clean {
+                    led.delete(id);
+                    log_line(&format!("reap {id} (wrapper gone)"));
+                } else {
+                    let _ = led.update(id, |x| x.status = "cleanup-failed".into());
+                }
             }
         }
     }
@@ -1251,7 +1306,11 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .and_then(|t| unix_now.duration_since(t).ok())
             .is_some_and(|d| d.as_secs() > secs)
     };
-    let used: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
+    let used: Vec<u32> = Ledger::open(&cfg.paths.state)?
+        .all()
+        .iter()
+        .filter_map(|v| v.net_slot)
+        .collect();
     for i in net::taps_present() {
         if !used.contains(&i) {
             net::tap_down(cfg, i);
@@ -1284,11 +1343,19 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         .flatten()
         .filter_map(|e| e.ok())
     {
+        // run dirs hold spooled input (up to 512M); drop them once their wrapper is gone
         let name = e.file_name().to_string_lossy().into_owned();
-        if valid_id(&name) && !known.contains(&name) && old(&e.path(), 86400) {
+        if !valid_id(&name) || known.contains(&name) {
+            continue;
+        }
+        let owner: Option<Ident> = fs::read(e.path().join("owner"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        if owner.as_ref().is_some_and(|o| !o.alive()) || (owner.is_none() && old(&e.path(), 600)) {
             let _ = fs::remove_dir_all(e.path());
         }
     }
+    net::check(cfg);
     Ok(ExitCode::SUCCESS)
 }
 

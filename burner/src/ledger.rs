@@ -124,6 +124,12 @@ impl Ledger {
     }
 }
 
+/// one VM's entry without taking the lock. writes are tmp + rename, so a
+/// reader sees the old or the new file, never half of one
+pub fn peek(state: &Path, id: &str) -> Option<Vm> {
+    serde_json::from_slice(&fs::read(state.join("vms").join(format!("{id}.json"))).ok()?).ok()
+}
+
 pub fn valid_id(id: &str) -> bool {
     id.len() == 19
         && id.starts_with("burner-")
