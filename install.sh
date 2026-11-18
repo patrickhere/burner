@@ -2,13 +2,17 @@
 # install burner on this machine. run from a checkout after `cargo build --release`:
 #   sudo ./install.sh
 # downloads firecracker, the jailer and a guest kernel (pinned and checksummed),
-# creates the burner user, installs the binary and systemd units, then runs burner doctor.
+# creates the burner and burner-parse users, installs the binary and systemd
+# units, then runs burner doctor. everything is downloaded and checked before
+# anything already installed is replaced. safe to run again to upgrade.
 set -eu
+umask 022
 
 FC_VERSION=v1.18.0
 KERNEL_BUILD=20261111-778a26c0594c-0
 KERNEL_VERSION=6.1.188
 ROOT=/var/lib/burner
+BIN=/usr/local/bin/burner
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -28,46 +32,107 @@ ARCH=$(uname -m)
 src=$(cd "$(dirname "$0")" && pwd)
 bin="$src/target/release/burner"
 [ -x "$bin" ] || die "no $bin, build it first: cargo build --release"
-for t in curl tar sha256sum ip nft mkfs.ext4 systemctl; do
+for t in curl tar sha256sum ip nft mkfs.ext4 conntrack systemctl useradd; do
     command -v "$t" >/dev/null 2>&1 || die "missing $t"
 done
+for f in burner-net.service burner-reap.service burner-reap.timer; do
+    [ -f "$src/dist/$f" ] || die "missing dist/$f in the checkout"
+done
+
+# a service account burner can trust: exists or gets created, never root, never
+# a login account someone else already uses
+account() { # name
+    if ! id "$1" >/dev/null 2>&1; then
+        echo "creating the $1 user"
+        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$1"
+    fi
+    uid=$(id -u "$1")
+    [ "$uid" != 0 ] || die "user $1 is root, burner needs an unprivileged account"
+    max=$(awk '$1 == "SYS_UID_MAX" {print $2}' /etc/login.defs 2>/dev/null)
+    [ "$uid" -le "${max:-999}" ] || die "user $1 (uid $uid) looks like a person's account, not a system one"
+    case "$(getent passwd "$1" | cut -d: -f7)" in
+        */nologin|*/false) ;;
+        *) die "user $1 has a login shell, burner wants an account nobody logs in as" ;;
+    esac
+}
+
+# dirs root writes into must not be writable by anyone else
+root_only() { # path
+    p=$1
+    while [ -n "$p" ] && [ "$p" != / ]; do
+        if [ -e "$p" ]; then
+            [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
+            case "$(stat -c %A "$p")" in
+                ?????w????|????????w?) die "$p is writable by others than root" ;;
+            esac
+        fi
+        p=$(dirname "$p")
+    done
+}
 
 fetch() { # url sha256 dest
-    curl -fsSL --retry 3 -o "$3" "$1"
+    curl -fsSL --proto '=https' --retry 3 -o "$3" "$1" || die "download failed: $1"
     echo "$2  $3" | sha256sum -c --quiet - || die "checksum mismatch for $1"
 }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# 1. stage: download and check everything first
 echo "firecracker $FC_VERSION"
 fetch "https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz" \
     "$FC_SHA" "$work/fc.tgz"
 tar -xzf "$work/fc.tgz" -C "$work"
-install -d -m 0755 "$ROOT" "$ROOT/bin" "$ROOT/kernel" "$ROOT/images"
-install -m 0755 "$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH" "$ROOT/bin/firecracker"
-install -m 0755 "$work/release-$FC_VERSION-$ARCH/jailer-$FC_VERSION-$ARCH" "$ROOT/bin/jailer"
+fc="$work/release-$FC_VERSION-$ARCH/firecracker-$FC_VERSION-$ARCH"
+jailer="$work/release-$FC_VERSION-$ARCH/jailer-$FC_VERSION-$ARCH"
+"$fc" --version >/dev/null 2>&1 || die "the downloaded firecracker doesn't run here"
+"$jailer" --version >/dev/null 2>&1 || die "the downloaded jailer doesn't run here"
 
 echo "guest kernel $KERNEL_VERSION"
 fetch "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$KERNEL_BUILD/$ARCH/vmlinux-$KERNEL_VERSION" \
     "$KERNEL_SHA" "$work/vmlinux"
-install -m 0644 "$work/vmlinux" "$ROOT/kernel/vmlinux-$KERNEL_VERSION"
-ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux"
 
-if ! id burner >/dev/null 2>&1; then
-    echo "creating the burner user"
-    useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin burner
-fi
+"$bin" config >/dev/null 2>&1 || "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
+
+account burner
+account burner-parse
+[ "$(id -u burner)" != "$(id -u burner-parse)" ] || die "burner and burner-parse must be different users"
 getent group kvm >/dev/null && usermod -aG kvm burner
 
-install -m 0755 "$bin" /usr/local/bin/burner
+# 2. install: each file goes in under a temp name and is renamed into place
+root_only "$ROOT"
+root_only /etc/burner
+root_only "$(dirname "$BIN")"
+install -d -m 0755 "$ROOT" "$ROOT/bin" "$ROOT/kernel" "$ROOT/images"
+put() { # mode src dest
+    install -m "$1" "$2" "$3.new"
+    mv -f "$3.new" "$3"
+}
+put 0755 "$fc" "$ROOT/bin/firecracker"
+put 0755 "$jailer" "$ROOT/bin/jailer"
+put 0644 "$work/vmlinux" "$ROOT/kernel/vmlinux-$KERNEL_VERSION"
+ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux.new"
+mv -fT "$ROOT/kernel/vmlinux.new" "$ROOT/kernel/vmlinux"
+put 0755 "$bin" "$BIN"
+
 install -d -m 0755 /etc/burner
-[ -f /etc/burner/config.toml ] || burner config > /etc/burner/config.toml
-install -m 0644 "$src"/dist/burner-net.service "$src"/dist/burner-reap.service "$src"/dist/burner-reap.timer /etc/systemd/system/
+if [ -s /etc/burner/config.toml ]; then
+    "$BIN" config >/dev/null || die "/etc/burner/config.toml has errors (above), fix it and run this again"
+else
+    "$BIN" config > /etc/burner/config.toml.new
+    mv -f /etc/burner/config.toml.new /etc/burner/config.toml
+fi
+
+for f in burner-net.service burner-reap.service burner-reap.timer; do
+    put 0644 "$src/dist/$f" "/etc/systemd/system/$f"
+done
 systemctl daemon-reload
-systemctl enable --now burner-net.service burner-reap.timer
+systemctl enable burner-net.service burner-reap.timer >/dev/null
+# reload, not restart: a restart runs net down first, which stops networked VMs
+systemctl reload-or-restart burner-net.service || die "burner-net failed to start, see: journalctl -u burner-net"
+systemctl start burner-reap.timer
 
 echo
-burner doctor || true
+"$BIN" doctor || die "burner doctor found problems, see the FAIL lines above"
 echo
 [ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: tools/build-image alpine (needs docker)"

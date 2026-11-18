@@ -4,9 +4,11 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use crate::config::{self, Config};
 use crate::net;
+use crate::sys;
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum Level {
@@ -122,19 +124,20 @@ fn cgroups(r: &mut Report) {
 }
 
 fn tools(r: &mut Report) {
-    for t in ["ip", "nft", "mkfs.ext4"] {
-        if which(t) {
+    for t in ["ip", "nft", "mkfs.ext4", "conntrack"] {
+        if sys::which(t) {
             r.line(Level::Ok, t, "found");
         } else {
             let pkg = match t {
                 "ip" => "iproute2",
                 "nft" => "nftables",
+                "conntrack" => "conntrack",
                 _ => "e2fsprogs",
             };
             r.line(Level::Fail, t, format!("not found, install {pkg}"));
         }
     }
-    if which("firewall-cmd")
+    if sys::which("firewall-cmd")
         && run_ok("firewall-cmd", &["--state"]).is_some_and(|o| o.trim() == "running")
     {
         r.line(
@@ -198,7 +201,7 @@ fn network(r: &mut Report, cfg: &Config) {
                 "firewall",
                 format!("ufw is active and has no rule for burner: {cmd}"),
             ),
-            Ok(None) if which("ufw") => {
+            Ok(None) if sys::which("ufw") => {
                 r.line(Level::Ok, "firewall", "ufw allows the VM subnet out")
             }
             _ => {}
@@ -251,7 +254,9 @@ fn memory(r: &mut Report, cfg: &Config) {
         r.line(Level::Warn, "memory", "couldn't read /proc/meminfo");
         return;
     };
-    let want = u64::from(cfg.limits.total_mem_mib);
+    // guest RAM plus what each firecracker process may use on top
+    let want = u64::from(cfg.limits.total_mem_mib)
+        + u64::from(cfg.limits.max_vms) * crate::run::VMM_OVERHEAD_MIB;
     let level = if avail >= want + 512 {
         Level::Ok
     } else {
@@ -260,7 +265,7 @@ fn memory(r: &mut Report, cfg: &Config) {
     r.line(
         level,
         "memory",
-        format!("{avail} MiB free of {total}, VMs may use up to {want} (limits.total_mem_mib)"),
+        format!("{avail} MiB free of {total}, VMs may use up to {want} (limits.total_mem_mib + {} per VM)", crate::run::VMM_OVERHEAD_MIB),
     );
 }
 
@@ -316,6 +321,26 @@ fn install(r: &mut Report, cfg: &Config) {
             );
         }
     }
+    // the VM user and the result parser's user: both unprivileged, never the same
+    let vm = sys::user_ids(crate::run::USER);
+    let parse = sys::user_ids(crate::result::PARSE_USER);
+    match (vm, parse) {
+        (Some((a, _)), Some((b, _))) if a != 0 && b != 0 && a != b => r.line(
+            Level::Ok,
+            "users",
+            format!("burner ({a}), burner-parse ({b})"),
+        ),
+        (Some(_), Some(_)) => r.line(
+            Level::Fail,
+            "users",
+            "burner and burner-parse must be two different non-root users",
+        ),
+        _ => r.line(
+            Level::Warn,
+            "users",
+            "burner or burner-parse missing, install.sh creates them",
+        ),
+    }
     let images = fs::read_dir(root.join("images"))
         .map(|d| {
             d.filter_map(|e| e.ok())
@@ -338,17 +363,8 @@ fn existing_parent(p: &Path) -> String {
         .to_string()
 }
 
-fn which(cmd: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
-        .unwrap_or(false)
-        || ["/usr/sbin", "/sbin"]
-            .iter()
-            .any(|d| Path::new(d).join(cmd).is_file())
-}
-
 fn run_ok(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
+    let out = sys::run_timeout(Command::new(cmd).args(args), None, Duration::from_secs(30)).ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

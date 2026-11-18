@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/burner net up
+ExecReload=/usr/local/bin/burner net up
 ExecStop=/usr/local/bin/burner net down
 
 [Install]
