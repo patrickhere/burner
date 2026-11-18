@@ -4,7 +4,7 @@ throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or 
 
 it started as a sandbox on my homelab for running code i don't trust (install scripts, other people's repos, things agents want to run) away from the box that has my keys on it. this is the rebuild in rust so other people can install it. the homelab version stays private, so the history here starts with the rebuild.
 
-status: early. one maintainer, tested on ubuntu 26.04 and debian 13 on x86_64, aarch64 builds but has never booted a VM, and nobody has audited it.
+status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's runners) and debian 13 on x86_64, aarch64 builds but has never booted a VM, and nobody has audited it.
 
 ```
 sudo burner shell                          # root shell in a fresh VM, gone when you exit
