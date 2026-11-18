@@ -50,7 +50,7 @@ pub struct Limits {
     pub ttl_shell_secs: u32,
     pub max_vms: u32,
     pub total_mem_mib: u32,
-    /// the most network any run may ask for: none, web or open
+    /// the most network any run may ask for: none, web or open. default web
     pub net: String,
 }
 
@@ -85,7 +85,8 @@ impl Default for Limits {
             ttl_shell_secs: 3600,
             max_vms: 2,
             total_mem_mib: 3072,
-            net: "open".into(),
+            // open (any port but mail) is something you opt into
+            net: "web".into(),
         }
     }
 }

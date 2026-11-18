@@ -8,6 +8,11 @@ pass=0; fail=0
 ok()  { echo "PASS  $1"; pass=$((pass+1)); }
 bad() { echo "FAIL  $1  ($2)"; fail=$((fail+1)); }
 
+if ! sudo burner config | grep -qx 'net = "open"'; then
+    echo "network.sh tests --net open too: set net = \"open\" under [limits] in /etc/burner/config.toml"
+    exit 1
+fi
+
 # targets a VM must never reach, found on this host: the default gateway, the
 # host's own addresses and something behind every other route (VPNs, LANs,
 # docker). only ones the host itself can reach count, so a BLOCKED result means
