@@ -79,9 +79,10 @@ fi
 
 token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
 mkdir -p /job /work /out /result
-# rc and the log live in their own small tmpfs, so a full scratch disk can't lose them
-mount -t tmpfs -o size=24m,mode=0700 tmpfs /result
-LOG=/var/tmp/burner-log.txt
+# rc and the log live in their own small tmpfs, so a full scratch disk can't lose
+# them. the log never touches scratch at all: 64K head + 5 rolling 4M chunks
+mount -t tmpfs -o size=40m,mode=0700 tmpfs /result || { echo "burner-init: /result tmpfs failed" > /dev/console; halt; }
+C=/result/chunks; mkdir -p "$C"
 
 # raw console: no \n -> \r\n, so the live bytes match the log exactly
 stty -opost 2>/dev/null
@@ -90,6 +91,22 @@ fail() {   # sandbox-side failure before the command ran
     echo "BURNER-$token-BEGIN"; echo "burner: $1"; echo "BURNER-$token-END"
     echo "burner: $1" > /result/log.txt
     echo 125 > /result/rc
+}
+
+# reads the job's output from stdin: the first 64K to the console and /result/head,
+# the rest into 4M chunks, keeping only the newest 5. prints the total byte count
+capture() {
+    dd bs=65536 count=1 iflag=fullblock 2>/dev/null | tee /result/head
+    total=$(wc -c < /result/head)
+    n=0
+    while :; do
+        dd of="$C/$n" bs=1048576 count=4 iflag=fullblock 2>/dev/null
+        size=$(wc -c < "$C/$n" 2>/dev/null || echo 0)
+        [ "$size" -gt 0 ] || { rm -f "$C/$n"; break; }
+        rm -f "$C/$((n - 5))"
+        total=$((total + size)); n=$((n + 1))
+    done
+    echo "$total $n" > /result/total
 }
 
 if ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
@@ -103,25 +120,27 @@ else
     export HOME=/root TERM=dumb LANG=C.UTF-8 BURNER=1
     echo "BURNER-$token-BEGIN"
     # the serial console is slow (nested virt), so only the first 64K goes out live.
-    # the full log goes back on the result disk and the host prints the rest.
-    { /bin/sh /job/run.sh < "$stdin"; echo $? > /result/rc; } 2>&1 \
-        | tee "$LOG" | { head -c 65536; cat > /dev/null; }
-    total=$(wc -c < "$LOG" 2>/dev/null || echo 0)
-    live=$(( total < 65536 ? total : 65536 ))
+    # the log goes back on the result disk and the host prints the rest
+    { /bin/sh /job/run.sh < "$stdin"; echo $? > /result/rc; } 2>&1 | capture
+    live=$(wc -c < /result/head 2>/dev/null || echo 0)
+    read -r total n < /result/total 2>/dev/null || { total=0; n=0; }
     last=""
-    [ "$live" -gt 0 ] && last=$(dd if="$LOG" bs=1 skip=$((live - 1)) count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ "$live" -gt 0 ] && last=$(tail -c 1 /result/head | od -An -tx1 | tr -d ' \n')
     if [ "$live" -gt 0 ] && [ "$last" != 0a ]; then
         printf '\nBURNER-%s-ENDN\n' "$token"     # N: the newline before the marker is ours, not output
     else
         printf 'BURNER-%s-END\n' "$token"
     fi
-    if [ "$total" -gt 16777216 ]; then
-        tail -c 16777216 "$LOG" > /result/log.txt
-        echo $((total - 16777216)) > /result/log_skipped
-    else
-        cat "$LOG" > /result/log.txt 2>/dev/null
-    fi
-    rm -f "$LOG"
+    # the surviving chunks in order, after the head only if nothing between them
+    # was dropped, cut to the last 16M
+    i=$((n > 5 ? n - 5 : 0)); parts=""
+    [ "$i" = 0 ] && parts=/result/head
+    while [ "$i" -lt "$n" ]; do parts="$parts $C/$i"; i=$((i + 1)); done
+    # shellcheck disable=SC2086
+    cat $parts | tail -c 16777216 > /result/log.txt || echo "log assembly failed" > /result/error
+    kept=$(wc -c < /result/log.txt 2>/dev/null || echo 0)
+    [ "$total" -gt "$kept" ] && echo $((total - kept)) > /result/log_skipped
+    rm -rf "$C" /result/head /result/total
     [ -f /result/rc ] || echo 125 > /result/rc
 fi
 
