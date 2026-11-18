@@ -1,5 +1,6 @@
 # lint, unit tests and static builds. the VM test suites need root, kvm and
-# nftables, so they run on a dedicated box against main, not here
+# nftables: vm-suites.yml runs them on a github runner, and a dedicated box
+# runs them against main too
 name: ci
 
 on:

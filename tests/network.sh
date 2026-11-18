@@ -83,7 +83,10 @@ sudo burner run --net web -- "$PROBES" </dev/null > "$T/web.txt" 2>&1
 for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ssh-out ipv6-global; do
     expect "$T/web.txt" "$t" BLOCKED web
 done
-for t in dns ping-internet https-github https-pypi https-npm https-crates; do expect "$T/web.txt" "$t" OPEN web; done
+# some clouds (github's runners on azure) drop all icmp from the host itself
+web_open="dns https-github https-pypi https-npm https-crates"
+if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then web_open+=" ping-internet"; else echo "SKIP  web: ping-internet  (the host can't ping out either)"; fi
+for t in $web_open; do expect "$T/web.txt" "$t" OPEN web; done
 
 sudo burner run --net open -- "$PROBES" </dev/null > "$T/open.txt" 2>&1
 for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ipv6-global; do
