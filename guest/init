@@ -101,7 +101,9 @@ capture() {
     # busybox ash has pipefail, plain posix sh doesn't. this only runs on busybox
     # shellcheck disable=SC3040
     set -o pipefail
-    if ! dd bs=65536 count=1 iflag=fullblock 2>/dev/null | tee /result/head; then
+    # one byte at a time so it streams as the job writes, and stops at exactly 64K
+    # (busybox head -c reads past its count, a 64K block would wait for 64K)
+    if ! dd bs=1 count=65536 2>/dev/null | tee /result/head; then
         echo "log capture failed" > /result/error
     fi
     total=$(wc -c < /result/head 2>/dev/null || echo 0)
