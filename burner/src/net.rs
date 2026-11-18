@@ -106,7 +106,7 @@ pub fn blocked(cfg: &Config) -> Result<Vec<String>> {
         add((addr, 32));
         add((addr, prefix));
     }
-    for dst in route_dsts()? {
+    for dst in route_dsts(&cfg.uplink()?)? {
         if dst.1 > 0 {
             add(dst);
         }
@@ -152,16 +152,29 @@ fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
     Ok(addrs)
 }
 
-fn route_dsts() -> Result<Vec<(Ipv4Addr, u8)>> {
+/// destinations of every route except the default ones, and except routes that
+/// go out the uplink through the default gateway: those reach the same place
+/// the default route does. dhcp clients add such routes for the dns servers
+/// they hand out (systemd-networkd does by default), and blocking them would
+/// block public resolvers like 1.1.1.1
+fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
     let out = helper("ip", &["-j", "-4", "route", "show", "table", "all"], None)?;
     if !out.status.success() {
         bail!("ip route show failed");
     }
     // a route list we can't read must not shrink the blocked set
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("reading ip route")?;
-    Ok(v.as_array()
-        .into_iter()
-        .flatten()
+    let routes = v.as_array().cloned().unwrap_or_default();
+    let gateways: Vec<&str> = routes
+        .iter()
+        .filter(|r| r["dst"] == "default" && r["dev"] == uplink)
+        .filter_map(|r| r["gateway"].as_str())
+        .collect();
+    Ok(routes
+        .iter()
+        .filter(|r| {
+            !(r["dev"] == uplink && r["gateway"].as_str().is_some_and(|g| gateways.contains(&g)))
+        })
         .filter_map(|r| {
             let dst = r["dst"].as_str()?;
             let (ip, p) = match dst.split_once('/') {
