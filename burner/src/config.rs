@@ -95,13 +95,23 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         // as root, a config decides what burner runs as root (paths.root holds
         // the jailer). only one that nobody but root could have written counts
+        let via_sudo = std::env::var_os("SUDO_UID").is_some();
         if crate::sys::is_root() {
-            trusted(path)?;
+            trusted(path, via_sudo)?;
         }
         let cfg = match fs::read_to_string(path) {
-            Ok(text) => {
-                toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?
-            }
+            Ok(text) => toml::from_str(&text).map_err(|e| {
+                // someone running burner through sudo doesn't get to read root's
+                // files through parse errors: position only, never the text
+                let line = e.span().map_or(0, |s| {
+                    text[..s.start.min(text.len())].matches('\n').count() + 1
+                });
+                if via_sudo {
+                    anyhow::anyhow!("{} is not a valid config (line {line})", path.display())
+                } else {
+                    anyhow::anyhow!("{} is not a valid config: {e}", path.display())
+                }
+            })?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
@@ -189,8 +199,10 @@ fn default_route_iface() -> Option<String> {
 }
 
 /// the config file and every directory above it: owned by root and writable by
-/// nobody else. a path other than the default has to exist
-fn trusted(path: &Path) -> Result<()> {
+/// nobody else. a path other than the default has to exist, and through sudo it
+/// has to be in /etc/burner, so a sudo rule for burner can't be used to load
+/// some other root-owned file as a config
+fn trusted(path: &Path, via_sudo: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let real = match fs::canonicalize(path) {
         Ok(p) => p,
@@ -199,6 +211,9 @@ fn trusted(path: &Path) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("config {}", path.display())),
     };
+    if via_sudo && !real.starts_with("/etc/burner/") {
+        bail!("through sudo, --config has to be a file in /etc/burner");
+    }
     for p in real.ancestors() {
         let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
         if m.uid() != 0 || m.mode() & 0o022 != 0 {

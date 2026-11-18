@@ -47,28 +47,25 @@ pub fn random_hex(bytes: usize) -> io::Result<String> {
 pub struct Lock(File);
 
 impl Lock {
+    /// waits up to a minute: a lock held longer than that means something is
+    /// stuck, and failing beats hanging forever
     pub fn exclusive(path: &std::path::Path) -> io::Result<Lock> {
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)?;
-        // SAFETY: valid fd for the life of the call
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Lock(f))
+        Lock::exclusive_until(path, std::time::Instant::now() + Duration::from_secs(60))
     }
 }
 
 impl Lock {
     /// like exclusive, but gives up at the deadline instead of waiting forever
     pub fn exclusive_until(path: &std::path::Path, until: std::time::Instant) -> io::Result<Lock> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let f = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
+            .mode(0o600)
             .open(path)?;
+        // root-only, so nobody else can open it and sit on the lock
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
         loop {
             // SAFETY: valid fd for the life of the call
             if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
@@ -507,6 +504,13 @@ fn remove_at(dirfd: libc::c_int, name: &std::ffi::CStr, mnt: u64) -> bool {
     unsafe { libc::close(fd) };
     // SAFETY: unlinkat(2) of a name in a dir fd we hold
     ok && unsafe { libc::unlinkat(dirfd, name.as_ptr(), libc::AT_REMOVEDIR) == 0 }
+}
+
+/// a directory only root can enter: burner's state dir and the ledger in it
+pub fn private_dir(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(test)]

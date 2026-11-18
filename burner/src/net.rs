@@ -362,7 +362,7 @@ fn fail_closed(why: &str) {
 }
 
 fn net_lock(cfg: &Config) -> Result<sys::Lock> {
-    std::fs::create_dir_all(&cfg.paths.state)?;
+    sys::private_dir(&cfg.paths.state)?;
     Ok(sys::Lock::exclusive(&cfg.paths.state.join("net.lock"))?)
 }
 
@@ -598,7 +598,7 @@ pub fn reap_orphan_taps(cfg: &Config) -> Vec<u32> {
 }
 
 fn net_lock_for(cfg: &Config, wait: std::time::Duration) -> Result<sys::Lock> {
-    std::fs::create_dir_all(&cfg.paths.state)?;
+    sys::private_dir(&cfg.paths.state)?;
     sys::Lock::exclusive_until(
         &cfg.paths.state.join("net.lock"),
         std::time::Instant::now() + wait,

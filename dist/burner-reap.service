@@ -4,3 +4,5 @@ Description=burner: stop VMs past their deadline, clean up after dead runs
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/burner reap
+# every lock wait inside gives up after a minute; this is the backstop
+TimeoutStartSec=5min

@@ -58,7 +58,8 @@ pub struct Ledger {
 impl Ledger {
     pub fn open(state: &Path) -> Result<Ledger> {
         let dir = state.join("vms");
-        fs::create_dir_all(&dir)?;
+        sys::private_dir(state)?;
+        sys::private_dir(&dir)?;
         let lock = sys::Lock::exclusive(&state.join("ledger.lock"))?;
         Ok(Ledger { dir, _lock: lock })
     }

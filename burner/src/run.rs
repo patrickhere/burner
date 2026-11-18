@@ -1657,7 +1657,7 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
 /// held for reads and the final deletes, never across subprocesses or file removal
 pub fn reap(cfg: &Config) -> Result<ExitCode> {
     // one reaper at a time; a second one just leaves it to the first
-    fs::create_dir_all(&cfg.paths.state)?;
+    sys::private_dir(&cfg.paths.state)?;
     let Ok(_reaping) =
         sys::Lock::exclusive_until(&cfg.paths.state.join("reap.lock"), Instant::now())
     else {
