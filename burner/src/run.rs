@@ -37,7 +37,12 @@ const STDIN_TOTAL: Duration = Duration::from_secs(600);
 const CMD_CAP: usize = 64 << 10;
 const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
-pub const VMM_OVERHEAD_MIB: u64 = 128;
+/// what the VM's cgroup may use on top of guest RAM: firecracker itself, plus
+/// host page cache from writes to its disks, which is charged to the same cgroup
+pub const VMM_OVERHEAD_MIB: u64 = 256;
+/// past this much over guest RAM the kernel starts flushing and throttling the
+/// VM's writes, long before the hard limit would kill firecracker
+const VMM_SOFT_MIB: u64 = 64;
 /// setup (disks, tap) has this long before the reaper stops the wrapper
 const PREP_SECS: u32 = 180;
 
@@ -669,6 +674,13 @@ fn run_vm(
         .args([
             "--cgroup",
             &format!(
+                "memory.high={}",
+                (u64::from(p.mem_mib) + VMM_SOFT_MIB) << 20
+            ),
+        ])
+        .args([
+            "--cgroup",
+            &format!(
                 "memory.max={}",
                 (u64::from(p.mem_mib) + VMM_OVERHEAD_MIB) << 20
             ),
@@ -793,6 +805,12 @@ fn run_vm(
             } else {
                 Vec::new()
             };
+            if meta.rc.is_none() && cgroup::oom_kills(id) > 0 {
+                diag.put(
+                    b"burner: the VM's cgroup ran out of memory and the kernel killed firecracker\n",
+                    None,
+                );
+            }
             teardown(cfg, id, Some(&mut child));
             *held = None;
             let until = Instant::now() + DELIVER_TIMEOUT;

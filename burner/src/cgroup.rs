@@ -10,6 +10,18 @@ fn path(id: &str) -> PathBuf {
     PathBuf::from("/sys/fs/cgroup").join(PARENT).join(id)
 }
 
+/// how many times the kernel's OOM killer fired inside the VM's cgroup
+pub fn oom_kills(id: &str) -> u64 {
+    fs::read_to_string(path(id).join("memory.events"))
+        .ok()
+        .and_then(|e| {
+            e.lines()
+                .find_map(|l| l.strip_prefix("oom_kill "))
+                .and_then(|n| n.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 /// true unless the cgroup is gone or confirmed empty: a read that fails for any
 /// other reason counts as busy, so its slot stays taken
 pub fn populated(id: &str) -> bool {
