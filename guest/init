@@ -111,6 +111,32 @@ capture() {
     echo "$total $n" > /result/total
 }
 
+# the session id of a pid, from /proc/PID/stat. comm can hold spaces and ")",
+# so everything up to the last ") " goes first
+sid() {
+    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    st=${st##*) }
+    # shellcheck disable=SC2086
+    set -- $st
+    echo "$4"
+}
+
+# something the job left running in the background (a server, a daemon) still
+# holds the output pipe, so capture would wait for it until the time limit.
+# once the job has exited, everything outside init's own session goes. a few
+# rounds, since a stray can fork while this looks
+strays() {
+    me=$(sid 1)
+    for _ in 1 2 3; do
+        for d in /proc/[0-9]*; do
+            p=${d#/proc/}
+            s=$(sid "$p") || continue
+            # 0 is the kernel's own threads
+            [ "$s" = "$me" ] || [ "$s" = 0 ] || kill -KILL "$p" 2>/dev/null
+        done
+    done
+}
+
 if [ "$want" != "$PROTO" ]; then
     fail "this image's guest init speaks protocol $PROTO and burner wants ${want:-none}, rebuild the image with tools/build-image"
 elif ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
@@ -138,7 +164,7 @@ else
         watchdog=$!
     fi
     # shellcheck disable=SC2016
-    { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec /bin/sh /job/run.sh' < "$stdin"; echo $? > /result/rc; } 2>&1 | capture
+    { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec /bin/sh /job/run.sh' < "$stdin"; echo $? > /result/rc; strays; } 2>&1 | capture
     [ -n "${watchdog:-}" ] && kill "$watchdog" 2>/dev/null
     live=$(wc -c < /result/head 2>/dev/null || echo 0)
     read -r total n < /result/total 2>/dev/null || { total=0; n=0; }

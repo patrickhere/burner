@@ -196,6 +196,24 @@ e=$(date +%s)
   && ok "SIGKILLed wrapper: reaper stopped the VM and freed the slot in $((e - s))s" \
   || bad "sigkill wrapper" "vid=$vid still=$(sudo burner ls | grep -c ' sigkill ')"
 
+# 20 something left running in the background doesn't hold the run open: the
+# run ends with the job, with the job's own exit code, its output and /out
+s=$(date +%s)
+a=$(sudo burner run -- 'sleep 300 & echo ok' </dev/null 2>&1); ra=$?
+b=$(sudo burner run -- 'setsid sleep 300 & echo ok' </dev/null 2>&1); rb=$?
+sudo burner run -- 'sleep 300 & exit 7' </dev/null >/dev/null 2>&1; rc7=$?
+sudo burner run --result tar -- 'sleep 300 & echo hi > /out/f' </dev/null > "$T/bg.tar" 2>/dev/null; rt=$?
+e=$(date +%s)
+[ "$a" = ok ] && [ "$ra" = 0 ] && [ "$b" = ok ] && [ "$rb" = 0 ] && [ "$rc7" = 7 ] && [ "$rt" = 0 ] \
+  && tar -tf "$T/bg.tar" 2>/dev/null | grep -qx 'out/f' && [ $((e - s)) -le 60 ] \
+  && ok "background processes don't hold a run open (4 runs in $((e - s))s)" \
+  || bad "background processes" "a=$ra:$a b=$rb:$b rc7=$rc7 tar=$rt secs=$((e - s))"
+s=$(date +%s); out=$(sudo burner run --ttl 20s -- 'echo before; sleep 300' </dev/null 2>/dev/null); rc=$?; e=$(date +%s)
+# the job's shell prints "Terminated" after it when the watchdog stops it
+[ "$rc" = 124 ] && [ "$(echo "$out" | head -n 1)" = before ] && [ $((e - s)) -le 30 ] \
+  && ok "a job that really runs on still ends at the ttl with its output (rc $rc)" \
+  || bad "ttl with output" "rc=$rc out=$out secs=$((e - s))"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]
