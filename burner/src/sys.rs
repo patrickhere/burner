@@ -268,11 +268,17 @@ pub fn dup_above(fd: i32, min: i32) -> io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(n) })
 }
 
-/// run a helper (ip, nft, mkfs) with a time limit. on timeout it's killed and
-/// reaped, never left behind. `input` goes to its stdin
+/// run a helper (ip, nft, conntrack) with one time limit covering the process,
+/// anything it forks and its output pipes. on timeout its whole process group is
+/// killed and reaped. `input` goes to its stdin
 pub fn run_timeout(cmd: &mut Command, input: Option<&[u8]>, limit: Duration) -> io::Result<Output> {
     use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc;
+    const CAP: u64 = 16 << 20;
+    let end = Instant::now() + limit;
     let mut child = cmd
+        .process_group(0)
         .stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -281,55 +287,83 @@ pub fn run_timeout(cmd: &mut Command, input: Option<&[u8]>, limit: Duration) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let feed = child
-        .stdin
-        .take()
-        .zip(input.map(<[u8]>::to_vec))
-        .map(|(mut w, data)| {
-            std::thread::spawn(move || {
-                let _ = w.write_all(&data);
-            })
-        });
-    let collect = |r: Option<Box<dyn Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut r) = r {
-                let _ = r.by_ref().take(16 << 20).read_to_end(&mut buf);
-            }
-            buf
-        })
+    let pgid = child.id() as libc::pid_t;
+    let kill_all = |child: &mut std::process::Child| {
+        // SAFETY: plain kill(2) on the helper's own process group
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = child.wait();
     };
-    let out = collect(
+    if let (Some(mut w), Some(data)) = (child.stdin.take(), input.map(<[u8]>::to_vec)) {
+        std::thread::spawn(move || {
+            let _ = w.write_all(&data);
+        });
+    }
+    let (tx, rx) = mpsc::channel();
+    for (n, r) in [
         child
             .stdout
             .take()
             .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let err = collect(
         child
             .stderr
             .take()
             .map(|r| Box::new(r) as Box<dyn Read + Send>),
-    );
-    let end = Instant::now() + limit;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let res = match r {
+                Some(r) => r.take(CAP + 1).read_to_end(&mut buf).map(|_| buf),
+                None => Ok(buf),
+            };
+            let _ = tx.send((n, res));
+        });
+    }
+    drop(tx);
     let status = loop {
-        if let Some(st) = child.try_wait()? {
-            break st;
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                kill_all(&mut child);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "helper timed out"));
+            }
+            Err(e) => {
+                kill_all(&mut child);
+                return Err(e);
+            }
         }
-        if Instant::now() >= end {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "helper timed out"));
-        }
-        std::thread::sleep(Duration::from_millis(20));
     };
-    if let Some(f) = feed {
-        let _ = f.join();
+    // the helper exited; whatever it forked may still hold the pipes open
+    let (mut stdout, mut stderr) = (None, None);
+    for _ in 0..2 {
+        let left = end
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(100));
+        match rx.recv_timeout(left) {
+            Ok((0, r)) => stdout = Some(r?),
+            Ok((_, r)) => stderr = Some(r?),
+            Err(_) => {
+                // SAFETY: plain kill(2) on the helper's own process group
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "helper left its output open",
+                ));
+            }
+        }
+    }
+    let (stdout, stderr) = (stdout.unwrap_or_default(), stderr.unwrap_or_default());
+    if stdout.len() as u64 > CAP || stderr.len() as u64 > CAP {
+        return Err(io::Error::other("helper output over 16M"));
     }
     Ok(Output {
         status,
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
+        stdout,
+        stderr,
     })
 }
 
@@ -341,4 +375,44 @@ pub fn which(cmd: &str) -> bool {
         || ["/usr/sbin", "/sbin"]
             .iter()
             .any(|d| std::path::Path::new(d).join(cmd).is_file())
+}
+
+static SAVED_TTY: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+/// release builds abort on panic, which skips every cleanup path. the hook
+/// still runs first: put the terminal back and undo any screen modes
+pub fn restore_tty_on_panic(reset: &'static [u8]) {
+    if let Some(t) = save_tty() {
+        let _ = SAVED_TTY.set(t);
+    }
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // SAFETY: plain write(2) of a static buffer to stdout
+        unsafe { libc::write(1, reset.as_ptr().cast(), reset.len()) };
+        restore_tty(SAVED_TTY.get());
+        prev(info);
+    }));
+}
+
+/// signal a process only if it's still the one `who` names. the pidfd pins the
+/// process, so a pid reused after the check can't get the signal
+pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
+    // SAFETY: pidfd_open and pidfd_send_signal are plain syscalls; the fd is
+    // closed on every path
+    unsafe {
+        let fd = libc::syscall(libc::SYS_pidfd_open, who.pid as libc::pid_t, 0) as libc::c_int;
+        if fd < 0 {
+            return false;
+        }
+        let ok = who.alive()
+            && libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                sig,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0;
+        libc::close(fd);
+        ok
+    }
 }

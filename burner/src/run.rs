@@ -539,6 +539,9 @@ fn run_vm(
         if cur.cancel {
             return Err(Exit(EXIT_INTERRUPTED, "cancelled before start".into()).into());
         }
+        if cur.deadline_boot.is_some_and(|d| sys::boottime() > d) {
+            return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
+        }
         led.update(id, |v| {
             v.status = "running".into();
             v.deadline_boot = Some(deadline.0);
@@ -552,9 +555,10 @@ fn run_vm(
     // own process group so a ctrl-c meant for burner doesn't hit the VM first.
     // firecracker never sees the caller's terminal, even for a shell: burner relays it
     jailer.process_group(0);
-    // SAFETY: join_from_child only calls open, write and close
+    let me = std::process::id() as libc::pid_t;
+    // SAFETY: join_from_child only makes plain syscalls (prctl, getppid, open, write, close)
     unsafe {
-        jailer.pre_exec(move || cgroup::join_from_child(&procs));
+        jailer.pre_exec(move || cgroup::join_from_child(&procs, me));
     }
     let mut child = jailer
         .args(["--id", id, "--exec-file"])
@@ -896,13 +900,20 @@ fn reserve(path: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
-/// between setup steps: stop if burner kill, a signal or the reaper said so
+/// between setup steps: stop if burner kill, a signal or the setup deadline
+/// (set at admission) says so
 fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
     if is_interrupted() {
         return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
     }
-    if cancelled(cfg, id) {
+    let v = ledger::peek(&cfg.paths.state, id);
+    if v.as_ref().is_none_or(|v| v.cancel) {
         return Err(Exit(EXIT_INTERRUPTED, "killed by burner kill".into()).into());
+    }
+    if v.is_some_and(|v| {
+        v.status == "preparing" && v.deadline_boot.is_some_and(|d| sys::boottime() > d)
+    }) {
+        return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
     }
     Ok(())
 }
@@ -1268,12 +1279,12 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
         return false;
     }
     // the slow parts (subprocesses, deleting files) happen without the ledger lock
-    cgroup::remove(id);
+    let cg_gone = cgroup::remove(id);
     let tap_gone = ledger::peek(&cfg.paths.state, id)
         .and_then(|v| v.net_slot)
         .is_none_or(|i| net::tap_down(cfg, i));
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
-    let jail_gone = remove_tree(&jail) && tap_gone;
+    let jail_gone = remove_tree(&jail) && tap_gone && cg_gone;
     let Ok(led) = Ledger::open(&cfg.paths.state) else {
         return false;
     };
@@ -1403,12 +1414,13 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
         eprintln!("burner: usage: burner kill burner-xxxxxxxxxxxx");
         return Ok(ExitCode::from(EXIT_USAGE));
     }
-    {
-        let led = Ledger::open(&cfg.paths.state)?;
-        if led.update(id, |v| v.cancel = true)?.is_none() {
-            eprintln!("burner: no VM {id}");
-            return Ok(ExitCode::from(1));
-        }
+    // nothing is printed while the ledger is locked: a stalled stderr would hold it
+    let found = Ledger::open(&cfg.paths.state)?
+        .update(id, |v| v.cancel = true)?
+        .is_some();
+    if !found {
+        eprintln!("burner: no VM {id}");
+        return Ok(ExitCode::from(1));
     }
     cgroup::kill(id);
     log_line(&format!("kill {id}"));
@@ -1440,11 +1452,13 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         if v.deadline_boot.is_some_and(|d| now > d + 5.0) {
             cgroup::kill(&v.id);
             // still setting up long past its time: something it ran is stuck
+            // read again: the snapshot may be stale and the VM running by now
+            let now_v = ledger::peek(&cfg.paths.state, &v.id);
             if v.status == "preparing"
-                && let Some(w) = v.wrapper.as_ref().filter(|w| w.alive())
+                && now_v.as_ref().is_some_and(|n| n.status == "preparing")
+                && let Some(w) = v.wrapper.as_ref()
+                && sys::signal_ident(w, libc::SIGTERM)
             {
-                // SAFETY: plain kill(2); alive() matched the pid's boot id and start time
-                unsafe { libc::kill(w.pid as i32, libc::SIGTERM) };
                 log_line(&format!("reap {}: setup stuck, stopping its wrapper", v.id));
             }
         }
@@ -1459,7 +1473,10 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         if cgroup::populated(&v.id) {
             continue;
         }
-        cgroup::remove(&v.id);
+        // something that joined late makes the remove fail: then nothing is freed
+        if !cgroup::remove(&v.id) {
+            continue;
+        }
         let tap_gone = v.net_slot.is_none_or(|i| net::tap_down(cfg, i));
         let jail = cfg.paths.root.join("jail/firecracker").join(&v.id);
         let run_gone = remove_tree(&cfg.paths.root.join("run").join(&v.id));
@@ -1512,8 +1529,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
                 continue;
             }
             cgroup::kill(&name);
-            if !cgroup::populated(&name) {
-                cgroup::remove(&name);
+            if !cgroup::populated(&name) && cgroup::remove(&name) {
                 remove_tree(&cfg.paths.root.join("jail/firecracker").join(&name));
                 log_line(&format!("reap orphan {name}"));
             }

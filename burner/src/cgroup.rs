@@ -10,16 +10,25 @@ fn path(id: &str) -> PathBuf {
     PathBuf::from("/sys/fs/cgroup").join(PARENT).join(id)
 }
 
+/// true unless the cgroup is gone or confirmed empty: a read that fails for any
+/// other reason counts as busy, so its slot stays taken
 pub fn populated(id: &str) -> bool {
-    fs::read_to_string(path(id).join("cgroup.events")).is_ok_and(|e| e.contains("populated 1"))
+    match fs::read_to_string(path(id).join("cgroup.events")) {
+        Ok(e) => e.contains("populated 1"),
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 pub fn kill(id: &str) {
     let _ = fs::write(path(id).join("cgroup.kill"), "1");
 }
 
-pub fn remove(id: &str) {
-    let _ = fs::remove_dir(path(id));
+/// true when the cgroup no longer exists
+pub fn remove(id: &str) -> bool {
+    match fs::remove_dir(path(id)) {
+        Ok(()) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// create the VM's cgroup before anything runs, so the jailer can join it
@@ -41,9 +50,19 @@ pub fn prepare(id: &str) -> std::io::Result<std::ffi::CString> {
 
 /// in a forked child: move this process into the cgroup. only open and write,
 /// which are async-signal-safe
-pub fn join_from_child(procs: &std::ffi::CStr) -> std::io::Result<()> {
-    // SAFETY: valid NUL-terminated path; plain syscalls between fork and exec
+/// runs between fork and exec. the child dies with burner from here on, and
+/// refuses to go on if burner already died, so a jailer can never start outside
+/// the cgroup with nobody left to account for it
+pub fn join_from_child(procs: &std::ffi::CStr, parent: libc::pid_t) -> std::io::Result<()> {
+    // SAFETY: valid NUL-terminated path; prctl, getppid, open, write and close
+    // are plain syscalls, fine between fork and exec
     unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::getppid() != parent {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
         let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
