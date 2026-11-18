@@ -121,9 +121,15 @@ pub fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
+/// setrlimit's resource type: its own typedef on glibc, a plain int on musl
+#[cfg(target_env = "gnu")]
+pub type Resource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+pub type Resource = libc::c_int;
+
 /// hard resource limits, run in a forked child before exec. std's Command has
 /// already dropped supplementary groups and switched uid by then
-pub fn limit_child(limits: &[(libc::__rlimit_resource_t, u64)]) -> io::Result<()> {
+pub fn limit_child(limits: &[(Resource, u64)]) -> io::Result<()> {
     // SAFETY: called between fork and exec; setrlimit is async-signal-safe
     unsafe {
         for &(res, v) in limits {

@@ -17,6 +17,7 @@ concurrency:
 jobs:
   rust:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
@@ -41,7 +42,7 @@ jobs:
       - name: static binary
         run: |
           f=target/${{ matrix.target }}/release/burner
-          file "$f" | tee /dev/stderr | grep -q 'statically linked'
+          file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
           "$f" --version
 
   shell:
