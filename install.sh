@@ -140,6 +140,8 @@ systemctl enable burner-net.service burner-reap.timer >/dev/null
 # reload, not restart: a restart runs net down first, which stops networked VMs
 systemctl reload-or-restart burner-net.service || die "burner-net failed to start, see: journalctl -u burner-net"
 systemctl start burner-reap.timer
+# one pass now, so networked runs don't wait for the timer's first tick
+"$BIN" reap || die "burner reap failed, see journalctl -t burner"
 
 echo
 "$BIN" doctor || die "burner doctor found problems, see the FAIL lines above"

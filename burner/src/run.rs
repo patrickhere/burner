@@ -79,6 +79,9 @@ pub struct RunArgs {
     cmd: Vec<String>,
     #[arg(skip)]
     shell: bool,
+    /// --net wasn't given: lower it to limits.net instead of refusing
+    #[arg(skip)]
+    net_default: bool,
 }
 
 #[derive(Args)]
@@ -96,9 +99,9 @@ pub struct ShellArgs {
     /// time limit: 30m, 1h
     #[arg(long)]
     ttl: Option<String>,
-    /// network: none, web or open
-    #[arg(long, default_value = "web")]
-    net: String,
+    /// network: none, web or open (default web, or less if the config says so)
+    #[arg(long)]
+    net: Option<String>,
     #[arg(long)]
     tag: Option<String>,
 }
@@ -124,7 +127,8 @@ pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
         input: Input::None,
         result: None,
         tag: a.tag,
-        net: a.net,
+        net_default: a.net.is_none(),
+        net: a.net.unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
     };
@@ -312,8 +316,21 @@ fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         None if a.shell => 3600.min(max_ttl),
         None => d.ttl_secs.unwrap_or(600).clamp(10, max_ttl),
     };
-    let net = net::Mode::parse(&a.net)
+    let mut net = net::Mode::parse(&a.net)
         .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net)))?;
+    let ceiling = net::Mode::parse(&cfg.limits.net).unwrap_or(net::Mode::None);
+    if net > ceiling {
+        if !a.net_default {
+            return Err(usage(format!(
+                "--net {} is more than this machine allows (limits.net = {})",
+                a.net, cfg.limits.net
+            )));
+        }
+        net = ceiling;
+    }
+    if net != net::Mode::None {
+        reaper_alive(cfg)?;
+    }
     let tag = a.tag.clone().unwrap_or_else(|| "-".into());
     if tag != "-" && !valid_name(&tag) {
         return Err(usage(
@@ -901,6 +918,33 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
         }
         std::thread::sleep(Duration::from_secs(2));
     }
+}
+
+/// the reaper refreshes the network filter and stops orphaned VMs. without it,
+/// a VM with a network could outlive its wrapper or sit behind a stale filter,
+/// so networked runs wait for it to be running
+const REAPED: &str = "reaped";
+const REAPER_MAX_AGE: Duration = Duration::from_secs(120);
+
+fn reaper_alive(cfg: &Config) -> Result<()> {
+    match reaper_age(cfg) {
+        Some(a) if a <= REAPER_MAX_AGE => Ok(()),
+        _ => Err(Exit(
+            EXIT_SANDBOX,
+            "the reaper hasn't run in the last 2 min (systemctl status burner-reap.timer), \
+             refusing a VM with a network. --net none still works"
+                .into(),
+        )
+        .into()),
+    }
+}
+
+/// when the reaper last finished a pass, for doctor
+pub fn reaper_age(cfg: &Config) -> Option<Duration> {
+    fs::metadata(cfg.paths.state.join(REAPED))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
 }
 
 /// whether `need` bytes fit on `dir`'s filesystem with 1 GiB to spare
@@ -1615,6 +1659,10 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         }
     }
     net::check(cfg);
+    let _ = fs::write(
+        cfg.paths.state.join(REAPED),
+        format!("{}\n", sys::boottime()),
+    );
     Ok(ExitCode::SUCCESS)
 }
 

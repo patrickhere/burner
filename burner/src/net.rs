@@ -23,7 +23,8 @@ fn helper(prog: &str, args: &[&str], input: Option<&[u8]>) -> Result<std::proces
         .with_context(|| format!("running {prog}"))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// ordered from least to most reach, so a config ceiling can compare them
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Mode {
     None,
     Web,
@@ -329,7 +330,7 @@ fn routing_down() {
     let _ = run("ip", &["-4", "route", "flush", "table", RT_TABLE]);
 }
 
-fn routing_ok(cfg: &Config) -> bool {
+pub fn routing_ok(cfg: &Config) -> bool {
     helper("ip", &["-4", "rule", "show", "priority", RULE_PRIO], None).is_ok_and(|o| {
         String::from_utf8_lossy(&o.stdout)
             .contains(&format!("from {} lookup {RT_TABLE}", cfg.net.subnet))
@@ -352,7 +353,7 @@ fn net_lock(cfg: &Config) -> Result<sys::Lock> {
     Ok(sys::Lock::exclusive(&cfg.paths.state.join("net.lock"))?)
 }
 
-fn table_exists() -> bool {
+pub fn table_exists() -> bool {
     run("nft", &["list", "table", "inet", TABLE]).is_ok()
 }
 

@@ -50,6 +50,8 @@ pub struct Limits {
     pub ttl_shell_secs: u32,
     pub max_vms: u32,
     pub total_mem_mib: u32,
+    /// the most network any run may ask for: none, web or open
+    pub net: String,
 }
 
 impl Default for Paths {
@@ -83,6 +85,7 @@ impl Default for Limits {
             ttl_shell_secs: 3600,
             max_vms: 2,
             total_mem_mib: 3072,
+            net: "open".into(),
         }
     }
 }
@@ -90,6 +93,11 @@ impl Default for Limits {
 impl Config {
     /// a missing file means defaults; a broken one is an error, never silently ignored
     pub fn load(path: &Path) -> Result<Config> {
+        // as root, a config decides what burner runs as root (paths.root holds
+        // the jailer). only one that nobody but root could have written counts
+        if crate::sys::is_root() {
+            trusted(path)?;
+        }
         let cfg = match fs::read_to_string(path) {
             Ok(text) => {
                 toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?
@@ -107,6 +115,9 @@ impl Config {
             bail!("net.subnet /{prefix} is too small, it needs room for at least four /30s");
         }
         let l = &self.limits;
+        if crate::net::Mode::parse(&l.net).is_none() {
+            bail!("limits.net must be none, web or open");
+        }
         if l.vcpus == 0 || l.mem_mib < 128 || l.disk_gib == 0 || l.ttl_secs < 10 || l.max_vms == 0 {
             bail!("limits are too low to start a VM");
         }
@@ -175,6 +186,29 @@ fn default_route_iface() -> Option<String> {
         .map(|l| l.split_whitespace().collect::<Vec<_>>())
         .find(|f| f.len() > 2 && f[1] == "00000000")
         .map(|f| f[0].to_string())
+}
+
+/// the config file and every directory above it: owned by root and writable by
+/// nobody else. a path other than the default has to exist
+fn trusted(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let real = match fs::canonicalize(path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && path == Path::new(DEFAULT_PATH) => {
+            return Ok(());
+        }
+        Err(e) => return Err(e).with_context(|| format!("config {}", path.display())),
+    };
+    for p in real.ancestors() {
+        let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
+        if m.uid() != 0 || m.mode() & 0o022 != 0 {
+            bail!(
+                "{} is owned or writable by someone other than root, so burner won't take a config from it",
+                p.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// ipv4 addresses on an interface, from `ip -j`

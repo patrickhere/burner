@@ -54,6 +54,9 @@ pub fn run(cfg: &Config) -> bool {
     memory(&mut r, cfg);
     disk(&mut r, cfg);
     install(&mut r, cfg);
+    if root {
+        services(&mut r, cfg);
+    }
 
     println!();
     match r.worst {
@@ -368,6 +371,55 @@ fn install(r: &mut Report, cfg: &Config) {
         r.line(Level::Ok, "images", format!("{images} installed"));
     } else {
         r.line(Level::Warn, "images", "none installed yet");
+    }
+}
+
+/// the parts that only exist once burner is installed and running: the reaper,
+/// the VM network, and a forward policy that lets VM traffic out at all
+fn services(r: &mut Report, cfg: &Config) {
+    let timer = run_ok("systemctl", &["is-active", "burner-reap.timer"]).is_some();
+    match (timer, crate::run::reaper_age(cfg)) {
+        (true, Some(a)) if a.as_secs() <= 120 => r.line(
+            Level::Ok,
+            "reaper",
+            format!("last ran {}s ago", a.as_secs()),
+        ),
+        (true, _) => r.line(
+            Level::Fail,
+            "reaper",
+            "timer is on but hasn't finished a pass in 2 min, see journalctl -u burner-reap",
+        ),
+        (false, _) => r.line(
+            Level::Fail,
+            "reaper",
+            "burner-reap.timer isn't running; VMs with a network are refused until it is",
+        ),
+    }
+    if net::table_exists() && net::routing_ok(cfg) {
+        r.line(Level::Ok, "vm network", "filter and routing table loaded");
+    } else {
+        r.line(
+            Level::Warn,
+            "vm network",
+            "not set up, see systemctl status burner-net (or run burner net up)",
+        );
+    }
+    // docker and some firewalls set the forward policy to drop; then VM traffic
+    // needs its own accept rule, which ufw's route rule provides
+    let drops = run_ok("nft", &["list", "chain", "ip", "filter", "FORWARD"])
+        .is_some_and(|c| c.contains("policy drop"));
+    let ufw_ok = matches!(net::ufw_rule_missing(cfg), Ok(None))
+        && run_ok("ufw", &["status"]).is_some_and(|s| s.contains("Status: active"));
+    if drops && !ufw_ok {
+        let up = cfg.uplink().unwrap_or_else(|_| "UPLINK".into());
+        r.line(
+            Level::Warn,
+            "forwarding",
+            format!(
+                "the FORWARD policy is drop (docker sets this), VM traffic may never leave. allow it with:\n  iptables -I DOCKER-USER -s {s} -o {up} -j ACCEPT\n  iptables -I DOCKER-USER -d {s} -i {up} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT",
+                s = cfg.net.subnet
+            ),
+        );
     }
 }
 
