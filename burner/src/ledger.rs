@@ -32,8 +32,34 @@ impl Ident {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// where a VM is in its life. stored as the same strings older versions wrote
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Status {
+    #[default]
+    Preparing,
+    Running,
+    CleanupFailed,
+}
+
+impl Status {
+    pub fn name(self) -> &'static str {
+        match self {
+            Status::Preparing => "preparing",
+            Status::Running => "running",
+            Status::CleanupFailed => "cleanup-failed",
+        }
+    }
+}
+
+/// bumped when an entry's meaning changes. every field has a default, so an
+/// entry written by an older or newer burner still reads during an upgrade
+pub const VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Vm {
+    pub version: u32,
     pub id: String,
     pub tag: String,
     pub img: String,
@@ -43,7 +69,9 @@ pub struct Vm {
     pub net: String,
     pub ttl_secs: u32,
     pub wrapper: Option<Ident>,
-    pub status: String,
+    /// the uid that asked for it (the sudo caller), for burner kill
+    pub owner: Option<u32>,
+    pub status: Status,
     pub cancel: bool,
     pub started: u64,
     pub deadline_boot: Option<f64>,
@@ -168,6 +196,23 @@ pub fn valid_id(id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_entries_still_read() {
+        // as written before the version and owner fields existed
+        let old = r#"{"id":"burner-0123456789ab","tag":"-","img":"alpine","vcpus":1,"mem_mib":512,
+            "disk_gib":2,"net":"web","ttl_secs":60,"wrapper":null,"status":"cleanup-failed",
+            "cancel":false,"started":1,"deadline_boot":null,"net_slot":3}"#;
+        let v: Vm = serde_json::from_str(old).unwrap();
+        assert_eq!(v.status, Status::CleanupFailed);
+        assert_eq!((v.version, v.owner, v.net_slot), (0, None, Some(3)));
+        // and a newer one with fields this version doesn't know
+        let newer = r#"{"version":9,"id":"burner-0123456789ab","status":"running","later":true}"#;
+        assert_eq!(
+            serde_json::from_str::<Vm>(newer).unwrap().status,
+            Status::Running
+        );
+    }
 
     #[test]
     fn ids() {

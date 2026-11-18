@@ -22,7 +22,7 @@ use serde_json::json;
 
 use crate::cgroup;
 use crate::config::Config;
-use crate::ledger::{self, Ident, Ledger, Vm, valid_id};
+use crate::ledger::{self, Ident, Ledger, Status, Vm, valid_id};
 use crate::net;
 use crate::output::{Dest, Out, escape_controls};
 use crate::result;
@@ -635,7 +635,7 @@ fn run_vm(
             return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
         }
         led.update(id, |v| {
-            v.status = "running".into();
+            v.status = Status::Running;
             v.deadline_boot = Some(deadline.0);
         })?;
     }
@@ -947,7 +947,9 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
         net: p.net.name().into(),
         ttl_secs: p.ttl,
         wrapper: Some(Ident::me()),
-        status: "preparing".into(),
+        status: Status::Preparing,
+        version: ledger::VERSION,
+        owner: caller_uid().parse().ok(),
         cancel: false,
         started: SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1098,7 +1100,7 @@ fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
         return Err(Exit(EXIT_INTERRUPTED, "killed by burner kill".into()).into());
     }
     if v.is_some_and(|v| {
-        v.status == "preparing" && v.deadline_boot.is_some_and(|d| sys::boottime() > d)
+        v.status == Status::Preparing && v.deadline_boot.is_some_and(|d| sys::boottime() > d)
     }) {
         return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
     }
@@ -1480,7 +1482,7 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     let stopped = done(&mut child) && !cgroup::populated(id);
     if !stopped {
         if let Ok(led) = Ledger::open(&cfg.paths.state) {
-            let _ = led.update(id, |v| v.status = "cleanup-failed".into());
+            let _ = led.update(id, |v| v.status = Status::CleanupFailed);
         }
         log_line(&format!(
             "teardown {id}: VM did not stop, slot kept for the reaper"
@@ -1502,7 +1504,7 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     };
     if !jail_gone {
         let _ = led.update(id, |v| {
-            v.status = "cleanup-failed".into();
+            v.status = Status::CleanupFailed;
             v.wrapper = None;
         });
         return false;
@@ -1601,7 +1603,7 @@ pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
             .iter()
             .map(|v| {
                 json!({"id": v.id, "tag": v.tag, "img": v.img, "vcpus": v.vcpus, "mem": v.mem_mib, "disk": v.disk_gib,
-                       "net": v.net, "status": v.status, "age": unix.saturating_sub(v.started), "ttl": v.ttl_secs,
+                       "net": v.net, "status": v.status.name(), "owner": v.owner, "age": unix.saturating_sub(v.started), "ttl": v.ttl_secs,
                        "ttl_left": v.deadline_boot.map(|d| (d - now).max(0.0) as u64)})
             })
             .collect();
@@ -1628,7 +1630,7 @@ pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
             v.vcpus,
             v.mem_mib,
             v.net,
-            v.status,
+            v.status.name(),
             unix.saturating_sub(v.started)
         );
     }
@@ -1640,12 +1642,24 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
         eprintln!("burner: usage: burner kill burner-xxxxxxxxxxxx");
         return Ok(ExitCode::from(EXIT_USAGE));
     }
+    // through sudo you can only kill what you started. real root can kill anything
+    let caller: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
     // nothing is printed while the ledger is locked: a stalled stderr would hold it
-    let found = Ledger::open(&cfg.paths.state)?
-        .update(id, |v| v.cancel = true)?
-        .is_some();
-    if !found {
-        eprintln!("burner: no VM {id}");
+    let refused = {
+        let led = Ledger::open(&cfg.paths.state)?;
+        match led.get(id) {
+            None => Some("no VM with that id"),
+            Some(v) if caller.is_some_and(|c| v.owner != Some(c)) => {
+                Some("not yours, another user started it")
+            }
+            Some(_) => match led.update(id, |v| v.cancel = true)? {
+                Some(_) => None,
+                None => Some("no VM with that id"),
+            },
+        }
+    };
+    if let Some(why) = refused {
+        eprintln!("burner: {id}: {why}");
         return Ok(ExitCode::from(1));
     }
     cgroup::kill(id);
@@ -1687,8 +1701,10 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             // still setting up long past its time: something it ran is stuck
             // read again: the snapshot may be stale and the VM running by now
             let now_v = ledger::peek(&cfg.paths.state, &v.id);
-            if v.status == "preparing"
-                && now_v.as_ref().is_some_and(|n| n.status == "preparing")
+            if v.status == Status::Preparing
+                && now_v
+                    .as_ref()
+                    .is_some_and(|n| n.status == Status::Preparing)
                 && let Some(w) = v.wrapper.as_ref()
                 && sys::signal_ident(w, libc::SIGTERM)
             {
@@ -1719,7 +1735,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         let led = Ledger::open(&cfg.paths.state)?;
         for v in &vms {
             if !v.wrapper.as_ref().is_some_and(Ident::alive) && cgroup::populated(&v.id) {
-                let _ = led.update(&v.id, |x| x.status = "cleanup-failed".into());
+                let _ = led.update(&v.id, |x| x.status = Status::CleanupFailed);
             }
         }
         for (id, clean) in &done {
@@ -1732,7 +1748,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
                     led.delete(id);
                     log_line(&format!("reap {id} (wrapper gone)"));
                 } else {
-                    let _ = led.update(id, |x| x.status = "cleanup-failed".into());
+                    let _ = led.update(id, |x| x.status = Status::CleanupFailed);
                 }
             }
         }
@@ -1745,6 +1761,33 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .and_then(|t| unix_now.duration_since(t).ok())
             .is_some_and(|d| d.as_secs() > secs)
     };
+    // an entry nobody can read would block admission forever. stop whatever runs
+    // under its id, then move it aside as .bad; the orphan sweeps below take
+    // care of its tap and jail
+    let unreadable = Ledger::open(&cfg.paths.state)?.unreadable();
+    for path in unreadable {
+        let p = PathBuf::from(&path);
+        let Some(id) = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .filter(|s| valid_id(s))
+        else {
+            continue;
+        };
+        cgroup::kill(id);
+        let until = Instant::now() + Duration::from_secs(3);
+        while cgroup::populated(id) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !cgroup::populated(id)
+            && cgroup::remove(id)
+            && fs::rename(&p, p.with_extension("bad")).is_ok()
+        {
+            log_line(&format!(
+                "reap {id}: ledger entry unreadable, VM stopped, entry kept as {id}.bad"
+            ));
+        }
+    }
     for i in net::reap_orphan_taps(cfg) {
         log_line(&format!("reap orphan tap {i}"));
     }
