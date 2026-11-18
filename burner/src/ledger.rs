@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::cgroup;
 use crate::sys;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,14 +48,6 @@ pub struct Vm {
     pub started: u64,
     pub deadline_boot: Option<f64>,
     pub net_slot: Option<u32>,
-}
-
-impl Vm {
-    pub fn holds_slot(&self) -> bool {
-        self.wrapper.as_ref().is_some_and(Ident::alive)
-            || cgroup::populated(&self.id)
-            || self.status == "cleanup-failed"
-    }
 }
 
 pub struct Ledger {
@@ -111,8 +102,15 @@ impl Ledger {
 
     /// false when the id is already taken. the entry shows up whole or not at all
     pub fn create(&self, vm: &Vm) -> Result<bool> {
-        let tmp = self.dir.join(format!("{}.json.new", vm.id));
-        let mut f = fs::File::create(&tmp)?;
+        // a unique staging name, opened exclusively: a crash between link and
+        // unlink can never leave a name a later create would truncate
+        let tmp = self
+            .dir
+            .join(format!("{}.{}.new", vm.id, sys::random_hex(6)?));
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
         f.write_all(&serde_json::to_vec(vm)?)?;
         f.sync_all()?;
         let res = fs::hard_link(&tmp, self.path(&vm.id));
@@ -144,7 +142,18 @@ impl Ledger {
 /// one VM's entry without taking the lock. writes are tmp + rename, so a
 /// reader sees the old or the new file, never half of one
 pub fn peek(state: &Path, id: &str) -> Option<Vm> {
-    serde_json::from_slice(&fs::read(state.join("vms").join(format!("{id}.json"))).ok()?).ok()
+    peek_strict(state, id).ok().flatten()
+}
+
+/// like peek, but an entry that exists and can't be read is an error, not "gone"
+pub fn peek_strict(state: &Path, id: &str) -> io::Result<Option<Vm>> {
+    match fs::read(state.join("vms").join(format!("{id}.json"))) {
+        Ok(b) => serde_json::from_slice(&b)
+            .map(Some)
+            .map_err(io::Error::other),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn valid_id(id: &str) -> bool {

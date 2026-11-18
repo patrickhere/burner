@@ -409,12 +409,16 @@ fn readd_running(cfg: &Config) -> Result<()> {
 pub fn down(cfg: &Config) -> Result<usize> {
     let _lock = net_lock(cfg)?;
     let mut killed = 0;
-    for v in Ledger::open(&cfg.paths.state)?.all() {
+    let led = Ledger::open(&cfg.paths.state)?;
+    for v in led.all() {
         if v.net_slot.is_some() {
+            // cancel too: a VM still setting up stops before it launches
+            let _ = led.update(&v.id, |x| x.cancel = true);
             cgroup::kill(&v.id);
             killed += 1;
         }
     }
+    drop(led);
     for i in taps_present() {
         tap_down_locked(cfg, i);
     }

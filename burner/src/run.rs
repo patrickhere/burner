@@ -443,8 +443,17 @@ fn run_vm(
     let diag = Out::new(Dest::Stderr);
     let t0 = Instant::now();
 
+    if a.input != Input::None && !disk_left(run_dir, 0) {
+        return Err(Exit(EXIT_SANDBOX, "not enough disk to hold the input".into()).into());
+    }
     let spool = spool_input(&run_dir.join("stdin"), a.input)?;
     let job = run_dir.join("job.tar");
+    // the job disk copies the spool before the spool goes away
+    if let Some(sp) = &spool
+        && !disk_left(run_dir, fs::metadata(sp)?.len())
+    {
+        return Err(Exit(EXIT_SANDBOX, "not enough disk to build the job disk".into()).into());
+    }
     build_job(&job, &p.cmd, a.input, spool.as_deref())?;
 
     let net_slot = take_slot(cfg, p, id, &diag)?;
@@ -473,11 +482,11 @@ fn run_vm(
     )?;
     fs::rename(&job, root.join("job.tar"))?;
     let scratch = root.join("scratch.ext4");
-    reserve(&scratch, u64::from(p.disk_gib) << 30)?;
+    reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
     prep_ok(cfg, id)?;
     mkfs(&scratch, cfg, id)?;
     let raw = root.join("result.raw");
-    reserve(&raw, result::RESULT_SIZE)?;
+    reserve(cfg, &raw, result::RESULT_SIZE)?;
     // opened now, before anything runs as the VM's user, and read through this fd
     // later: the path inside the jail can't be swapped for something else
     let raw_fd = File::open(&raw)?;
@@ -768,6 +777,10 @@ fn spool_input(path: &Path, mode: Input) -> Result<Option<PathBuf>> {
         if n > STDIN_CAP {
             return Err(usage("input over the 512M cap"));
         }
+        // spooled input counts against the same 1 GiB the VM disks keep free
+        if n % (16 << 20) < got as u64 && !disk_left(path, 0) {
+            return Err(Exit(EXIT_SANDBOX, "not enough disk to hold the input".into()).into());
+        }
         f.write_all(&buf[..got])?;
     }
     Ok(Some(path.to_path_buf()))
@@ -837,7 +850,7 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
                     "ledger entry {bad} is unreadable. if no VM is running for it, delete it"
                 );
             }
-            let busy: Vec<_> = led.all().into_iter().filter(Vm::holds_slot).collect();
+            let busy = led.all();
             let used: u32 = busy.iter().map(|v| v.mem_mib).sum();
             if (busy.len() as u32) < l.max_vms && used + p.mem_mib <= l.total_mem_mib {
                 let mut vm = vm.clone();
@@ -887,9 +900,20 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
     }
 }
 
+/// whether `need` bytes fit on `dir`'s filesystem with 1 GiB to spare
+fn disk_left(dir: &Path, need: u64) -> bool {
+    sys::free_bytes(dir).is_ok_and(|f| f >= need + (1 << 30))
+}
+
 /// a disk file with all its blocks reserved up front, so a guest filling it
 /// can never fill the host. keeps 1 GiB free for everything else
-fn reserve(path: &Path, size: u64) -> Result<()> {
+fn reserve(cfg: &Config, path: &Path, size: u64) -> Result<()> {
+    // check and allocate under one lock, so two runs can't both count the same free space
+    let _disk = sys::Lock::exclusive_until(
+        &cfg.paths.state.join("disk.lock"),
+        Instant::now() + Duration::from_secs(60),
+    )
+    .context("the disk lock stayed busy")?;
     let free = sys::free_bytes(path.parent().unwrap_or(Path::new("/")))?;
     if free < size + (1 << 30) {
         return Err(Exit(
@@ -1208,7 +1232,8 @@ fn child_outcome(child: &mut Child) -> Outcome {
 }
 
 fn cancelled(cfg: &Config, id: &str) -> bool {
-    ledger::peek(&cfg.paths.state, id).is_none_or(|v| v.cancel)
+    // unreadable counts as cancelled: nothing keeps running on a record nobody can read
+    ledger::peek_strict(&cfg.paths.state, id).map_or(true, |v| v.is_none_or(|v| v.cancel))
 }
 
 /// after the console closed: the VM must be gone before its result disk is read
@@ -1296,9 +1321,12 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     }
     // the slow parts (subprocesses, deleting files) happen without the ledger lock
     let cg_gone = cgroup::remove(id);
-    let tap_gone = ledger::peek(&cfg.paths.state, id)
-        .and_then(|v| v.net_slot)
-        .is_none_or(|i| net::tap_down(cfg, i));
+    let tap_gone = match ledger::peek_strict(&cfg.paths.state, id) {
+        Ok(v) => v
+            .and_then(|v| v.net_slot)
+            .is_none_or(|i| net::tap_down(cfg, i)),
+        Err(_) => false, // can't tell which tap: leave it all for the reaper
+    };
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
     let jail_gone = remove_tree(&jail) && tap_gone && cg_gone;
     let Ok(led) = Ledger::open(&cfg.paths.state) else {
@@ -1385,11 +1413,7 @@ pub fn log_line(msg: &str) {
 
 pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
     let now = sys::boottime();
-    let mut vms: Vec<_> = Ledger::open(&cfg.paths.state)?
-        .all()
-        .into_iter()
-        .filter(Vm::holds_slot)
-        .collect();
+    let mut vms = Ledger::open(&cfg.paths.state)?.all();
     vms.sort_by_key(|v| v.started);
     let unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1452,7 +1476,7 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     // only say it's gone once its wrapper (or the reaper) has cleaned it up
     let end = Instant::now() + Duration::from_secs(20);
     while Instant::now() < end {
-        if ledger::peek(&cfg.paths.state, id).is_none() {
+        if matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None)) {
             println!("killed {id}");
             return Ok(ExitCode::SUCCESS);
         }
@@ -1466,6 +1490,13 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
 /// wrappers that died, keep the network filter current. the ledger lock is only
 /// held for reads and the final deletes, never across subprocesses or file removal
 pub fn reap(cfg: &Config) -> Result<ExitCode> {
+    // one reaper at a time; a second one just leaves it to the first
+    fs::create_dir_all(&cfg.paths.state)?;
+    let Ok(_reaping) =
+        sys::Lock::exclusive_until(&cfg.paths.state.join("reap.lock"), Instant::now())
+    else {
+        return Ok(ExitCode::SUCCESS);
+    };
     let now = sys::boottime();
     let vms = Ledger::open(&cfg.paths.state)?.all();
     let known: Vec<String> = vms.iter().map(|v| v.id.clone()).collect();
