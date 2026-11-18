@@ -80,9 +80,11 @@ linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack
 ```
 cargo build --release
 sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), users, units
-tools/build-image alpine         # an image to boot, needs docker
+tools/build-image alpine         # an image to boot, uses sudo, no docker
 sudo burner doctor
 ```
+
+an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, `burner config` shows them with defaults filled in.
 

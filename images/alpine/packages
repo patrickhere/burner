@@ -1,0 +1,4 @@
+# one alpine package per line, installed on top of the minirootfs
+git
+curl
+ca-certificates

@@ -168,7 +168,7 @@ systemctl start burner-reap.timer
 echo
 "$BIN" doctor || die "burner doctor found problems, see the FAIL lines above"
 echo
-[ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: tools/build-image alpine (needs docker)"
+[ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: tools/build-image alpine"
 # a changed guest/init only reaches VMs through a rebuilt image
 for img in "$ROOT"/images/*/; do
     [ -d "$img" ] || continue

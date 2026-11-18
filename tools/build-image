@@ -1,32 +1,97 @@
 #!/bin/bash
-# build <root>/images/NAME/rootfs.ext4 from images/NAME/Dockerfile and guest/init.
-# root is $BURNER_ROOT, default /var/lib/burner. needs docker and sudo.
+# build <root>/images/NAME/rootfs.ext4 from images/NAME/packages and guest/init.
+# root is $BURNER_ROOT, default /var/lib/burner. needs sudo and curl, no docker.
+# images/NAME/Dockerfile still works (with docker) when there's no packages file.
 set -euo pipefail
 name="${1:?usage: build-image NAME}"
 [[ "$name" =~ ^[a-z0-9-]{1,32}$ ]] || { echo "bad image name" >&2; exit 2; }
 src="$(cd "$(dirname "$0")/.." && pwd)"
 root="${BURNER_ROOT:-/var/lib/burner}"
-[ -f "$src/images/$name/Dockerfile" ] || { echo "no Dockerfile for $name" >&2; exit 2; }
+img="$src/images/$name"
+
+# alpine minirootfs, pinned like firecracker and the kernel. hashes match the
+# release's latest-releases.yaml and its gpg signature, key 0482D84022F52DF1C4E7CD43293ACD0907D9495A
+alpine=3.24.4
+case "$(uname -m)" in
+    x86_64) arch=x86_64 sum=cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012 ;;
+    aarch64) arch=aarch64 sum=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de ;;
+    *) echo "images build on x86_64 or aarch64 only, for the same arch as this host" >&2; exit 2 ;;
+esac
+
+if [ -f "$img/packages" ]; then
+    mode=packages
+elif [ -f "$img/Dockerfile" ]; then
+    mode=docker
+    command -v docker >/dev/null || { echo "$name only has a Dockerfile, and that needs docker" >&2; exit 2; }
+else
+    echo "no packages file for $name" >&2; exit 2
+fi
 
 work=$(mktemp -d /tmp/burner-build-XXXX)
-trap 'sudo rm -rf "$work"; docker rm -f "burner-build-$name" >/dev/null 2>&1 || true' EXIT
-cp "$src/images/$name/Dockerfile" "$src/guest/init" "$work/"
-docker build -q -t "burner-img-$name:latest" "$work" >/dev/null
-docker create --name "burner-build-$name" "burner-img-$name:latest" >/dev/null
-mkdir "$work/root"
-docker export "burner-build-$name" | sudo tar -x -C "$work/root"
-sudo rm -f "$work/root/.dockerenv" "$work/root/etc/resolv.conf"
-printf '127.0.0.1 localhost\n127.0.1.1 burner\n::1 localhost\n' | sudo tee "$work/root/etc/hosts" >/dev/null
-echo burner | sudo tee "$work/root/etc/hostname" >/dev/null
-mb=$(sudo du -sm "$work/root" | cut -f1)
+cleanup() {
+    sudo rm -rf "$work"
+    if [ "$mode" = docker ]; then docker rm -f "burner-build-$name" >/dev/null 2>&1 || true; fi
+}
+trap cleanup EXIT
+r="$work/root"
+mkdir "$r"
+
+if [ "$mode" = packages ]; then
+    pkgs=()
+    while read -r line; do
+        read -ra words <<< "${line%%#*}"
+        for p in ${words[@]+"${words[@]}"}; do
+            [[ "$p" =~ ^[a-z0-9][a-z0-9._+-]*$ ]] || { echo "bad package name in $img/packages: $p" >&2; exit 2; }
+            pkgs+=("$p")
+        done
+    done < "$img/packages"
+
+    tgz="alpine-minirootfs-$alpine-$arch.tar.gz"
+    curl -fsSL --proto =https --retry 3 -o "$work/$tgz" \
+        "https://dl-cdn.alpinelinux.org/alpine/v${alpine%.*}/releases/$arch/$tgz"
+    echo "$sum  $work/$tgz" | sha256sum -c --quiet - || { echo "$tgz doesn't match the pinned sha256" >&2; exit 1; }
+    sudo tar -xzf "$work/$tgz" -C "$r" --numeric-owner
+
+    if [ ${#pkgs[@]} -gt 0 ]; then
+        sudo rm -f "$r/etc/resolv.conf"
+        sudo cp -L /etc/resolv.conf "$r/etc/resolv.conf"
+        # apk checks signatures with the keys from the tarball. own mount and pid
+        # namespace, so /dev and /proc go away with it and nothing is left running
+        # shellcheck disable=SC2016
+        sudo unshare --mount --pid --fork --propagation private sh -ec '
+            r=$1; shift
+            mount -t tmpfs -o mode=0755,nosuid tmpfs "$r/dev"
+            mknod -m 0666 "$r/dev/null" c 1 3
+            mknod -m 0666 "$r/dev/zero" c 1 5
+            mknod -m 0666 "$r/dev/random" c 1 8
+            mknod -m 0666 "$r/dev/urandom" c 1 9
+            ln -s /proc/self/fd "$r/dev/fd"
+            mount -t proc proc "$r/proc"
+            exec chroot "$r" /sbin/apk add --no-cache --quiet "$@"
+        ' sh "$r" "${pkgs[@]}"
+    fi
+    sudo install -d -m 0755 "$r/overlay" "$r/mnt"
+    sudo install -d -m 1777 "$r/var/tmp"
+    sudo install -m 0755 "$src/guest/init" "$r/sbin/burner-init"
+else
+    cp "$img/Dockerfile" "$src/guest/init" "$work/"
+    docker build -q -t "burner-img-$name:latest" "$work" >/dev/null
+    docker create --name "burner-build-$name" "burner-img-$name:latest" >/dev/null
+    docker export "burner-build-$name" | sudo tar -x -C "$r" --numeric-owner
+fi
+
+sudo rm -f "$r/.dockerenv" "$r/etc/resolv.conf" "$r/etc/hosts" "$r/etc/hostname"
+printf '127.0.0.1 localhost\n127.0.1.1 burner\n::1 localhost\n' | sudo tee "$r/etc/hosts" >/dev/null
+echo burner | sudo tee "$r/etc/hostname" >/dev/null
+mb=$(sudo du -sm "$r" | cut -f1)
 truncate -s $(( mb * 13 / 10 + 64 ))M "$work/rootfs.ext4"
-sudo mkfs.ext4 -q -F -L "burner-$name" -d "$work/root" "$work/rootfs.ext4"
+sudo mkfs.ext4 -q -F -L "burner-$name" -d "$r" "$work/rootfs.ext4"
 
 dest="$root/images/$name"
 sudo install -d -m 0755 "$dest"
 sudo install -m 0644 "$work/rootfs.ext4" "$dest/rootfs.ext4.new"
 sudo mv -f "$dest/rootfs.ext4.new" "$dest/rootfs.ext4"
-[ -f "$src/images/$name/defaults.toml" ] && sudo install -m 0644 "$src/images/$name/defaults.toml" "$dest/defaults.toml"
+[ -f "$img/defaults.toml" ] && sudo install -m 0644 "$img/defaults.toml" "$dest/defaults.toml"
 # what burner doctor compares against its own copy, to spot images built from an older init
 sudo install -m 0644 "$src/guest/init" "$dest/init"
 echo "$name: $(du -h "$dest/rootfs.ext4" | cut -f1) ($mb M content) -> $dest"
