@@ -28,7 +28,7 @@ use crate::output::{Dest, Out, escape_controls};
 use crate::result;
 use crate::sys;
 
-const USER: &str = "burner";
+pub const USER: &str = "burner";
 const SERIAL_CAP: u64 = 1 << 20;
 const LIVE_BYTES: u64 = 65536;
 const STDIN_CAP: u64 = 512 << 20;
@@ -37,7 +37,9 @@ const STDIN_TOTAL: Duration = Duration::from_secs(600);
 const CMD_CAP: usize = 64 << 10;
 const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
-const VMM_OVERHEAD_MIB: u64 = 128;
+pub const VMM_OVERHEAD_MIB: u64 = 128;
+/// setup (disks, tap) has this long before the reaper stops the wrapper
+const PREP_SECS: u32 = 180;
 
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_TIMEOUT: u8 = 124;
@@ -355,8 +357,26 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     }
 }
 
+/// a point in boot time (CLOCK_BOOTTIME, keeps counting through suspend). the
+/// same value goes in the ledger, so burner and the reaper agree on when a VM ends
+#[derive(Clone, Copy)]
+struct Deadline(f64);
+
+impl Deadline {
+    fn in_secs(secs: u32) -> Deadline {
+        Deadline(sys::boottime() + f64::from(secs))
+    }
+    fn passed(self) -> bool {
+        sys::boottime() >= self.0
+    }
+    fn left(self) -> Duration {
+        Duration::from_secs_f64((self.0 - sys::boottime()).max(0.0))
+    }
+}
+
 enum Outcome {
     Done,
+    Failed,
     Timeout,
     Cancelled,
     Interrupted,
@@ -378,7 +398,7 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     if vm.is_some() {
         teardown(cfg, &id, None);
     }
-    let _ = fs::remove_dir_all(&run_dir);
+    remove_tree(&run_dir);
     res
 }
 
@@ -427,7 +447,10 @@ fn run_vm(
 
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
     let root = jail.join("root");
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(jail.parent().context("jail path")?)?;
+    // fresh dirs only: a jail left over from anything else is never reused
+    fs::create_dir(&jail).context("creating the jail (left over from an earlier run?)")?;
+    fs::create_dir(&root)?;
     for d in [&jail, &root] {
         fs::set_permissions(d, fs::Permissions::from_mode(0o755))?;
     }
@@ -446,7 +469,8 @@ fn run_vm(
     fs::rename(&job, root.join("job.tar"))?;
     let scratch = root.join("scratch.ext4");
     reserve(&scratch, u64::from(p.disk_gib) << 30)?;
-    mkfs(&scratch)?;
+    prep_ok(cfg, id)?;
+    mkfs(&scratch, cfg, id)?;
     let raw = root.join("result.raw");
     reserve(&raw, result::RESULT_SIZE)?;
     // opened now, before anything runs as the VM's user, and read through this fd
@@ -457,6 +481,7 @@ fn run_vm(
         fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
     }
 
+    prep_ok(cfg, id)?;
     let token = sys::random_hex(8)?;
     let mut boot = format!(
         "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token}"
@@ -506,7 +531,7 @@ fn run_vm(
     fs::write(root.join("vm.json"), serde_json::to_vec(&vmcfg)?)?;
     fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o644))?;
 
-    let deadline = Instant::now() + Duration::from_secs(u64::from(p.ttl));
+    let deadline = Deadline::in_secs(p.ttl);
     let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
     {
         let led = Ledger::open(&cfg.paths.state)?;
@@ -516,7 +541,7 @@ fn run_vm(
         }
         led.update(id, |v| {
             v.status = "running".into();
-            v.deadline_boot = Some(sys::boottime() + f64::from(p.ttl));
+            v.deadline_boot = Some(deadline.0);
         })?;
     }
     if is_interrupted() {
@@ -524,12 +549,9 @@ fn run_vm(
     }
     let fclog = File::create(jail.join("firecracker.log"))?;
     let mut jailer = Command::new(cfg.paths.root.join("bin/jailer"));
-    if !p.shell {
-        // own process group so a ctrl-c meant for burner doesn't hit the VM first.
-        // a shell stays in the foreground group: firecracker sets the terminal raw,
-        // and from a background group that would stop it with SIGTTOU
-        jailer.process_group(0);
-    }
+    // own process group so a ctrl-c meant for burner doesn't hit the VM first.
+    // firecracker never sees the caller's terminal, even for a shell: burner relays it
+    jailer.process_group(0);
     // SAFETY: join_from_child only calls open, write and close
     unsafe {
         jailer.pre_exec(move || cgroup::join_from_child(&procs));
@@ -567,26 +589,21 @@ fn run_vm(
             "Error",
         ])
         .stdin(if p.shell {
-            Stdio::inherit()
+            Stdio::piped()
         } else {
             Stdio::null()
         })
-        .stdout(if p.shell {
-            Stdio::inherit()
-        } else {
-            Stdio::piped()
-        })
+        .stdout(Stdio::piped())
         .stderr(fclog)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .spawn()
         .context("starting the jailer")?;
     if p.shell {
-        // the terminal is wired straight to the VM console; firecracker sets it raw
-        let outcome = supervise(&mut child, deadline, cfg, id);
+        let outcome = relay(&mut child, deadline, cfg, id);
+        sys::restore_tty(saved_tty.as_ref());
         teardown(cfg, id, Some(&mut child));
         *held = None;
-        sys::restore_tty(saved_tty.as_ref());
         log_line(&format!(
             "end {id} tag={} secs={:.1} shell",
             p.tag,
@@ -594,6 +611,10 @@ fn run_vm(
         ));
         return Ok(match outcome {
             Outcome::Done => 0,
+            Outcome::Failed => {
+                eprintln!("burner: the VM stopped with an error, see the system log");
+                EXIT_SANDBOX
+            }
             Outcome::Timeout => {
                 eprintln!("burner: shell closed at the {} min limit", p.ttl / 60);
                 EXIT_TIMEOUT
@@ -642,7 +663,9 @@ fn run_vm(
                 }
             }
         }
-        Outcome::Done => {
+        // a firecracker error after the job still has a result disk worth reading;
+        // without an exit code from the guest it ends up as a sandbox failure anyway
+        Outcome::Done | Outcome::Failed => {
             let log = run_dir.join("log.bin");
             let tar_path = run_dir.join("result.tar");
             let meta = result::parse(
@@ -798,10 +821,16 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
         }
         {
             let led = Ledger::open(&cfg.paths.state)?;
+            if let Some(bad) = led.unreadable().first() {
+                anyhow::bail!(
+                    "ledger entry {bad} is unreadable. if no VM is running for it, delete it"
+                );
+            }
             let busy: Vec<_> = led.all().into_iter().filter(Vm::holds_slot).collect();
             let used: u32 = busy.iter().map(|v| v.mem_mib).sum();
             if (busy.len() as u32) < l.max_vms && used + p.mem_mib <= l.total_mem_mib {
                 let mut vm = vm.clone();
+                vm.deadline_boot = Some(sys::boottime() + f64::from(PREP_SECS));
                 if p.net != net::Mode::None {
                     let taken: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
                     vm.net_slot = Some(
@@ -867,7 +896,18 @@ fn reserve(path: &Path, size: u64) -> Result<()> {
     Ok(())
 }
 
-fn mkfs(path: &Path) -> Result<()> {
+/// between setup steps: stop if burner kill, a signal or the reaper said so
+fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
+    if is_interrupted() {
+        return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
+    }
+    if cancelled(cfg, id) {
+        return Err(Exit(EXIT_INTERRUPTED, "killed by burner kill".into()).into());
+    }
+    Ok(())
+}
+
+fn mkfs(path: &Path, cfg: &Config, id: &str) -> Result<()> {
     let mut c = Command::new("mkfs.ext4")
         .args([
             "-q",
@@ -886,21 +926,29 @@ fn mkfs(path: &Path) -> Result<()> {
             anyhow::ensure!(s.success(), "mkfs.ext4 failed");
             return Ok(());
         }
-        if start.elapsed() > Duration::from_secs(60) {
+        let stop = if start.elapsed() > Duration::from_secs(60) {
+            Some(anyhow::anyhow!("mkfs.ext4 hung"))
+        } else {
+            prep_ok(cfg, id).err()
+        };
+        if let Some(e) = stop {
             let _ = c.kill();
-            anyhow::bail!("mkfs.ext4 hung");
+            let _ = c.wait();
+            return Err(e);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// copy the console between the BEGIN/END markers to `out`, byte for byte
+/// copy the console between the BEGIN/END markers to `out`, byte for byte.
+/// the markers are only presentation: the guest knows the token and can end its
+/// own live output early, which hides nothing but its own output
 #[allow(clippy::too_many_arguments)]
 fn stream(
     stdout: &mut ChildStdout,
     child: &mut Child,
     token: &str,
-    deadline: Instant,
+    deadline: Deadline,
     out: &Out,
     diag: &Out,
     cfg: &Config,
@@ -919,7 +967,8 @@ fn stream(
         Done,
     }
     let mut st = St::Pre;
-    let (mut buf, mut pending) = (Vec::new(), Vec::new());
+    // pre_line: whether pre[0] starts a line, kept across trims
+    let (mut pre, mut pre_line, mut pending) = (Vec::new(), true, Vec::new());
     let (mut held_nl, mut at_line_start, mut raw_total) = (false, true, 0u64);
     let mut next_check = Instant::now();
     let mut chunk = vec![0u8; 65536];
@@ -930,20 +979,19 @@ fn stream(
         }
     };
     loop {
-        let now = Instant::now();
-        if now >= deadline {
+        if deadline.passed() {
             return Outcome::Timeout;
         }
         if is_interrupted() {
             return Outcome::Interrupted;
         }
-        if now >= next_check {
-            next_check = now + Duration::from_secs(1);
+        if Instant::now() >= next_check {
+            next_check = Instant::now() + Duration::from_secs(1);
             if cancelled(cfg, id) {
                 return Outcome::Cancelled;
             }
         }
-        if !sys::readable(fd, (deadline - now).min(Duration::from_secs(1))) {
+        if !sys::readable(fd, deadline.left().min(Duration::from_secs(1))) {
             if matches!(child.try_wait(), Ok(Some(_))) {
                 break;
             }
@@ -960,59 +1008,68 @@ fn stream(
             }
             Err(_) => break,
         };
+        // the part of this read still under the console cap
+        let take = n.min(SERIAL_CAP.saturating_sub(raw_total) as usize);
         raw_total += n as u64;
-        if raw_total > SERIAL_CAP {
-            if st == St::Body {
-                flush_held(&mut held_nl);
-                diag.put(b"burner: console over 1M, live output stopped\n", None);
-                st = St::Capped;
-            }
-            continue;
-        }
+        let data = &chunk[..take];
         match st {
             St::Pre => {
-                buf.extend_from_slice(&chunk[..n]);
-                let found = find_at_line_start(&buf, &begin);
-                let Some(i) = found else {
+                pre.extend_from_slice(data);
+                if let Some(i) = find_at_line_start(&pre, &begin, pre_line) {
+                    st = St::Body;
+                    pending = pre.split_off(i + begin.len());
+                    pre.truncate(i);
+                } else {
                     let keep = 8192 + begin.len();
-                    if buf.len() > keep {
-                        buf.drain(..buf.len() - keep);
+                    if pre.len() > keep {
+                        let cut = pre.len() - keep;
+                        pre_line = pre[cut - 1] == b'\n';
+                        pre.drain(..cut);
                     }
-                    continue;
-                };
-                st = St::Body;
-                pending = buf.split_off(i + begin.len());
-                buf.truncate(i);
-            }
-            St::Body => pending.extend_from_slice(&chunk[..n]),
-            _ => continue,
-        }
-        while st == St::Body {
-            let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
-                if !pending.is_empty() && !(at_line_start && end_n.starts_with(&pending)) {
-                    flush_held(&mut held_nl);
-                    out.put(&pending, None);
-                    at_line_start = false;
-                    pending.clear();
                 }
-                break;
-            };
-            let line: Vec<u8> = pending.drain(..=nl).collect();
-            let line = &line[..line.len() - 1];
-            if at_line_start && line == end.as_slice() {
+            }
+            St::Body => pending.extend_from_slice(data),
+            _ => {}
+        }
+        if st == St::Body {
+            // scan with an offset and compact once, instead of draining per line
+            let mut start = 0;
+            loop {
+                let Some(off) = pending[start..].iter().position(|&b| b == b'\n') else {
+                    let rest = &pending[start..];
+                    if !rest.is_empty() && !(at_line_start && end_n.starts_with(rest)) {
+                        flush_held(&mut held_nl);
+                        out.put(rest, None);
+                        at_line_start = false;
+                        start = pending.len();
+                    }
+                    break;
+                };
+                let line = &pending[start..start + off];
+                start += off + 1;
+                if at_line_start && line == end.as_slice() {
+                    flush_held(&mut held_nl);
+                    st = St::Done;
+                    break;
+                }
+                if at_line_start && line == end_n.as_slice() {
+                    held_nl = false; // that newline was added by the guest init
+                    st = St::Done;
+                    break;
+                }
                 flush_held(&mut held_nl);
-                st = St::Done;
-                break;
+                out.put(line, None);
+                held_nl = true;
+                at_line_start = true;
             }
-            if at_line_start && line == end_n.as_slice() {
-                held_nl = false; // that newline was added by the guest init
-                st = St::Done;
-                break;
-            }
+            pending.drain(..start);
+        }
+        if raw_total >= SERIAL_CAP && st == St::Body {
             flush_held(&mut held_nl);
-            out.put(line, None);
-            held_nl = true;
-            at_line_start = true;
+            out.put(&pending, None);
+            pending.clear();
+            diag.put(b"burner: console over 1M, live output stopped\n", None);
+            st = St::Capped;
         }
     }
     if st == St::Body {
@@ -1024,18 +1081,23 @@ fn stream(
             b"burner: VM ended before the job started; last console lines:\n",
             None,
         );
-        let tail = &buf[buf.len().saturating_sub(2000)..];
+        let tail = &pre[pre.len().saturating_sub(2000)..];
         diag.put(&escape_controls(tail), None);
         diag.put(b"\n", None);
     }
     Outcome::Done
 }
 
-fn find_at_line_start(hay: &[u8], needle: &[u8]) -> Option<usize> {
+/// first `needle` that starts a line. `first_is_line` says whether hay[0] does
+fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<usize> {
     let mut from = 0;
-    while let Some(off) = hay[from..].windows(needle.len()).position(|w| w == needle) {
+    while let Some(off) = hay
+        .get(from..)?
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
         let i = from + off;
-        if i == 0 || hay[i - 1] == b'\n' {
+        if (i == 0 && first_is_line) || (i > 0 && hay[i - 1] == b'\n') {
             return Some(i);
         }
         from = i + 1;
@@ -1043,16 +1105,94 @@ fn find_at_line_start(hay: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
+/// `burner shell`: the caller's terminal goes raw and burner copies bytes both
+/// ways. keystrokes go to the VM as they are; what the VM prints goes through a
+/// filter so it can't set titles, the clipboard or anything else on the terminal
+fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
+    let (Some(mut vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Outcome::Failed;
+    };
+    let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
+    let _ = sys::set_nonblocking(vin_fd);
+    let _ = sys::set_nonblocking(vout_fd);
+    let _ = sys::set_raw(0);
+    let screen = Out::new_unescaped(Dest::Stdout);
+    let mut filter = crate::output::TermFilter::default();
+    let mut to_vm: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 16384];
+    let mut next_check = Instant::now();
+    let mut stdin_open = true;
+    let outcome = loop {
+        if deadline.passed() {
+            break Outcome::Timeout;
+        }
+        if is_interrupted() {
+            break Outcome::Interrupted;
+        }
+        if Instant::now() >= next_check {
+            next_check = Instant::now() + Duration::from_secs(1);
+            if cancelled(cfg, id) {
+                break Outcome::Cancelled;
+            }
+        }
+        let fds = if stdin_open && to_vm.len() < 65536 {
+            vec![0, vout_fd]
+        } else {
+            vec![vout_fd]
+        };
+        let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(200)));
+        if ready.contains(&0) {
+            match io::stdin().lock().read(&mut buf) {
+                Ok(0) | Err(_) => stdin_open = false,
+                Ok(n) => to_vm.extend_from_slice(&buf[..n]),
+            }
+        }
+        if !to_vm.is_empty() {
+            match vin.write(&to_vm) {
+                Ok(n) => {
+                    to_vm.drain(..n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => to_vm.clear(),
+            }
+        }
+        if ready.contains(&vout_fd) {
+            match vout.read(&mut buf) {
+                Ok(0) => break child_outcome(child),
+                Ok(n) => screen.put(&filter.feed(&buf[..n]), None),
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break child_outcome(child),
+            }
+        } else if matches!(child.try_wait(), Ok(Some(_))) {
+            break child_outcome(child);
+        }
+    };
+    screen.drain(Instant::now() + Duration::from_secs(2));
+    outcome
+}
+
+fn child_outcome(child: &mut Child) -> Outcome {
+    match child.wait() {
+        Ok(s) if s.success() => Outcome::Done,
+        _ => Outcome::Failed,
+    }
+}
+
 fn cancelled(cfg: &Config, id: &str) -> bool {
     ledger::peek(&cfg.paths.state, id).is_none_or(|v| v.cancel)
 }
 
 /// after the console closed: the VM must be gone before its result disk is read
-fn supervise(child: &mut Child, deadline: Instant, cfg: &Config, id: &str) -> Outcome {
+fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
     let mut next_check = Instant::now();
-    while !matches!(child.try_wait(), Ok(Some(_))) {
+    let status = loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            break st;
+        }
         let now = Instant::now();
-        if now >= deadline {
+        if deadline.passed() {
             return Outcome::Timeout;
         }
         if is_interrupted() {
@@ -1065,7 +1205,7 @@ fn supervise(child: &mut Child, deadline: Instant, cfg: &Config, id: &str) -> Ou
             }
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
+    };
     let end = Instant::now() + Duration::from_secs(5);
     while cgroup::populated(id) && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(100));
@@ -1074,7 +1214,32 @@ fn supervise(child: &mut Child, deadline: Instant, cfg: &Config, id: &str) -> Ou
         cgroup::kill(id);
         return Outcome::Timeout;
     }
-    Outcome::Done
+    if status.success() {
+        Outcome::Done
+    } else {
+        Outcome::Failed
+    }
+}
+
+/// delete a jail or run dir. refuses when anything is mounted inside it, so a
+/// bind mount someone left there never gets its contents deleted
+fn remove_tree(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    let mounted_inside = mounts.lines().filter_map(|l| l.split(' ').nth(4)).any(|m| {
+        let m = m.replace("\\040", " ");
+        Path::new(&m).starts_with(path)
+    });
+    if mounted_inside {
+        log_line(&format!(
+            "not removing {}: something is mounted inside it",
+            path.display()
+        ));
+        return false;
+    }
+    fs::remove_dir_all(path).is_ok()
 }
 
 /// stop the VM and only then free its disks and its slot. false when it couldn't be confirmed dead
@@ -1104,11 +1269,11 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     }
     // the slow parts (subprocesses, deleting files) happen without the ledger lock
     cgroup::remove(id);
-    if let Some(i) = ledger::peek(&cfg.paths.state, id).and_then(|v| v.net_slot) {
-        net::tap_down(cfg, i);
-    }
+    let tap_gone = ledger::peek(&cfg.paths.state, id)
+        .and_then(|v| v.net_slot)
+        .is_none_or(|i| net::tap_down(cfg, i));
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
-    let jail_gone = !jail.exists() || fs::remove_dir_all(&jail).is_ok();
+    let jail_gone = remove_tree(&jail) && tap_gone;
     let Ok(led) = Ledger::open(&cfg.paths.state) else {
         return false;
     };
@@ -1129,7 +1294,7 @@ fn print_rest(meta: &result::Meta, log: &Path, out: &Out, diag: &Out, until: Ins
     let size = f.metadata().map(|m| m.len()).unwrap_or(0);
     let start = match meta.skipped {
         0 => LIVE_BYTES,
-        s if s < LIVE_BYTES => LIVE_BYTES - s,
+        s if s <= LIVE_BYTES => LIVE_BYTES - s,
         s => {
             diag.put(
                 format!(
@@ -1238,15 +1403,26 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
         eprintln!("burner: usage: burner kill burner-xxxxxxxxxxxx");
         return Ok(ExitCode::from(EXIT_USAGE));
     }
-    let led = Ledger::open(&cfg.paths.state)?;
-    if led.update(id, |v| v.cancel = true)?.is_none() {
-        eprintln!("burner: no VM {id}");
-        return Ok(ExitCode::from(1));
+    {
+        let led = Ledger::open(&cfg.paths.state)?;
+        if led.update(id, |v| v.cancel = true)?.is_none() {
+            eprintln!("burner: no VM {id}");
+            return Ok(ExitCode::from(1));
+        }
     }
     cgroup::kill(id);
     log_line(&format!("kill {id}"));
-    println!("killed {id}");
-    Ok(ExitCode::SUCCESS)
+    // only say it's gone once its wrapper (or the reaper) has cleaned it up
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end {
+        if ledger::peek(&cfg.paths.state, id).is_none() {
+            println!("killed {id}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    eprintln!("burner: kill requested for {id}, still stopping (burner ls shows it)");
+    Ok(ExitCode::from(1))
 }
 
 /// run every minute from a timer: stop VMs past their deadline, clean up after
@@ -1261,8 +1437,16 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         if !valid_id(&v.id) {
             continue;
         }
-        if v.deadline_boot.is_some_and(|d| now > d + 60.0) {
+        if v.deadline_boot.is_some_and(|d| now > d + 5.0) {
             cgroup::kill(&v.id);
+            // still setting up long past its time: something it ran is stuck
+            if v.status == "preparing"
+                && let Some(w) = v.wrapper.as_ref().filter(|w| w.alive())
+            {
+                // SAFETY: plain kill(2); alive() matched the pid's boot id and start time
+                unsafe { libc::kill(w.pid as i32, libc::SIGTERM) };
+                log_line(&format!("reap {}: setup stuck, stopping its wrapper", v.id));
+            }
         }
         if v.wrapper.as_ref().is_some_and(Ident::alive) {
             continue;
@@ -1276,15 +1460,10 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             continue;
         }
         cgroup::remove(&v.id);
-        if let Some(i) = v.net_slot {
-            net::tap_down(cfg, i);
-        }
+        let tap_gone = v.net_slot.is_none_or(|i| net::tap_down(cfg, i));
         let jail = cfg.paths.root.join("jail/firecracker").join(&v.id);
-        let _ = fs::remove_dir_all(cfg.paths.root.join("run").join(&v.id));
-        done.push((
-            v.id.clone(),
-            !jail.exists() || fs::remove_dir_all(&jail).is_ok(),
-        ));
+        let run_gone = remove_tree(&cfg.paths.root.join("run").join(&v.id));
+        done.push((v.id.clone(), remove_tree(&jail) && run_gone && tap_gone));
     }
     {
         let led = Ledger::open(&cfg.paths.state)?;
@@ -1343,7 +1522,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             cgroup::kill(&name);
             if !cgroup::populated(&name) {
                 cgroup::remove(&name);
-                let _ = fs::remove_dir_all(cfg.paths.root.join("jail/firecracker").join(&name));
+                remove_tree(&cfg.paths.root.join("jail/firecracker").join(&name));
                 log_line(&format!("reap orphan {name}"));
             }
         }
@@ -1362,7 +1541,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok());
         if owner.as_ref().is_some_and(|o| !o.alive()) || (owner.is_none() && old(&e.path(), 600)) {
-            let _ = fs::remove_dir_all(e.path());
+            remove_tree(&e.path());
         }
     }
     net::check(cfg);
@@ -1398,8 +1577,17 @@ mod tests {
 
     #[test]
     fn markers() {
-        assert_eq!(find_at_line_start(b"xBEGIN\nBEGIN\n", b"BEGIN\n"), Some(7));
-        assert_eq!(find_at_line_start(b"BEGIN\n", b"BEGIN\n"), Some(0));
-        assert_eq!(find_at_line_start(b"noise BEGIN\n", b"BEGIN\n"), None);
+        assert_eq!(
+            find_at_line_start(b"xBEGIN\nBEGIN\n", b"BEGIN\n", true),
+            Some(7)
+        );
+        assert_eq!(find_at_line_start(b"BEGIN\n", b"BEGIN\n", true), Some(0));
+        assert_eq!(find_at_line_start(b"noise BEGIN\n", b"BEGIN\n", true), None);
+        // after a trim, the buffer's first byte may sit mid-line
+        assert_eq!(find_at_line_start(b"BEGIN\n", b"BEGIN\n", false), None);
+        assert_eq!(
+            find_at_line_start(b"BEGIN\nBEGIN\n", b"BEGIN\n", false),
+            Some(6)
+        );
     }
 }

@@ -72,7 +72,9 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     let log_fd = sys::dup_above(logf.as_raw_fd(), 10)?;
     let tar_fd = sys::dup_above(tarf.as_raw_fd(), 10)?;
     let (l, t) = (log_fd.as_raw_fd(), tar_fd.as_raw_fd());
-    let mut cmd = Command::new(std::env::current_exe()?);
+    // the running binary itself, not its path: an upgrade while VMs run replaces
+    // the file, and the old path would then point at nothing
+    let mut cmd = Command::new("/proc/self/exe");
     cmd.arg(PARSE_ARG)
         .arg(if tar_out.is_some() { "1" } else { "0" })
         .stdin(Stdio::from(raw))

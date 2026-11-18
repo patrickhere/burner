@@ -3,7 +3,8 @@
 use std::fs::{self, File};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 pub fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions
@@ -174,12 +175,48 @@ pub fn save_tty() -> Option<libc::termios> {
     (unsafe { libc::tcgetattr(0, &mut t) } == 0).then_some(t)
 }
 
-/// firecracker puts the terminal in raw mode; put it back even when it was killed
+/// raw mode on fd 0 so keystrokes, ctrl-c included, go to the VM as bytes
+pub fn set_raw(fd: i32) -> io::Result<()> {
+    // SAFETY: zeroed termios is a valid out-parameter
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and termios pointer
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: cfmakeraw only edits the struct
+    unsafe { libc::cfmakeraw(&mut t) };
+    // SAFETY: valid fd and termios pointer
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// put the terminal back right away, without waiting on output a dead VM left queued
 pub fn restore_tty(t: Option<&libc::termios>) {
     if let Some(t) = t {
         // SAFETY: fd 0 and a termios we read earlier
-        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, t) };
     }
+}
+
+/// which of `fds` are readable (or at eof/error) within the timeout
+pub fn poll_read(fds: &[i32], timeout: Duration) -> Vec<i32> {
+    let mut p: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: p is a valid array of p.len() pollfds
+    let n = unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, ms) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    p.iter().filter(|x| x.revents != 0).map(|x| x.fd).collect()
 }
 
 /// fire-and-forget to the system log. never blocks, so it's safe under a lock
@@ -223,4 +260,79 @@ pub fn dup_above(fd: i32, min: i32) -> io::Result<std::os::fd::OwnedFd> {
     }
     // SAFETY: n is a fresh fd nobody else owns
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(n) })
+}
+
+/// run a helper (ip, nft, mkfs) with a time limit. on timeout it's killed and
+/// reaped, never left behind. `input` goes to its stdin
+pub fn run_timeout(cmd: &mut Command, input: Option<&[u8]>, limit: Duration) -> io::Result<Output> {
+    use std::io::{Read, Write};
+    let mut child = cmd
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let feed = child
+        .stdin
+        .take()
+        .zip(input.map(<[u8]>::to_vec))
+        .map(|(mut w, data)| {
+            std::thread::spawn(move || {
+                let _ = w.write_all(&data);
+            })
+        });
+    let collect = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.by_ref().take(16 << 20).read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = collect(
+        child
+            .stdout
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let err = collect(
+        child
+            .stderr
+            .take()
+            .map(|r| Box::new(r) as Box<dyn Read + Send>),
+    );
+    let end = Instant::now() + limit;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "helper timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if let Some(f) = feed {
+        let _ = f.join();
+    }
+    Ok(Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
+/// a program on PATH or in the sbin dirs root's PATH sometimes lacks
+pub fn which(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
+        .unwrap_or(false)
+        || ["/usr/sbin", "/sbin"]
+            .iter()
+            .any(|d| std::path::Path::new(d).join(cmd).is_file())
 }

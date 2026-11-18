@@ -2,9 +2,9 @@
 //! one nft table lets those taps reach the internet through the uplink and
 //! nothing else (not the LAN, not the host, not each other).
 
-use std::io::Write;
 use std::net::Ipv4Addr;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -16,6 +16,12 @@ use crate::sys;
 pub const TABLE: &str = "burner";
 pub const NAT_TABLE: &str = "burner_nat";
 const TAP_PREFIX: &str = "bn";
+const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn helper(prog: &str, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output> {
+    sys::run_timeout(Command::new(prog).args(args), input, HELPER_TIMEOUT)
+        .with_context(|| format!("running {prog}"))
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -127,9 +133,10 @@ fn collapse(mut nets: Vec<(u32, u8)>) -> Vec<String> {
 }
 
 fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
-    let out = Command::new("ip")
-        .args(["-j", "-4", "addr", "show"])
-        .output()?;
+    let out = helper("ip", &["-j", "-4", "addr", "show"], None)?;
+    if !out.status.success() {
+        bail!("ip addr show failed");
+    }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
     let mut addrs = Vec::new();
     for link in v.as_array().into_iter().flatten() {
@@ -145,10 +152,12 @@ fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
 }
 
 fn route_dsts() -> Result<Vec<(Ipv4Addr, u8)>> {
-    let out = Command::new("ip")
-        .args(["-j", "-4", "route", "show", "table", "all"])
-        .output()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    let out = helper("ip", &["-j", "-4", "route", "show", "table", "all"], None)?;
+    if !out.status.success() {
+        bail!("ip route show failed");
+    }
+    // a route list we can't read must not shrink the blocked set
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("reading ip route")?;
     Ok(v.as_array()
         .into_iter()
         .flatten()
@@ -186,6 +195,16 @@ table inet {TABLE} {{
     set mode_web {{ type ifname; }}
     set mode_open {{ type ifname; }}
     set tap_ip {{ type ifname . ipv4_addr; }}
+
+    # before defrag and conntrack (-400): spoofed, fragmented or flooding guest
+    # packets never reach shared state on the host
+    chain ingress {{
+        type filter hook prerouting priority -450; policy accept;
+        iifname "{t}*" meta nfproto ipv6 drop
+        iifname "{t}*" iifname . ip saddr != @tap_ip drop
+        iifname "{t}*" ip frag-off & 0x3fff != 0 drop
+        iifname "{t}*" meter {TABLE}_pps {{ iifname limit rate over 3000/second burst 6000 packets }} drop
+    }}
 
     chain input {{
         type filter hook input priority filter - 10; policy accept;
@@ -225,22 +244,12 @@ table ip {NAT_TABLE} {{
 }
 
 fn nft(script: &str, check: bool) -> Result<()> {
-    let mut c = Command::new("nft");
-    if check {
-        c.arg("-c");
-    }
-    let mut child = c
-        .args(["-f", "-"])
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("running nft")?;
-    child
-        .stdin
-        .take()
-        .context("nft stdin")?
-        .write_all(script.as_bytes())?;
-    let out = child.wait_with_output()?;
+    let args: &[&str] = if check {
+        &["-c", "-f", "-"]
+    } else {
+        &["-f", "-"]
+    };
+    let out = helper("nft", args, Some(script.as_bytes()))?;
     if !out.status.success() {
         bail!("nft: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -248,11 +257,7 @@ fn nft(script: &str, check: bool) -> Result<()> {
 }
 
 fn run(prog: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(prog)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
+    let out = helper(prog, args, None)?;
     if !out.status.success() {
         bail!(
             "{prog} {}: {}",
@@ -362,7 +367,7 @@ pub fn check(cfg: &Config) {
 
 /// the ufw command still needed, if ufw is active and lacks it
 pub fn ufw_rule_missing(cfg: &Config) -> Result<Option<String>> {
-    let Ok(out) = Command::new("ufw").arg("status").output() else {
+    let Ok(out) = helper("ufw", &["status"], None) else {
         return Ok(None);
     };
     let status = String::from_utf8_lossy(&out.stdout);
@@ -387,7 +392,20 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Sl
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
     }
     let s = slot(cfg, i)?;
-    tap_down(cfg, i);
+    if !sys::which("conntrack") {
+        bail!(
+            "conntrack not found (package conntrack). burner needs it to clear old connections when a network slot is reused"
+        );
+    }
+    // teardown and the reaper remove a tap before its slot is free, so one that
+    // still exists here belongs to something else
+    if std::path::Path::new("/sys/class/net").join(&s.tap).exists() {
+        bail!(
+            "{} already exists, not touching it (burner reap cleans up its own)",
+            s.tap
+        );
+    }
+    let _ = helper("conntrack", &["-D", "-s", &s.guest.to_string()], None);
     run(
         "ip",
         &[
@@ -433,8 +451,10 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Sl
     Ok(s)
 }
 
-pub fn tap_down(cfg: &Config, i: u32) {
-    let Ok(s) = slot(cfg, i) else { return };
+/// remove a VM's tap, its filter entries and any connections it left. false when
+/// a tap with that name is still there afterwards
+pub fn tap_down(cfg: &Config, i: u32) -> bool {
+    let Ok(s) = slot(cfg, i) else { return false };
     let _ = run(
         "nft",
         &[
@@ -459,9 +479,24 @@ pub fn tap_down(cfg: &Config, i: u32) {
             ],
         );
     }
-    if std::path::Path::new("/sys/class/net").join(&s.tap).exists() {
+    let dev = std::path::Path::new("/sys/class/net").join(&s.tap);
+    if dev.exists() && ours(&s.tap) {
         let _ = run("ip", &["link", "delete", &s.tap]);
     }
+    // conntrack exits 1 when there was nothing to delete
+    let _ = helper("conntrack", &["-D", "-s", &s.guest.to_string()], None);
+    !dev.exists()
+}
+
+/// a bnN burner made: a tap owned by the burner user. an unrelated interface
+/// that happens to have the same name is left alone
+fn ours(tap: &str) -> bool {
+    let dir = std::path::Path::new("/sys/class/net").join(tap);
+    let Some((uid, _)) = sys::user_ids(crate::run::USER) else {
+        return false;
+    };
+    dir.join("tun_flags").exists()
+        && std::fs::read_to_string(dir.join("owner")).is_ok_and(|o| o.trim() == uid.to_string())
 }
 
 pub fn is_tap(dev: &str) -> bool {
@@ -469,18 +504,15 @@ pub fn is_tap(dev: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// tap indexes that exist on the host right now
+/// indexes of burner's own taps that exist on the host right now
 pub fn taps_present() -> Vec<u32> {
     std::fs::read_dir("/sys/class/net")
         .into_iter()
         .flatten()
         .filter_map(|e| {
-            e.ok()?
-                .file_name()
-                .to_str()?
-                .strip_prefix(TAP_PREFIX)?
-                .parse()
-                .ok()
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let i: u32 = name.strip_prefix(TAP_PREFIX)?.parse().ok()?;
+            (name == format!("{TAP_PREFIX}{i}") && ours(&name)).then_some(i)
         })
         .collect()
 }

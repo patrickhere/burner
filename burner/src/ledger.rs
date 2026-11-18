@@ -91,17 +91,34 @@ impl Ledger {
         serde_json::from_slice(&fs::read(self.path(id)).ok()?).ok()
     }
 
-    /// false when the id is already taken
+    /// entry files that don't parse. admission refuses to guess what they held
+    pub fn unreadable(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter(|e| {
+                fs::read(e.path())
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Vm>(&b).ok())
+                    .is_none()
+            })
+            .map(|e| e.path().display().to_string())
+            .collect()
+    }
+
+    /// false when the id is already taken. the entry shows up whole or not at all
     pub fn create(&self, vm: &Vm) -> Result<bool> {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(self.path(&vm.id))
-        {
-            Ok(mut f) => {
-                f.write_all(&serde_json::to_vec(vm)?)?;
-                Ok(true)
-            }
+        let tmp = self.dir.join(format!("{}.json.new", vm.id));
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(&serde_json::to_vec(vm)?)?;
+        f.sync_all()?;
+        let res = fs::hard_link(&tmp, self.path(&vm.id));
+        let _ = fs::remove_file(&tmp);
+        match res {
+            Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e.into()),
         }

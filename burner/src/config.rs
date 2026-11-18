@@ -179,9 +179,11 @@ fn default_route_iface() -> Option<String> {
 
 /// ipv4 addresses on an interface, from `ip -j`
 pub fn iface_addrs(iface: &str) -> Result<Vec<Ipv4Addr>> {
-    let out = Command::new("ip")
-        .args(["-j", "-4", "addr", "show", "dev", iface])
-        .output()?;
+    let out = crate::sys::run_timeout(
+        Command::new("ip").args(["-j", "-4", "addr", "show", "dev", iface]),
+        None,
+        std::time::Duration::from_secs(30),
+    )?;
     if !out.status.success() {
         bail!("ip addr show {iface} failed");
     }
