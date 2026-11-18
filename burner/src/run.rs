@@ -100,7 +100,7 @@ pub struct RunArgs {
 
 #[derive(Args)]
 pub struct ShellArgs {
-    /// image to boot, default ubuntu if it's installed, else alpine
+    /// image to boot (burner images lists them), default alpine
     spec: Option<String>,
     #[arg(long)]
     cpus: Option<u32>,
@@ -125,13 +125,7 @@ pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
         eprintln!("burner: burner shell needs a terminal (over ssh: ssh -t)");
         return ExitCode::from(EXIT_USAGE);
     }
-    let img = a.spec.unwrap_or_else(|| {
-        if images(cfg).iter().any(|i| i == "ubuntu") {
-            "ubuntu".into()
-        } else {
-            "alpine".into()
-        }
-    });
+    let img = a.spec.unwrap_or_else(|| "alpine".into());
     let ra = RunArgs {
         img,
         cpus: a.cpus,
@@ -548,10 +542,14 @@ fn run_vm(
     for d in [&jail, &root] {
         fs::set_permissions(d, fs::Permissions::from_mode(0o755))?;
     }
+    // hard links, not copies: instant, and the jailer can't follow a symlink out.
+    // that needs the kernel, images and jail on one filesystem under paths.root
+    let same_fs = "the kernel, images and jail dirs have to be on one filesystem (paths.root)";
     fs::hard_link(
         fs::canonicalize(cfg.paths.root.join("kernel/vmlinux"))?,
         root.join("vmlinux"),
-    )?;
+    )
+    .context(same_fs)?;
     fs::hard_link(
         cfg.paths
             .root
@@ -559,7 +557,8 @@ fn run_vm(
             .join(&p.img)
             .join("rootfs.ext4"),
         root.join("rootfs.ext4"),
-    )?;
+    )
+    .context(same_fs)?;
     fs::rename(&job, root.join("job.tar"))?;
     let scratch = root.join("scratch.ext4");
     reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;

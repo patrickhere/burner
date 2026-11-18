@@ -21,16 +21,6 @@ if [ "${1:-}" != stage2 ]; then
     mount -t overlay overlay -o lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work /mnt || {
         echo "burner-init: overlay failed" > /dev/console; halt; }
     mkdir -p /mnt/rom
-    # toolchains: one read-only drive each (vde, vdf, ...), with a writable overlay on scratch
-    tcs=$(sed -n 's/.*burner\.tc=\([a-z0-9,]*\).*/\1/p' /proc/cmdline)
-    set -- e f g h
-    for name in $(echo "$tcs" | tr ',' ' '); do
-        dev=/dev/vd$1; shift
-        mkdir -p "/overlay/tc-ro/$name" "/overlay/tc/$name/up" "/overlay/tc/$name/wk" "/mnt/opt/tc/$name"
-        mount -t ext4 -o ro "$dev" "/overlay/tc-ro/$name" &&
-        mount -t overlay overlay -o "lowerdir=/overlay/tc-ro/$name,upperdir=/overlay/tc/$name/up,workdir=/overlay/tc/$name/wk" \
-            "/mnt/opt/tc/$name" || echo "burner-init: toolchain $name failed to mount" > /dev/console
-    done
     cd /mnt || halt
     pivot_root . rom || { echo "burner-init: pivot failed" > /dev/console; halt; }
     exec /sbin/burner-init stage2
@@ -51,14 +41,6 @@ if [ -n "$dns" ]; then
     for ip in $(echo "$dns" | tr ',' ' '); do echo "nameserver $ip"; done > /etc/resolv.conf
 fi
 
-# toolchain environment, for jobs and login shells
-: > /etc/profile.d/burner-tc.sh 2>/dev/null || { mkdir -p /etc/profile.d; : > /etc/profile.d/burner-tc.sh; }
-for d in /opt/tc/*/; do
-    [ -f "$d/env" ] && cat "$d/env" >> /etc/profile.d/burner-tc.sh
-done
-# shellcheck disable=SC1091
-. /etc/profile.d/burner-tc.sh
-
 if grep -q 'burner\.shell=1' /proc/cmdline; then
     # interactive: a login shell on the serial console, the VM ends when it exits
     exec < /dev/ttyS0 > /dev/ttyS0 2>&1
@@ -70,8 +52,7 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     sh=/bin/sh; [ -x /bin/bash ] && sh=/bin/bash
     # shellcheck disable=SC1091
     name=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
-    tcs=""; for d in /opt/tc/*/; do [ -d "$d" ] && tcs="$tcs $(basename "$d")"; done
-    printf '\nburner: fresh %s VM%s. nothing is kept when you exit.\n\n' "$name" "${tcs:+, toolchains:$tcs}"
+    printf '\nburner: fresh %s VM. nothing is kept when you exit.\n\n' "$name"
     if command -v setsid >/dev/null 2>&1; then setsid -c "$sh" -l; else "$sh" -l; fi
     dmesg -n 1 2>/dev/null
     halt
