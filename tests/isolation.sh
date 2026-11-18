@@ -29,9 +29,10 @@ echo "$out" | grep -qE 'after=(137|1|2)' && [ "$rc" = 0 ] && ok "memory bomb con
 
 # 4 fork bomb + busy loops: the VM's cgroup stays within 1 core and the run ends
 # by the TTL. a bomb that brings the guest kernel down ends it early with 125,
-# which is just as contained
+# which is just as contained. `wait` keeps the job going: on a fast box the shell
+# could get out of f and exit 0 before the bomb takes over
 s=$(date +%s)
-( sudo burner run --ttl 25s --tag forkbomb -- 'for i in 1 2 3 4; do (while :; do :; done) & done; f(){ f|f& }; f' </dev/null >/dev/null 2>&1; echo $? > "$T/fork.rc" ) &
+( sudo burner run --ttl 25s --tag forkbomb -- 'for i in 1 2 3 4; do (while :; do :; done) & done; f(){ f|f& }; f; wait' </dev/null >/dev/null 2>&1; echo $? > "$T/fork.rc" ) &
 sleep 4
 vid=$(sudo burner ls | awk '/forkbomb/{print $1}')
 u1=$(sudo awk '/usage_usec/{print $2}' "/sys/fs/cgroup/burner/$vid/cpu.stat"); sleep 4
@@ -39,7 +40,7 @@ u2=$(sudo awk '/usage_usec/{print $2}' "/sys/fs/cgroup/burner/$vid/cpu.stat")
 cores=$(awk -v a="$u1" -v b="$u2" 'BEGIN{printf "%.2f", (b-a)/4000000}')
 wait
 e=$(date +%s); rc=$(cat "$T/fork.rc")
-[ -n "$u1" ] && [ -n "$u2" ] && awk -v c="$cores" 'BEGIN{exit !(c <= 1.05)}' \
+[ -n "$vid" ] && [ -n "$u1" ] && [ -n "$u2" ] && awk -v c="$cores" 'BEGIN{exit !(c <= 1.05)}' \
   && { [ "$rc" = 124 ] || [ "$rc" = 125 ]; } && [ $((e-s)) -le 40 ] \
   && ok "fork bomb + busy loops: VM held to ${cores} cores, ended after $((e-s))s (rc $rc)" \
   || bad "fork bomb" "rc=$rc cores=$cores secs=$((e-s))"

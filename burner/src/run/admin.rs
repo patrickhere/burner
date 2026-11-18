@@ -53,6 +53,54 @@ pub(super) fn remove_tree(path: &Path) -> bool {
     ok
 }
 
+/// what's known about a VM's tap when it gets released
+pub(super) enum Slot {
+    /// it never had one
+    None,
+    Tap(u32),
+    /// its ledger entry can't be read: leave the tap and report it unfinished
+    Unknown,
+    /// the orphan tap sweep frees it
+    Swept,
+}
+
+#[derive(PartialEq)]
+pub(super) enum Released {
+    /// still running, or its cgroup is still there: nothing was freed
+    Running,
+    /// stopped, but its tap or jail is still around
+    Partly,
+    Done,
+}
+
+/// the one place a VM's resources get freed, for teardown, the reaper and the
+/// orphan sweeps: kill what's in its cgroup, wait up to `wait`, and only once the
+/// cgroup is empty and removed take down its tap and delete its jail. the run
+/// dir is left to the caller, the wrapper still reads the result from it
+pub(super) fn release(cfg: &Config, id: &str, slot: Slot, wait: Duration) -> Released {
+    cgroup::kill(id);
+    let end = Instant::now() + wait;
+    while cgroup::populated(id) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // something that joined late makes the remove fail: then nothing is freed
+    if cgroup::populated(id) || !cgroup::remove(id) {
+        return Released::Running;
+    }
+    // the slow parts (subprocesses, deleting files) happen without the ledger lock
+    let tap_gone = match slot {
+        Slot::None | Slot::Swept => true,
+        Slot::Tap(i) => net::tap_down(cfg, i),
+        Slot::Unknown => false,
+    };
+    let jail_gone = remove_tree(&cfg.paths.root.join("jail/firecracker").join(id));
+    if tap_gone && jail_gone {
+        Released::Done
+    } else {
+        Released::Partly
+    }
+}
+
 /// stop the VM and only then free its disks and its slot. false when it couldn't be confirmed dead
 pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     let mut child = child;
@@ -61,45 +109,46 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     }
     cgroup::kill(id);
     let end = Instant::now() + Duration::from_secs(15);
-    let done = |c: &mut Option<&mut Child>| {
+    let exited = |c: &mut Option<&mut Child>| {
         c.as_deref_mut()
             .is_none_or(|c| matches!(c.try_wait(), Ok(Some(_))))
     };
-    while Instant::now() < end && !(done(&mut child) && !cgroup::populated(id)) {
+    while Instant::now() < end && !exited(&mut child) {
         std::thread::sleep(Duration::from_millis(100));
     }
-    let stopped = done(&mut child) && !cgroup::populated(id);
-    if !stopped {
-        if let Ok(led) = Ledger::open(&cfg.paths.state) {
-            let _ = led.update(id, |v| v.status = Status::CleanupFailed);
-        }
-        log_line(&format!(
-            "teardown {id}: VM did not stop, slot kept for the reaper"
-        ));
-        return false;
-    }
-    // the slow parts (subprocesses, deleting files) happen without the ledger lock
-    let cg_gone = cgroup::remove(id);
-    let tap_gone = match ledger::peek_strict(&cfg.paths.state, id) {
-        Ok(v) => v
-            .and_then(|v| v.net_slot)
-            .is_none_or(|i| net::tap_down(cfg, i)),
-        Err(_) => false, // can't tell which tap: leave it all for the reaper
+    let slot = match ledger::peek_strict(&cfg.paths.state, id) {
+        Ok(v) => v.and_then(|v| v.net_slot).map_or(Slot::None, Slot::Tap),
+        Err(_) => Slot::Unknown, // can't tell which tap: leave it for the reaper
     };
-    let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
-    let jail_gone = remove_tree(&jail) && tap_gone && cg_gone;
+    // the jailer can be killed before it moved itself into the cgroup
+    let released = if exited(&mut child) {
+        release(cfg, id, slot, end.saturating_duration_since(Instant::now()))
+    } else {
+        Released::Running
+    };
     let Ok(led) = Ledger::open(&cfg.paths.state) else {
         return false;
     };
-    if !jail_gone {
-        let _ = led.update(id, |v| {
-            v.status = Status::CleanupFailed;
-            v.wrapper = None;
-        });
-        return false;
+    match released {
+        Released::Done => {
+            led.delete(id);
+            true
+        }
+        Released::Partly => {
+            let _ = led.update(id, |v| {
+                v.status = Status::CleanupFailed;
+                v.wrapper = None;
+            });
+            false
+        }
+        Released::Running => {
+            let _ = led.update(id, |v| v.status = Status::CleanupFailed);
+            log_line(&format!(
+                "teardown {id}: VM did not stop, slot kept for the reaper"
+            ));
+            false
+        }
     }
-    led.delete(id);
-    true
 }
 
 /// who asked for the run: the sudo caller when there is one, else our own uid
@@ -241,22 +290,13 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         if v.wrapper.as_ref().is_some_and(Ident::alive) {
             continue;
         }
-        cgroup::kill(&v.id);
-        let until = Instant::now() + Duration::from_secs(3);
-        while cgroup::populated(&v.id) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if cgroup::populated(&v.id) {
+        let slot = v.net_slot.map_or(Slot::None, Slot::Tap);
+        let released = release(cfg, &v.id, slot, Duration::from_secs(3));
+        if released == Released::Running {
             continue;
         }
-        // something that joined late makes the remove fail: then nothing is freed
-        if !cgroup::remove(&v.id) {
-            continue;
-        }
-        let tap_gone = v.net_slot.is_none_or(|i| net::tap_down(cfg, i));
-        let jail = cfg.paths.root.join("jail/firecracker").join(&v.id);
         let run_gone = remove_tree(&cfg.paths.root.join("run").join(&v.id));
-        done.push((v.id.clone(), remove_tree(&jail) && run_gone && tap_gone));
+        done.push((v.id.clone(), released == Released::Done && run_gone));
     }
     {
         let led = Ledger::open(&cfg.paths.state)?;
@@ -289,8 +329,8 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .is_some_and(|d| d.as_secs() > secs)
     };
     // an entry nobody can read would block admission forever. stop whatever runs
-    // under its id, then move it aside as .bad; the orphan sweeps below take
-    // care of its tap and jail
+    // under its id, then move it aside as .bad; the orphan tap sweep below takes
+    // care of its tap
     let unreadable = Ledger::open(&cfg.paths.state)?.unreadable();
     for path in unreadable {
         let p = PathBuf::from(&path);
@@ -301,13 +341,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         else {
             continue;
         };
-        cgroup::kill(id);
-        let until = Instant::now() + Duration::from_secs(3);
-        while cgroup::populated(id) && Instant::now() < until {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if !cgroup::populated(id)
-            && cgroup::remove(id)
+        if release(cfg, id, Slot::Swept, Duration::from_secs(3)) != Released::Running
             && fs::rename(&p, p.with_extension("bad")).is_ok()
         {
             log_line(&format!(
@@ -331,11 +365,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             if !valid_id(&name) || known.contains(&name) || !old(&e.path(), 120) {
                 continue;
             }
-            cgroup::kill(&name);
-            if !cgroup::populated(&name)
-                && cgroup::remove(&name)
-                && remove_tree(&cfg.paths.root.join("jail/firecracker").join(&name))
-            {
+            if release(cfg, &name, Slot::Swept, Duration::ZERO) == Released::Done {
                 log_line(&format!("reap orphan {name}"));
             }
         }
