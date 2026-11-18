@@ -1,10 +1,10 @@
 [Unit]
-Description=burner reaper, every minute
+Description=burner reaper, every 30s
 
 [Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-AccuracySec=10s
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
 
 [Install]
 WantedBy=timers.target

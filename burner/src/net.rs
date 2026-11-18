@@ -268,6 +268,85 @@ fn run(prog: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// VM traffic gets its own routing table holding nothing but the uplink's
+/// default route, picked by source address. routes added later (a VPN, a new
+/// LAN, docker) land in the main table and never apply to a VM
+const RT_TABLE: &str = "29217";
+const RULE_PRIO: &str = "29217";
+
+fn egress_route(uplink: &str) -> Result<Vec<String>> {
+    let out = helper(
+        "ip",
+        &["-j", "-4", "route", "show", "default", "dev", uplink],
+        None,
+    )?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("reading ip route")?;
+    let r = v
+        .as_array()
+        .and_then(|a| a.first())
+        .with_context(|| format!("no default route on {uplink}, VMs would have no way out"))?;
+    let mut route = vec!["default".to_string()];
+    if let Some(gw) = r["gateway"].as_str() {
+        gw.parse::<Ipv4Addr>().context("odd gateway in ip route")?;
+        route.extend(["via".into(), gw.into()]);
+    }
+    route.extend(["dev".into(), uplink.into()]);
+    Ok(route)
+}
+
+/// point the VM table at the uplink's current default route. safe to repeat
+fn routing_up(cfg: &Config) -> Result<()> {
+    let route = egress_route(&cfg.uplink()?)?;
+    let mut args: Vec<&str> = vec!["-4", "route", "replace"];
+    args.extend(route.iter().map(String::as_str));
+    args.extend(["table", RT_TABLE]);
+    run("ip", &args)?;
+    let want = format!("from {} lookup {RT_TABLE}", cfg.net.subnet);
+    let have = helper("ip", &["-4", "rule", "show", "priority", RULE_PRIO], None)?;
+    let have = String::from_utf8_lossy(&have.stdout);
+    if have.lines().count() == 1 && have.contains(&want) {
+        return Ok(());
+    }
+    while run("ip", &["-4", "rule", "del", "priority", RULE_PRIO]).is_ok() {}
+    run(
+        "ip",
+        &[
+            "-4",
+            "rule",
+            "add",
+            "from",
+            &cfg.net.subnet,
+            "lookup",
+            RT_TABLE,
+            "priority",
+            RULE_PRIO,
+        ],
+    )
+}
+
+fn routing_down() {
+    while run("ip", &["-4", "rule", "del", "priority", RULE_PRIO]).is_ok() {}
+    let _ = run("ip", &["-4", "route", "flush", "table", RT_TABLE]);
+}
+
+fn routing_ok(cfg: &Config) -> bool {
+    helper("ip", &["-4", "rule", "show", "priority", RULE_PRIO], None).is_ok_and(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .contains(&format!("from {} lookup {RT_TABLE}", cfg.net.subnet))
+    })
+}
+
+/// stop new VM connections when the filter can't be kept current
+fn fail_closed(why: &str) {
+    sys::syslog(&format!(
+        "burner net: {why}, VMs lose their network until it works again"
+    ));
+    let _ = nft(
+        &format!("flush set inet {TABLE} mode_web\nflush set inet {TABLE} mode_open\n"),
+        false,
+    );
+}
+
 fn net_lock(cfg: &Config) -> Result<sys::Lock> {
     std::fs::create_dir_all(&cfg.paths.state)?;
     Ok(sys::Lock::exclusive(&cfg.paths.state.join("net.lock"))?)
@@ -282,8 +361,27 @@ fn table_exists() -> bool {
 pub fn up(cfg: &Config) -> Result<Vec<String>> {
     let _lock = net_lock(cfg)?;
     let rules = ruleset(cfg)?;
+    // routing first: without the nft table no tap can come up, so a failure
+    // here leaves VMs with no network instead of the host's routes
+    routing_up(cfg).context("setting up the VM routing table")?;
     nft(&rules, true)?;
     nft(&rules, false)?;
+    readd_running(cfg)?;
+    let mut notes = Vec::new();
+    if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() != "1") {
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+        notes.push("turned on ipv4 forwarding".into());
+    }
+    if let Some(cmd) = ufw_rule_missing(cfg)? {
+        notes.push(format!(
+            "ufw drops forwarded traffic and has no rule for burner. add it with:\n  {cmd}"
+        ));
+    }
+    Ok(notes)
+}
+
+/// put running VMs' taps back in the sets, after a reload or a fail-closed flush
+fn readd_running(cfg: &Config) -> Result<()> {
     let mut readd = String::new();
     for v in Ledger::open(&cfg.paths.state)?.all() {
         let (Some(i), Some(mode)) = (v.net_slot, Mode::parse(&v.net)) else {
@@ -303,17 +401,7 @@ pub fn up(cfg: &Config) -> Result<Vec<String>> {
     if !readd.is_empty() {
         nft(&readd, false)?;
     }
-    let mut notes = Vec::new();
-    if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() != "1") {
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
-        notes.push("turned on ipv4 forwarding".into());
-    }
-    if let Some(cmd) = ufw_rule_missing(cfg)? {
-        notes.push(format!(
-            "ufw drops forwarded traffic and has no rule for burner. add it with:\n  {cmd}"
-        ));
-    }
-    Ok(notes)
+    Ok(())
 }
 
 /// take the network away. VMs that have one are killed and their taps removed
@@ -328,13 +416,14 @@ pub fn down(cfg: &Config) -> Result<usize> {
         }
     }
     for i in taps_present() {
-        tap_down(cfg, i);
+        tap_down_locked(cfg, i);
     }
     if !taps_present().is_empty() {
         bail!("some taps couldn't be removed, leaving the filter in place");
     }
     let _ = run("nft", &["delete", "table", "inet", TABLE]);
     let _ = run("nft", &["delete", "table", "ip", NAT_TABLE]);
+    routing_down();
     Ok(killed)
 }
 
@@ -354,14 +443,19 @@ pub fn check(cfg: &Config) {
         return;
     }
     let Ok(_lock) = net_lock(cfg) else { return };
-    if let Ok(b) = blocked(cfg) {
-        let script = format!(
-            "flush set inet {TABLE} blocked4\nadd element inet {TABLE} blocked4 {{ {} }}\n",
-            b.join(", ")
-        );
-        if nft(&script, false).is_err() {
-            sys::syslog("couldn't refresh the blocked set");
-        }
+    let res = routing_up(cfg).context("VM routing").and_then(|()| {
+        let b = blocked(cfg)?;
+        nft(
+            &format!(
+                "flush set inet {TABLE} blocked4\nadd element inet {TABLE} blocked4 {{ {} }}\n",
+                b.join(", ")
+            ),
+            false,
+        )?;
+        readd_running(cfg)
+    });
+    if let Err(e) = res {
+        fail_closed(&format!("{e:#}"));
     }
 }
 
@@ -387,8 +481,8 @@ pub fn ufw_rule_missing(cfg: &Config) -> Result<Option<String>> {
 }
 
 pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Slot> {
-    let _lock = net_lock(cfg)?;
-    if !table_exists() {
+    let _lock = net_lock_for(cfg, std::time::Duration::from_secs(60))?;
+    if !table_exists() || !routing_ok(cfg) {
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
     }
     let s = slot(cfg, i)?;
@@ -405,7 +499,9 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Sl
             s.tap
         );
     }
-    let _ = helper("conntrack", &["-D", "-s", &s.guest.to_string()], None);
+    clear_conntrack(s.guest)?;
+    // a mode left from the slot's last VM must never carry over
+    drop_elements(&s);
     run(
         "ip",
         &[
@@ -452,9 +548,47 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Sl
 }
 
 /// remove a VM's tap, its filter entries and any connections it left. false when
-/// a tap with that name is still there afterwards
+/// it couldn't be confirmed. takes the network lock, so the reaper can't put
+/// the entries back halfway through
 pub fn tap_down(cfg: &Config, i: u32) -> bool {
-    let Ok(s) = slot(cfg, i) else { return false };
+    let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
+        return false;
+    };
+    tap_down_locked(cfg, i)
+}
+
+/// with the network lock held: drop burner's taps that no ledger entry owns.
+/// the ledger is read under the lock, and taps only come up under it, so a VM
+/// starting right now can't have its tap taken for an orphan
+pub fn reap_orphan_taps(cfg: &Config) -> Vec<u32> {
+    let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
+        return Vec::new();
+    };
+    let Ok(led) = Ledger::open(&cfg.paths.state) else {
+        return Vec::new();
+    };
+    let used: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
+    drop(led);
+    let gone: Vec<u32> = taps_present()
+        .into_iter()
+        .filter(|i| !used.contains(i))
+        .collect();
+    for &i in &gone {
+        tap_down_locked(cfg, i);
+    }
+    gone
+}
+
+fn net_lock_for(cfg: &Config, wait: std::time::Duration) -> Result<sys::Lock> {
+    std::fs::create_dir_all(&cfg.paths.state)?;
+    sys::Lock::exclusive_until(
+        &cfg.paths.state.join("net.lock"),
+        std::time::Instant::now() + wait,
+    )
+    .context("the network lock stayed busy")
+}
+
+fn drop_elements(s: &Slot) {
     let _ = run(
         "nft",
         &[
@@ -479,13 +613,29 @@ pub fn tap_down(cfg: &Config, i: u32) -> bool {
             ],
         );
     }
+}
+
+fn tap_down_locked(cfg: &Config, i: u32) -> bool {
+    let Ok(s) = slot(cfg, i) else { return false };
+    drop_elements(&s);
     let dev = std::path::Path::new("/sys/class/net").join(&s.tap);
     if dev.exists() && ours(&s.tap) {
         let _ = run("ip", &["link", "delete", &s.tap]);
     }
-    // conntrack exits 1 when there was nothing to delete
-    let _ = helper("conntrack", &["-D", "-s", &s.guest.to_string()], None);
-    !dev.exists()
+    let cleared = clear_conntrack(s.guest).is_ok();
+    !dev.exists() && cleared
+}
+
+/// drop every tracked connection from a VM address, so whoever gets the slot
+/// next can't receive replies meant for the last VM
+fn clear_conntrack(ip: Ipv4Addr) -> Result<()> {
+    let out = helper("conntrack", &["-D", "-s", &ip.to_string()], None)?;
+    // exit 1 with "0 flow entries" just means there was nothing to delete
+    let err = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() || err.contains(" 0 flow entries") {
+        return Ok(());
+    }
+    bail!("conntrack -D -s {ip}: {}", err.trim())
 }
 
 /// a bnN burner made: a tap owned by the burner user. an unrelated interface

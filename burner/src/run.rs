@@ -1425,7 +1425,7 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::from(1))
 }
 
-/// run every minute from a timer: stop VMs past their deadline, clean up after
+/// run every 30s from a timer: stop VMs past their deadline, clean up after
 /// wrappers that died, keep the network filter current. the ledger lock is only
 /// held for reads and the final deletes, never across subprocesses or file removal
 pub fn reap(cfg: &Config) -> Result<ExitCode> {
@@ -1495,16 +1495,8 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             .and_then(|t| unix_now.duration_since(t).ok())
             .is_some_and(|d| d.as_secs() > secs)
     };
-    let used: Vec<u32> = Ledger::open(&cfg.paths.state)?
-        .all()
-        .iter()
-        .filter_map(|v| v.net_slot)
-        .collect();
-    for i in net::taps_present() {
-        if !used.contains(&i) {
-            net::tap_down(cfg, i);
-            log_line(&format!("reap orphan tap {i}"));
-        }
+    for i in net::reap_orphan_taps(cfg) {
+        log_line(&format!("reap orphan tap {i}"));
     }
     for base in [
         cfg.paths.root.join("jail/firecracker"),
