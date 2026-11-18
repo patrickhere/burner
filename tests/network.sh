@@ -49,8 +49,10 @@ done
 echo "      ${#blocked[@]} host-side targets the host can reach"
 
 # probes run inside the VM; each prints OPEN or BLOCKED
+# all probes at once: most of them are blocked and would each wait out their timeout
 PROBES='
-p() { if timeout 6 sh -c "$2" >/dev/null 2>&1; then echo "OPEN $1"; else echo "BLOCKED $1"; fi; }
+n=0
+p() { n=$((n + 1)); ( if timeout 6 sh -c "$2" >/dev/null 2>&1; then echo "OPEN $1"; else echo "BLOCKED $1"; fi ) > /tmp/probe.$n & }
 '"$probes"'
 p tap-host-side      "nc -z -w 4 172.29.217.1 22"
 p metadata           "nc -z -w 4 169.254.169.254 80"
@@ -65,6 +67,8 @@ p https-pypi         "curl -sfS -m 10 -o /dev/null https://pypi.org/simple/reque
 p https-npm          "curl -sfS -m 10 -o /dev/null https://registry.npmjs.org/"
 p https-crates       "curl -sfS -m 10 -o /dev/null https://index.crates.io/config.json"
 p ipv6-global        "ip -6 addr show scope global | grep -q inet6"
+wait
+cat /tmp/probe.*
 '
 
 expect() {  # file name OPEN|BLOCKED
