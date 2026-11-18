@@ -361,14 +361,39 @@ pub fn routing_ok(cfg: &Config) -> bool {
 }
 
 /// stop new VM connections when the filter can't be kept current
-fn fail_closed(why: &str) {
+/// empties the sets that let a tap's traffic through. tap_ip too: without it the
+/// ingress chain drops every packet from a VM, so connections that were already
+/// open stop as well, not only new ones
+fn fail_closed_script() -> String {
+    ["tap_ip", "mode_web", "mode_open"]
+        .iter()
+        .map(|s| format!("flush set inet {TABLE} {s}\n"))
+        .collect()
+}
+
+/// the filter couldn't be refreshed: VMs lose their network until it can. the
+/// next good pass puts their entries back (readd_running). if nft itself is what
+/// fails, the sets can't be emptied, so the VMs with a network are stopped
+fn fail_closed(cfg: &Config, why: &str) {
     sys::syslog(&format!(
         "burner net: {why}, VMs lose their network until it works again"
     ));
-    let _ = nft(
-        &format!("flush set inet {TABLE} mode_web\nflush set inet {TABLE} mode_open\n"),
-        false,
-    );
+    if nft(&fail_closed_script(), false).is_ok() {
+        return;
+    }
+    let Ok(led) = Ledger::open(&cfg.paths.state) else {
+        sys::syslog("burner net: can't read the ledger either, stopping every VM");
+        cgroup::kill_all();
+        return;
+    };
+    for v in led.all().into_iter().filter(|v| v.net_slot.is_some()) {
+        let _ = led.update(&v.id, |x| x.cancel = true);
+        cgroup::kill(&v.id);
+        sys::syslog(&format!(
+            "burner net: couldn't empty the filter sets, stopped {}",
+            v.id
+        ));
+    }
 }
 
 fn net_lock(cfg: &Config) -> Result<sys::Lock> {
@@ -536,7 +561,10 @@ pub fn check(cfg: &Config) {
         }
         return;
     }
-    let Ok(_lock) = net_lock(cfg) else { return };
+    let Ok(_lock) = net_lock(cfg) else {
+        sys::syslog("burner net: net.lock stayed busy, filter refresh skipped this pass");
+        return;
+    };
     let res = routing_up(cfg).context("VM routing").and_then(|()| {
         let b = blocked(cfg)?;
         nft(
@@ -549,7 +577,7 @@ pub fn check(cfg: &Config) {
         readd_running(cfg)
     });
     if let Err(e) = res {
-        fail_closed(&format!("{e:#}"));
+        fail_closed(cfg, &format!("{e:#}"));
     }
 }
 
@@ -612,6 +640,10 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
             &uid.to_string(),
         ],
     )?;
+    // by default linux answers arp on any interface for every address it has,
+    // which would let a VM map the host's LAN, vpn and docker addresses
+    std::fs::write(format!("/proc/sys/net/ipv4/conf/{}/arp_ignore", s.tap), "1")
+        .with_context(|| format!("setting arp_ignore on {}", s.tap))?;
     run(
         "ip",
         &["addr", "add", &format!("{}/30", s.host), "dev", &s.tap],
@@ -774,6 +806,18 @@ pub fn taps_present(cfg: &Config) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fail_closed_empties_every_pass_set() {
+        let s = fail_closed_script();
+        for set in ["tap_ip", "mode_web", "mode_open"] {
+            assert!(
+                s.contains(&format!("flush set inet {TABLE} {set}\n")),
+                "{set}"
+            );
+        }
+        assert!(!s.contains("blocked4"), "the blocked set stays as it was");
+    }
 
     #[test]
     fn public_ip_answers() {

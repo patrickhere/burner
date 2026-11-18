@@ -46,6 +46,9 @@ for c in "${candidates[@]}"; do
     blocked+=("$name")
 done
 [ -n "$gw" ] && probes+="p ping-gateway \"ping -c1 -W3 $gw\""$'\n' && blocked+=(ping-gateway)
+# arp: the host must only answer for the tap's own gateway address
+arp_target=$(ip -4 -o addr show scope global | awk '{split($4, x, "/"); print x[1]}' | grep -v '^172\.29\.217\.' | head -n 1)
+[ -n "$arp_target" ] && probes+="p arp-host-$arp_target \"arping -c 2 -w 3 -I eth0 $arp_target\""$'\n' && blocked+=("arp-host-$arp_target")
 echo "      ${#blocked[@]} host-side targets the host can reach"
 
 # probes run inside the VM; each prints OPEN or BLOCKED
@@ -94,6 +97,34 @@ for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp
 done
 for t in ssh-out https-github dns; do expect "$T/open.txt" "$t" OPEN open; done
 pv=$(sudo burner ls | awk '/ peer /{print $1}'); [ -n "$pv" ] && sudo burner kill "$pv" >/dev/null; wait 2>/dev/null
+
+# fail closed: when the filter refresh fails, VMs lose their network, open
+# connections included (a 90M download, cloudflare refuses over 100M). a config
+# with a net.block entry that doesn't parse makes the refresh fail. the reaper
+# timer is stopped meanwhile so a normal pass can't put the network back early
+sudo burner config | sed 's|^block = \[\]|block = ["not-an-address"]|' | sudo tee /etc/burner/broken-block.toml >/dev/null
+sudo systemctl stop burner-reap.timer
+sudo burner reap
+( sudo burner run --net web --ttl 90s -- 'curl -s -o /var/tmp/d "https://speed.cloudflare.com/__down?bytes=90000000" & for i in $(seq 20); do sleep 2; wc -c < /var/tmp/d; done' </dev/null > "$T/fc.txt" 2>&1 ) &
+fc=$!
+sleep 12
+emptied=no
+for _ in 1 2 3 4 5; do
+    sudo burner --config /etc/burner/broken-block.toml reap
+    if ! sudo nft list set inet burner tap_ip | grep -q 'elements'; then emptied=yes; break; fi
+    sleep 2
+done
+wait "$fc"
+sudo rm -f /etc/burner/broken-block.toml
+sudo burner reap
+sudo systemctl start burner-reap.timer
+# 20 samples, 2s apart: growing before, flat for the last 10 (from ~5s after the flush)
+grew=$(head -n 5 "$T/fc.txt" | sort -un | wc -l)
+flat=$(tail -n 10 "$T/fc.txt" | sort -u | wc -l)
+after=$(sudo burner run --net web -- 'nslookup github.com >/dev/null 2>&1 && echo ok' </dev/null 2>&1)
+[ "$emptied" = yes ] && [ "$grew" -ge 3 ] && [ "$flat" = 1 ] && [ "$after" = ok ] \
+  && ok "failed refresh: open connection cut, network back after the next good pass" \
+  || bad "fail closed" "emptied=$emptied grew=$grew flat=$flat after=$after samples=$(tr '\n' ' ' < "$T/fc.txt")"
 
 # spoofing: a VM that takes another address gets nothing through
 out=$(sudo burner run --net open -- 'ip addr flush dev eth0; ip addr add 172.29.217.6/30 dev eth0; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)

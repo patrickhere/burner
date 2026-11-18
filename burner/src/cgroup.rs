@@ -35,6 +35,16 @@ pub fn kill(id: &str) {
     let _ = fs::write(path(id).join("cgroup.kill"), "1");
 }
 
+/// every VM at once, for when there's no telling which ones have a network
+pub fn kill_all() {
+    let _ = fs::write(
+        PathBuf::from("/sys/fs/cgroup")
+            .join(PARENT)
+            .join("cgroup.kill"),
+        "1",
+    );
+}
+
 /// true when the cgroup no longer exists
 pub fn remove(id: &str) -> bool {
     match fs::remove_dir(path(id)) {
