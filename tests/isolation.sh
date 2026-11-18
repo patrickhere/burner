@@ -114,6 +114,15 @@ grep -q 'waiting for a slot' "$T"/c*.err && [ "$running" = 2 ] && [ "$(cat "$T"/
   && ok "concurrency: 2 ran, 3rd queued, all finished (${running} at once, $((e-s))s)" \
   || bad "concurrency" "running=$running rcs=$(cat "$T"/c*.rc | tr '\n' ' ') secs=$((e-s))"
 
+# 10b two VMs at once: each firecracker runs as its own uid out of jail.uid_base
+for i in 1 2; do ( sudo burner run --tag u$i -- 'sleep 10' </dev/null >/dev/null 2>&1 ) & done
+sleep 6
+uids=$(for p in $(cat /sys/fs/cgroup/burner/burner-*/cgroup.procs 2>/dev/null); do awk '/^Uid:/{print $3}' "/proc/$p/status"; done | sort -u | tr '\n' ' ')
+wait
+base=$(sudo burner config | awk '$1 == "uid_base" {print $3}')
+[ -n "$base" ] && echo "$uids" | awk -v b="$base" '{ for (i = 1; i <= NF; i++) if ($i < b || $i >= b + 1024) exit 1; exit NF != 2 }' \
+  && ok "two VMs run as two uids from the VM range ($uids)" || bad "VM uids" "uids=$uids base=$base"
+
 # 11 total memory budget: 2 x 2G cannot run together
 ( sudo burner run --mem 2048 -- 'sleep 8' </dev/null >/dev/null 2>&1 ) & sleep 3
 sudo burner run --mem 2048 -- 'true' </dev/null >/dev/null 2>"$T/m.err"; wait

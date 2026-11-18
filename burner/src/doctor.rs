@@ -345,24 +345,22 @@ fn install(r: &mut Report, cfg: &Config) {
             );
         }
     }
-    // the VM user and the result parser's user: both unprivileged, never the same
-    let vm = sys::user_ids(crate::run::USER);
-    let parse = sys::user_ids(crate::result::PARSE_USER);
-    match (vm, parse) {
-        (Some((a, _)), Some((b, _))) if a != 0 && b != 0 && a != b => r.line(
-            Level::Ok,
-            "users",
-            format!("burner ({a}), burner-parse ({b})"),
-        ),
-        (Some(_), Some(_)) => r.line(
+    vm_uids(r, cfg);
+    // the result parser's user: unprivileged, and never sharing an id with a VM
+    let vms = cfg.vm_uids();
+    match sys::user_ids(crate::result::PARSE_USER) {
+        Some((u, g)) if u != 0 && g != 0 && !vms.contains(&u) && !vms.contains(&g) => {
+            r.line(Level::Ok, "users", format!("burner-parse ({u})"))
+        }
+        Some(_) => r.line(
             Level::Fail,
             "users",
-            "burner and burner-parse must be two different non-root users",
+            "burner-parse must be a non-root user with a uid and gid outside the VM range",
         ),
-        _ => r.line(
+        None => r.line(
             Level::Warn,
             "users",
-            "burner or burner-parse missing, install.sh creates them",
+            "burner-parse missing, install.sh creates it",
         ),
     }
     // images carry a copy of the guest init they were built with; one from an
@@ -391,6 +389,79 @@ fn install(r: &mut Report, cfg: &Config) {
     } else {
         r.line(Level::Warn, "images", "none installed yet");
     }
+}
+
+/// the uids and gids VMs run as must belong to nobody else: an account, a group
+/// or a container's mapped uid with the same number could signal a VM's
+/// firecracker or open its disks
+fn vm_uids(r: &mut Report, cfg: &Config) {
+    let ids = cfg.vm_uids();
+    let mut clash = Vec::new();
+    for db in ["passwd", "group"] {
+        let keys: Vec<String> = ids.clone().map(|i| i.to_string()).collect();
+        // by key, so accounts from ldap and the like count too. exit 2 means
+        // some keys weren't found, the normal answer here
+        let text = sys::run_timeout(
+            Command::new("getent").arg(db).args(&keys),
+            None,
+            Duration::from_secs(30),
+        )
+        .ok()
+        .filter(|o| matches!(o.status.code(), Some(0 | 2)))
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|| fs::read_to_string(format!("/etc/{db}")).unwrap_or_default());
+        clash.extend(ids_in(&text, &ids).into_iter().map(|n| format!("{db} {n}")));
+    }
+    for f in ["/etc/subuid", "/etc/subgid"] {
+        let text = fs::read_to_string(f).unwrap_or_default();
+        clash.extend(
+            sub_ranges_in(&text, &ids)
+                .into_iter()
+                .map(|n| format!("{n} in {f}")),
+        );
+    }
+    let range = format!("{}-{}", ids.start, ids.end - 1);
+    if clash.is_empty() {
+        r.line(
+            Level::Ok,
+            "vm uids",
+            format!("{range}, nothing else uses them"),
+        );
+    } else {
+        clash.truncate(5);
+        r.line(
+            Level::Fail,
+            "vm uids",
+            format!(
+                "{range} is partly taken ({}), pick another jail.uid_base",
+                clash.join(", ")
+            ),
+        );
+    }
+}
+
+/// "name id" for each passwd or group line whose id is in `ids`
+fn ids_in(text: &str, ids: &std::ops::Range<u32>) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            let id: u32 = f.get(2)?.parse().ok()?;
+            ids.contains(&id).then(|| format!("{} {id}", f[0]))
+        })
+        .collect()
+}
+
+/// names in a subuid or subgid file whose range overlaps `ids`
+fn sub_ranges_in(text: &str, ids: &std::ops::Range<u32>) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            let start: u64 = f.get(1)?.trim().parse().ok()?;
+            let count: u64 = f.get(2)?.trim().parse().ok()?;
+            (start < u64::from(ids.end) && start + count > u64::from(ids.start))
+                .then(|| f[0].to_string())
+        })
+        .collect()
 }
 
 /// the parts that only exist once burner is installed and running: the reaper,
@@ -459,4 +530,25 @@ fn run_ok(cmd: &str, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taken_ids() {
+        let ids = 400_000..401_024;
+        let passwd = "root:x:0:0:root:/root:/bin/bash\n\
+                      odd:x:400005:100::/:/bin/sh\n\
+                      past:x:401024:100::/:/bin/sh\n\
+                      broken line\n";
+        assert_eq!(ids_in(passwd, &ids), vec!["odd 400005"]);
+        let group = "kvm:x:992:\nfirst:x:400000:\n";
+        assert_eq!(ids_in(group, &ids), vec!["first 400000"]);
+        // useradd's fifth subuid range runs 362144-427679
+        let subuid = "alice:100000:65536\nbob:362144:65536\nend:399000:1000\nafter:401024:65536\n";
+        assert_eq!(sub_ranges_in(subuid, &ids), vec!["bob"]);
+        assert!(sub_ranges_in("", &ids).is_empty());
+    }
 }

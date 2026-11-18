@@ -23,8 +23,6 @@ pub use admin::{kill, ls, reap, reaper_age};
 pub use launch::{VMM_OVERHEAD_MIB, main};
 pub use plan::{RunArgs, ShellArgs, images, shell_main};
 
-pub const USER: &str = "burner";
-
 pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_TIMEOUT: u8 = 124;
 pub const EXIT_SANDBOX: u8 = 125;

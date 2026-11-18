@@ -49,7 +49,7 @@ burner ──jailer──> firecracker VM ──tap──> nft ──nat──> 
                         └── read-only image, scratch disk, job tar in, result tar out
 ```
 
-- every VM runs under firecracker's jailer as the unprivileged `burner` user, in its own cgroup with cpu, memory and pid caps
+- every VM runs under firecracker's jailer as its own uid and gid, in its own cgroup with cpu, memory and pid caps. the ids come from `jail.uid_base` in the config (1900000000 up, no account behind them), so a guest that breaks out into firecracker can't open another VM's disks or signal its process. a uid stays taken until its VM is cleaned up, and `burner doctor` fails if an account, a group or a `/etc/subuid` range already uses one
 - the image is mounted read-only with an overlay on a throwaway scratch disk. the command goes in as a raw tar on its own disk
 - results come back as a raw tar the guest writes to another disk. the host never mounts anything the guest wrote: the tar is read by a separate burner process running as its own user, `burner-parse`, with hard rlimits, and only regular files and directories get through
 - each VM gets a tap and its own /30. one nft table only lets those taps out the uplink, minus private ranges and the host's own addresses. bandwidth and disk io are capped per VM
@@ -79,7 +79,7 @@ linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack
 
 ```
 cargo build --release
-sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), users, units
+sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), a user, units
 tools/build-image alpine         # an image to boot, uses sudo, no docker
 sudo burner doctor
 ```

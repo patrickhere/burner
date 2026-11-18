@@ -2,7 +2,7 @@
 # install burner on this machine. run from a checkout after `cargo build --release`:
 #   sudo ./install.sh
 # downloads firecracker, the jailer and a guest kernel (pinned and checksummed),
-# creates the burner and burner-parse users, installs the binary and systemd
+# creates the burner-parse user, installs the binary and systemd
 # units, then runs burner doctor. everything is downloaded and checked before
 # anything already installed is replaced. safe to run again to upgrade.
 set -eu
@@ -116,10 +116,9 @@ fetch "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$KERNEL_BUILD/$ARCH
 
 "$bin" config >/dev/null 2>&1 || "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
 
-account burner
+# VMs run as uids from jail.uid_base, no account needed. a burner user from an
+# older install stays until --uninstall: VMs started before the upgrade run as it
 account burner-parse
-[ "$(id -u burner)" != "$(id -u burner-parse)" ] || die "burner and burner-parse must be different users"
-getent group kvm >/dev/null && usermod -aG kvm burner
 
 # 2. install: each file goes in under a temp name and is renamed into place
 install -d -m 0755 "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images"

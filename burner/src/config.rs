@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PATH: &str = "/etc/burner/config.toml";
+/// how many uids from jail.uid_base belong to VMs. also the most VMs at once
+pub const VM_UIDS: u32 = 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -14,6 +16,7 @@ pub struct Config {
     pub paths: Paths,
     pub net: Net,
     pub limits: Limits,
+    pub jail: Jail,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +57,24 @@ pub struct Limits {
     pub net: String,
     /// how long --in stdin and --in tar wait for the next byte before giving up
     pub stdin_idle_secs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Jail {
+    /// each VM's firecracker runs as its own uid and gid out of
+    /// uid_base .. uid_base + 1023, with no account behind them
+    pub uid_base: u32,
+}
+
+impl Default for Jail {
+    fn default() -> Self {
+        // past useradd's subuid ranges and systemd-nspawn's container range
+        // (up to 1879048191), below 2^31 where signedness bugs live
+        Jail {
+            uid_base: 1_900_000_000,
+        }
+    }
 }
 
 impl Default for Paths {
@@ -146,7 +167,22 @@ impl Config {
                 "limits.total_mem_mib is below limits.mem_mib, no VM at the max size could ever start"
             );
         }
+        if l.max_vms > VM_UIDS {
+            bail!("limits.max_vms is over {VM_UIDS}, the most VM uids there are");
+        }
+        let base = self.jail.uid_base;
+        if !(65536..=(1 << 31) - VM_UIDS).contains(&base) {
+            bail!(
+                "jail.uid_base has to be between 65536 (below that live real accounts) and {}",
+                (1u32 << 31) - VM_UIDS
+            );
+        }
         Ok(())
+    }
+
+    /// the uids (and gids, same numbers) VMs run as
+    pub fn vm_uids(&self) -> std::ops::Range<u32> {
+        self.jail.uid_base..self.jail.uid_base + VM_UIDS
     }
 
     pub fn subnet(&self) -> Result<(Ipv4Addr, u8)> {
@@ -293,5 +329,25 @@ mod tests {
         assert!(toml::from_str::<Config>("[net]\nsubnett = \"10.0.0.0/24\"\n").is_err());
         let c: Config = toml::from_str("[limits]\nmem_mib = 4096\ntotal_mem_mib = 2048\n").unwrap();
         assert!(c.check().is_err());
+    }
+
+    #[test]
+    fn vm_uid_range() {
+        let c = Config::default();
+        assert_eq!(c.vm_uids(), 1_900_000_000..1_900_001_024);
+        for bad in [
+            "[jail]\nuid_base = 0\n",
+            "[jail]\nuid_base = 1000\n",
+            "[jail]\nuid_base = 2147483000\n",
+            "[limits]\nmax_vms = 2000\ntotal_mem_mib = 9999999\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(bad).unwrap().check().is_err(),
+                "{bad}"
+            );
+        }
+        let c: Config = toml::from_str("[jail]\nuid_base = 400000\n").unwrap();
+        c.check().unwrap();
+        assert!(c.vm_uids().contains(&401_023) && !c.vm_uids().contains(&401_024));
     }
 }

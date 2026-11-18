@@ -76,6 +76,9 @@ pub struct Vm {
     pub started: u64,
     pub deadline_boot: Option<f64>,
     pub net_slot: Option<u32>,
+    /// the uid and gid its firecracker runs as. taken as long as the entry is,
+    /// and cleanup only drops the entry once the VM's processes, jail and tap are gone
+    pub uid: Option<u32>,
 }
 
 pub struct Ledger {
@@ -205,7 +208,10 @@ mod tests {
             "cancel":false,"started":1,"deadline_boot":null,"net_slot":3}"#;
         let v: Vm = serde_json::from_str(old).unwrap();
         assert_eq!(v.status, Status::CleanupFailed);
-        assert_eq!((v.version, v.owner, v.net_slot), (0, None, Some(3)));
+        assert_eq!(
+            (v.version, v.owner, v.net_slot, v.uid),
+            (0, None, Some(3), None)
+        );
         // and a newer one with fields this version doesn't know
         let newer = r#"{"version":9,"id":"burner-0123456789ab","status":"running","later":true}"#;
         assert_eq!(

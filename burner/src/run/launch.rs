@@ -14,11 +14,11 @@ use super::admin::{caller_uid, log_line, remove_tree, teardown};
 use super::console::{deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
 use super::{
-    Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, USER,
-    interrupted, is_interrupted, usage,
+    Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
+    is_interrupted, usage,
 };
 use crate::cgroup;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::ledger::{self, Ident, Ledger, Status, Vm};
 use crate::net;
 use crate::output::{Dest, Out, escape_controls};
@@ -108,15 +108,22 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
         return Err(usage("burner run needs root (sudo burner run ...)"));
     }
     let p = plan(cfg, a)?;
-    let (uid, gid) =
-        sys::user_ids(USER).with_context(|| format!("no {USER} user, see burner doctor"))?;
+    // the parser reads what a VM wrote, so it must never share an id with one
+    let (pu, pg) = sys::user_ids(result::PARSE_USER)
+        .with_context(|| format!("no {} user, see burner doctor", result::PARSE_USER))?;
+    if cfg.vm_uids().contains(&pu) || cfg.vm_uids().contains(&pg) {
+        anyhow::bail!(
+            "{} has a uid or gid in the VM range (jail.uid_base), see burner doctor",
+            result::PARSE_USER
+        );
+    }
     let runs = cfg.paths.root.join("run");
     fs::create_dir_all(&runs)?;
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
     let (id, run_dir) = alloc_id(&runs)?;
     let _ = RUN_ID.set(id.clone());
     let mut vm = None;
-    let res = run_vm(cfg, a, &p, &id, &run_dir, uid, gid, &mut vm);
+    let res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
     if vm.is_some() {
         teardown(cfg, &id, None);
     }
@@ -140,15 +147,12 @@ fn alloc_id(runs: &Path) -> Result<(String, PathBuf)> {
     anyhow::bail!("could not allocate a run id")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_vm(
     cfg: &Config,
     a: &RunArgs,
     p: &Plan,
     id: &str,
     run_dir: &Path,
-    uid: u32,
-    gid: u32,
     held: &mut Option<()>,
 ) -> Result<u8> {
     let live = Out::new(if a.result.is_some() {
@@ -174,7 +178,7 @@ fn run_vm(
     }
     build_job(&job, &p.cmd, a.input, spool.as_deref())?;
 
-    let net_slot = take_slot(cfg, p, id, &diag)?;
+    let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     *held = Some(());
 
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
@@ -210,11 +214,11 @@ fn run_vm(
     mkfs(&scratch, cfg, id)?;
     let raw = root.join("result.raw");
     reserve(cfg, &raw, result::RESULT_SIZE)?;
-    // opened now, before anything runs as the VM's user, and read through this fd
+    // opened now, before anything runs as the VM's uid, and read through this fd
     // later: the path inside the jail can't be swapped for something else
     let raw_fd = File::open(&raw)?;
     for f in [&scratch, &raw] {
-        chown(f, Some(uid), Some(gid))?;
+        chown(f, Some(uid), Some(uid))?;
         fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
     }
 
@@ -228,7 +232,7 @@ fn run_vm(
     }
     let mut ifaces = Vec::new();
     if let Some(i) = net_slot {
-        let s = net::tap_up(cfg, i, p.net, uid, gid)?;
+        let s = net::tap_up(cfg, i, p.net, uid)?;
         let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
         ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
                            "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
@@ -303,6 +307,8 @@ fn run_vm(
     unsafe {
         jailer.pre_exec(move || cgroup::join_from_child(&procs, me));
     }
+    // no --new-pid-ns: with it the jailer exits right after cloning firecracker,
+    // and burner watches this child's exit and status as the VM's
     let mut child = jailer
         .args(["--id", id, "--exec-file"])
         .arg(bin.join("firecracker"))
@@ -310,7 +316,7 @@ fn run_vm(
             "--uid",
             &uid.to_string(),
             "--gid",
-            &gid.to_string(),
+            &uid.to_string(),
             "--chroot-base-dir",
         ])
         .arg(cfg.paths.root.join("jail"))
@@ -616,7 +622,25 @@ fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result
     Ok(())
 }
 
-fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>> {
+/// the lowest of 0..n not in `taken`
+fn first_free(taken: &[u32], n: u32) -> Option<u32> {
+    (0..n).find(|i| !taken.contains(i))
+}
+
+/// a uid no VM in the ledger holds. entries from before VMs had their own uid
+/// hold none
+fn free_uid(cfg: &Config, vms: &[Vm]) -> Option<u32> {
+    let base = cfg.jail.uid_base;
+    let taken: Vec<u32> = vms
+        .iter()
+        .filter_map(|v| v.uid?.checked_sub(base))
+        .collect();
+    first_free(&taken, config::VM_UIDS).map(|i| base + i)
+}
+
+/// wait for room, then write the VM's ledger entry with its network slot (if
+/// it has a network) and its uid
+fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32>, u32)> {
     let l = &cfg.limits;
     let vm = Vm {
         id: id.into(),
@@ -638,6 +662,7 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
             .unwrap_or(0),
         deadline_boot: None,
         net_slot: None,
+        uid: None,
     };
     let start = Instant::now();
     let mut waited = false;
@@ -658,18 +683,17 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
                 let mut vm = vm.clone();
                 vm.deadline_boot = Some(sys::boottime() + f64::from(PREP_SECS));
                 if p.net != net::Mode::None {
-                    let taken: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
-                    vm.net_slot = Some(
-                        (0..cfg.net_slots()?)
-                            .find(|i| !taken.contains(i))
-                            .context("no free network slot")?,
-                    );
+                    let taken: Vec<u32> = busy.iter().filter_map(|v| v.net_slot).collect();
+                    vm.net_slot =
+                        Some(first_free(&taken, cfg.net_slots()?).context("no free network slot")?);
                 }
+                let uid = free_uid(cfg, &busy).context("no free VM uid")?;
+                vm.uid = Some(uid);
                 if !led.create(&vm)? {
                     anyhow::bail!("run id collision");
                 }
                 log_line(&format!(
-                    "start {id} by uid {} tag={} img={} vcpus={} mem={} disk={} ttl={} net={} shell={}",
+                    "start {id} by uid {} as uid {uid} tag={} img={} vcpus={} mem={} disk={} ttl={} net={} shell={}",
                     caller_uid(),
                     p.tag,
                     p.img,
@@ -680,7 +704,7 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<Option<u32>
                     p.net.name(),
                     p.shell
                 ));
-                return Ok(vm.net_slot);
+                return Ok((vm.net_slot, uid));
             }
             if p.no_wait {
                 set_status("busy", None);
@@ -815,5 +839,40 @@ mod tests {
         assert_eq!(guest_limit(60), 45);
         assert_eq!(guest_limit(3600), 3570);
         assert_eq!(guest_limit(3), 1);
+    }
+
+    #[test]
+    fn free_slots() {
+        assert_eq!(first_free(&[], 4), Some(0));
+        assert_eq!(first_free(&[0, 2], 4), Some(1));
+        assert_eq!(first_free(&[1, 0, 2], 4), Some(3));
+        assert_eq!(first_free(&[0, 1, 2, 3], 4), None);
+    }
+
+    #[test]
+    fn vm_uids() {
+        let cfg = Config::default();
+        let base = cfg.jail.uid_base;
+        let vm = |uid: Option<u32>| Vm {
+            uid,
+            ..Vm::default()
+        };
+        assert_eq!(free_uid(&cfg, &[]), Some(base));
+        // a VM without a network still takes a uid, and an old entry with none
+        // or one from another uid_base doesn't block one
+        assert_eq!(
+            free_uid(&cfg, &[vm(Some(base)), vm(None), vm(Some(5000))]),
+            Some(base + 1)
+        );
+        assert_eq!(
+            free_uid(&cfg, &[vm(Some(base + 1)), vm(Some(base))]),
+            Some(base + 2)
+        );
+        assert_eq!(
+            free_uid(&cfg, &[vm(Some(base)), vm(Some(base + 2))]),
+            Some(base + 1)
+        );
+        let full: Vec<Vm> = cfg.vm_uids().map(|u| vm(Some(u))).collect();
+        assert_eq!(free_uid(&cfg, &full), None);
     }
 }

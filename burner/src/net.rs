@@ -439,10 +439,10 @@ pub fn down(cfg: &Config) -> Result<usize> {
         }
     }
     drop(led);
-    for i in taps_present() {
+    for i in taps_present(cfg) {
         tap_down_locked(cfg, i);
     }
-    if !taps_present().is_empty() {
+    if !taps_present(cfg).is_empty() {
         bail!("some taps couldn't be removed, leaving the filter in place");
     }
     let _ = run("nft", &["delete", "table", "inet", TABLE]);
@@ -457,7 +457,7 @@ pub fn down(cfg: &Config) -> Result<usize> {
 /// from the reaper: keep the blocked set current as routes and addresses change,
 /// and if something wiped the table while taps are up, put it back or kill them
 pub fn check(cfg: &Config) {
-    let has_taps = !taps_present().is_empty();
+    let has_taps = !taps_present(cfg).is_empty();
     if !table_exists() {
         if !has_taps {
             return;
@@ -507,7 +507,8 @@ pub fn ufw_rule_missing(cfg: &Config) -> Result<Option<String>> {
     }))
 }
 
-pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Slot> {
+/// a tap only the VM's own uid and gid (the same number) can open
+pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
     let _lock = net_lock_for(cfg, std::time::Duration::from_secs(60))?;
     if !table_exists() || !routing_ok(cfg) {
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
@@ -541,7 +542,7 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32, gid: u32) -> Result<Sl
             "user",
             &uid.to_string(),
             "group",
-            &gid.to_string(),
+            &uid.to_string(),
         ],
     )?;
     run(
@@ -596,7 +597,7 @@ pub fn reap_orphan_taps(cfg: &Config) -> Vec<u32> {
     };
     let used: Vec<u32> = led.all().iter().filter_map(|v| v.net_slot).collect();
     drop(led);
-    let gone: Vec<u32> = taps_present()
+    let gone: Vec<u32> = taps_present(cfg)
         .into_iter()
         .filter(|i| !used.contains(i))
         .collect();
@@ -646,7 +647,7 @@ fn tap_down_locked(cfg: &Config, i: u32) -> bool {
     let Ok(s) = slot(cfg, i) else { return false };
     drop_elements(&s);
     let dev = std::path::Path::new("/sys/class/net").join(&s.tap);
-    if dev.exists() && ours(&s.tap) {
+    if dev.exists() && ours(cfg, &s.tap) {
         let _ = run("ip", &["link", "delete", &s.tap]);
     }
     let cleared = clear_conntrack(s.guest).is_ok();
@@ -665,15 +666,24 @@ fn clear_conntrack(ip: Ipv4Addr) -> Result<()> {
     bail!("conntrack -D -s {ip}: {}", err.trim())
 }
 
-/// a bnN burner made: a tap owned by the burner user. an unrelated interface
-/// that happens to have the same name is left alone
-fn ours(tap: &str) -> bool {
+/// before each VM had its own uid, every tap belonged to this user
+const OLD_USER: &str = "burner";
+
+/// a bnN burner made: a tap owned by a VM uid, or by the old shared user so
+/// taps from VMs started before an upgrade still get cleaned up. an unrelated
+/// interface that happens to have the same name is left alone
+fn ours(cfg: &Config, tap: &str) -> bool {
     let dir = std::path::Path::new("/sys/class/net").join(tap);
-    let Some((uid, _)) = sys::user_ids(crate::run::USER) else {
-        return false;
-    };
+    let old = sys::user_ids(OLD_USER).map(|(u, _)| u);
     dir.join("tun_flags").exists()
-        && std::fs::read_to_string(dir.join("owner")).is_ok_and(|o| o.trim() == uid.to_string())
+        && std::fs::read_to_string(dir.join("owner"))
+            .ok()
+            .and_then(|o| o.trim().parse::<u32>().ok())
+            .is_some_and(|o| owned_by_vm(cfg, o, old))
+}
+
+fn owned_by_vm(cfg: &Config, owner: u32, old: Option<u32>) -> bool {
+    cfg.vm_uids().contains(&owner) || old == Some(owner)
 }
 
 pub fn is_tap(dev: &str) -> bool {
@@ -682,14 +692,14 @@ pub fn is_tap(dev: &str) -> bool {
 }
 
 /// indexes of burner's own taps that exist on the host right now
-pub fn taps_present() -> Vec<u32> {
+pub fn taps_present(cfg: &Config) -> Vec<u32> {
     std::fs::read_dir("/sys/class/net")
         .into_iter()
         .flatten()
         .filter_map(|e| {
             let name = e.ok()?.file_name().into_string().ok()?;
             let i: u32 = name.strip_prefix(TAP_PREFIX)?.parse().ok()?;
-            (name == format!("{TAP_PREFIX}{i}") && ours(&name)).then_some(i)
+            (name == format!("{TAP_PREFIX}{i}") && ours(cfg, &name)).then_some(i)
         })
         .collect()
 }
@@ -728,5 +738,18 @@ mod tests {
         let s = slot(&cfg, 63).unwrap();
         assert_eq!(s.guest, Ipv4Addr::new(172, 29, 217, 254));
         assert!(slot(&cfg, 64).is_err());
+    }
+
+    #[test]
+    fn tap_owners() {
+        let cfg = Config::default();
+        let base = cfg.jail.uid_base;
+        assert!(owned_by_vm(&cfg, base, None));
+        assert!(owned_by_vm(&cfg, base + 1023, None));
+        assert!(!owned_by_vm(&cfg, base + 1024, None));
+        assert!(!owned_by_vm(&cfg, base - 1, None));
+        assert!(!owned_by_vm(&cfg, 0, None));
+        assert!(!owned_by_vm(&cfg, 1000, None));
+        assert!(owned_by_vm(&cfg, 998, Some(998)));
     }
 }
