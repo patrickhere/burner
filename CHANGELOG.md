@@ -1,5 +1,20 @@
 # changelog
 
+## unreleased
+
+- a run ends when its command ends, even with something left running in the background
+- a failed filter refresh cuts open connections too, and stops VMs if nft itself fails
+- taps don't answer arp for the host's other addresses
+- the reaper frees slots held by a stopped wrapper
+- job input and VM config are private to root and the VM's uid
+- helpers run as root use a fixed PATH
+- CRLF and split UTF-8 on a terminal
+- help text for run
+- release tarballs come with build provenance
+- ping limits per VM instead of one bucket for all of them
+- an image's defaults.toml with a typo is an error, not a quiet fallback
+- a fresh install writes a config with only what you change, so new defaults reach it
+
 ## 0.1.0
 
 first release.

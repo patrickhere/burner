@@ -1,5 +1,7 @@
 # burner
 
+[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml)
+
 throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or run a command in it, and it's deleted when you're done. each one is a firecracker microVM with its own kernel, and it can reach the internet but not your LAN.
 
 it started as a sandbox on my homelab for running code i don't trust (install scripts, other people's repos, things agents want to run) away from the box that has my keys on it. this is the rebuild in rust so other people can install it. the homelab version stays private, so the history here starts with the rebuild.
@@ -24,7 +26,7 @@ git archive HEAD | sudo burner run --net web --in tar -- 'apk add -q nodejs npm 
 tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d /out' > res.tar
 ```
 
-exit codes: the command's own, 124 when it hit the time limit, 125 when the sandbox itself failed, 2 for bad arguments, 130 when killed.
+exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
 the image is plain alpine with git and curl, so the first example installs node itself. build your own with a Dockerfile in `images/NAME/` and `tools/build-image NAME`.
 
@@ -57,6 +59,15 @@ burner ──jailer──> firecracker VM ──tap──> nft ──nat──> 
 
 nothing from the host goes into a VM unless you pipe it in. `--net web` means anything that goes in can leave, so don't pipe in secrets.
 
+where to start reading the code:
+
+- `burner/src/run/mod.rs`, the lock order comment at the top. read it before touching anything that takes a lock
+- `burner/src/run/launch.rs`, one run from waiting for a slot to teardown
+- `burner/src/net.rs`, `ruleset()` is the whole nft table: what a tap can and can't reach
+- `burner/src/result.rs`, the parser for the result tar, run as `burner-parse`
+- `guest/init`, pid 1 inside the VM: unpacks the job, runs it, writes the result disk
+- `burner-tui/`, the terminal UI, which only ever runs the burner binary
+
 ## what it protects against
 
 i run it on a box that's only reachable over a VPN. yours might sit on a home LAN or have a public IP. burner assumes the code in the VM is hostile and the host could be any of those.
@@ -80,23 +91,50 @@ linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack
 grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
 ```
+sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
 sha256sum -c --ignore-missing SHA256SUMS
-tar -xzf burner-v0.1.0-x86_64-linux.tar.gz
-cd burner-v0.1.0-x86_64-linux
+tar -xzf burner-v*-$(uname -m)-linux.tar.gz
+cd burner-v*-$(uname -m)-linux
 sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), a user, units
 tools/build-image alpine         # an image to boot, uses sudo, no docker
 sudo burner doctor
 ```
 
+releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
+
 or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
 
 an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
 
-if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, `burner config` shows them with defaults filled in.
+if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, which starts out empty: put only what you change there. `burner config` shows every setting with the defaults filled in.
 
 ## letting other users run VMs
 
 anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, use `dist/sudoers.example`: it allows `run`, `shell`, `ls`, `kill` and `images`. through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `[limits]` in the config apply to everyone.
+
+## from scripts and agents
+
+- exit codes: the command's own, 124 when it hit the time limit, 125 when the sandbox itself failed, 2 for bad arguments, 130 when interrupted (ctrl-c, SIGTERM, SIGHUP) or killed with `burner kill`
+- `--status-fd N` writes one JSON line when the run ends, so a command that exits 124 itself isn't mistaken for a timeout. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error` or `usage`. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
+- when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up with 125 after 10 min. `--no-wait` fails right away instead, with 125 and outcome `busy`
+- `sudo burner ls --json` prints `{"vms": [...], "max_vms", "total_mem", "used_mem"}`. each VM has `id`, `tag`, `img`, `vcpus`, `mem`, `disk`, `net`, `status` (`preparing`, `running` or `cleanup-failed`), `owner`, `age`, `ttl` and `ttl_left`. `--tag` on a run makes yours easy to find
+- anything the command leaves running in the background (a server started with `&`, a daemon, even one that called setsid) is killed when the command exits, and the run ends there. if the tests need a server, start it and stop it inside the same command
+
+a wrapper that tells a failing test from a timeout or a busy box:
+
+```sh
+#!/bin/sh
+log=$(mktemp)
+git archive HEAD | sudo burner run --net web --in tar --tag tests --status-fd 2 -- 'sh ./test.sh' 2>"$log"
+code=$?
+outcome=$(tail -n 1 "$log" | grep -o '"outcome":"[a-z_]*"' | cut -d'"' -f4)
+case $outcome in
+    exited) echo "tests exited $code" ;;
+    timeout) echo "tests hit the time limit" ;;
+    *) echo "no result ($outcome), see $log" >&2 ;;
+esac
+exit "$code"
+```
 
 ## tui
 
@@ -117,12 +155,13 @@ it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so
 - burner logs to syslog under the `burner` tag: `journalctl -t burner`. every run logs a start and an end line with its id, and the reaper says what it cleaned up
 - the network: `systemctl status burner-net`, and `sudo burner net show` for the rules. a VM with no internet on a docker host is usually docker's FORWARD drop policy, doctor prints the two lines that fix it
 - `cleanup-failed` in `burner ls` means a VM stopped but something of it (its cgroup, tap or jail dir) couldn't be removed yet. the reaper retries every 30s and the slot stays taken until it's gone
-- wrappers can pass `--status-fd N` to get one JSON line saying how the run ended, so a command that exits 124 itself isn't mistaken for a timeout. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
 - `sudo ./install.sh --uninstall` takes it all back off, except `/etc/burner`
 
 ## tests
 
 `tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on). both need a box with burner installed and an alpine image, and run as root through sudo.
+
+both VM suites run on github's kvm runners on every push to main, and on a dedicated box with a LAN and vpns.
 
 ## license
 
