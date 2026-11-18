@@ -92,6 +92,12 @@ if ufw is on, `burner doctor` prints the one route rule it needs. settings live 
 
 anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, use `dist/sudoers.example`: it allows `run`, `shell`, `ls`, `kill` and `images`. through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `[limits]` in the config apply to everyone.
 
+## tui
+
+`burner-tui` is a small terminal UI on top of the same commands. pick an image, network, cpus, memory and time limit, see the exact `sudo burner ...` line it'll run, and enter starts the shell or run in your terminal and comes back when it ends. tab shows the running VMs, refreshed every 2s, and `k` kills one after asking.
+
+it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so the sudoers rule above covers it. `cargo build --release` builds it next to burner, and `install.sh` puts it in `/usr/local/bin`.
+
 ## why not docker, gvisor or a hosted sandbox
 
 - docker and podman containers share the host's kernel. one kernel bug or one careless mount and the code is on your box. every burner VM has its own kernel behind kvm

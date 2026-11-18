@@ -13,6 +13,7 @@ KERNEL_BUILD=20261111-778a26c0594c-0
 KERNEL_VERSION=6.1.188
 ROOT=/var/lib/burner
 BIN=/usr/local/bin/burner
+TUI=/usr/local/bin/burner-tui
 
 die() { echo "install: $*" >&2; exit 1; }
 
@@ -29,7 +30,7 @@ uninstall() {
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
     rm -rf "$ROOT" /run/burner
-    rm -f "$BIN"
+    rm -f "$BIN" "$TUI"
     for u in burner-parse burner; do
         id "$u" >/dev/null 2>&1 && userdel "$u"
     done
@@ -144,6 +145,10 @@ put 0644 "$work/vmlinux" "$ROOT/kernel/vmlinux-$KERNEL_VERSION"
 ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux.new"
 mv -fT "$ROOT/kernel/vmlinux.new" "$ROOT/kernel/vmlinux"
 put 0755 "$bin" "$BIN"
+# the tui is optional, it only runs the burner binary
+if [ -x "$src/target/release/burner-tui" ]; then
+    put 0755 "$src/target/release/burner-tui" "$TUI"
+fi
 
 install -d -m 0755 /etc/burner
 if [ -s /etc/burner/config.toml ]; then

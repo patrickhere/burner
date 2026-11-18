@@ -46,9 +46,11 @@ jobs:
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: static binary
         run: |
-          f=target/${{ matrix.target }}/release/burner
-          file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
-          "$f" --version
+          for b in burner burner-tui; do
+            f=target/${{ matrix.target }}/release/$b
+            file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
+            "$f" --version
+          done
 
   shell:
     runs-on: ubuntu-24.04
