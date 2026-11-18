@@ -265,6 +265,18 @@ fn prescan(src: &mut File) -> io::Result<()> {
         if size > max {
             return Err(fatal("result has an oversized tar header"));
         }
+        // a pax record can override the next member's size, which would make this
+        // pass and the tar crate disagree about where members start
+        if h[156] == b'x' {
+            let mut rec = vec![0u8; size as usize];
+            src.read_exact(&mut rec)?;
+            if rec
+                .split(|&b| b == b'\n')
+                .any(|l| l.windows(6).any(|w| w == b" size="))
+            {
+                return Err(fatal("result has a pax size override"));
+            }
+        }
         off = size
             .div_ceil(512)
             .checked_mul(512)
@@ -532,6 +544,24 @@ mod tests {
         let mut h = tar::Header::new_gnu();
         h.set_size(1);
         b.append_data(&mut h, &long, &b"z"[..]).unwrap();
+        assert!(walk_bytes(&b.into_inner().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn pax_size_override() {
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("size", &b"5"[..])]).unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(1);
+        b.append_data(&mut h, "out/x", &b"z"[..]).unwrap();
+        assert!(walk_bytes(&b.into_inner().unwrap()).is_err());
+        // a pax record without a size (long names, mtimes) still passes
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("mtime", &b"1700000000.5"[..])])
+            .unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(1);
+        b.append_data(&mut h, "out/x", &b"z"[..]).unwrap();
         assert!(walk_bytes(&b.into_inner().unwrap()).is_ok());
     }
 
