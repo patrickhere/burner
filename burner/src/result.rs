@@ -35,6 +35,12 @@ pub struct Meta {
     /// the run fails even if the command succeeded
     #[serde(default)]
     pub guest_error: bool,
+    /// the guest init's protocol number, from result/proto
+    #[serde(default)]
+    pub proto: Option<u32>,
+    /// the guest stopped the job at its time limit and still wrote results
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 /// reads exactly `left` bytes or fails: a member whose body runs past the end
@@ -363,6 +369,8 @@ fn walk(
             .ok_or_else(|| fatal("result over the size cap"))?;
         match name.as_str() {
             "result/rc" if size <= 8 => meta.rc = read_small(&mut e)?.trim().parse().ok(),
+            "result/proto" if size <= 8 => meta.proto = read_small(&mut e)?.trim().parse().ok(),
+            "result/timed_out" => meta.timed_out = true,
             "result/log_skipped" if size <= 20 => {
                 meta.skipped = read_small(&mut e)?.trim().parse().unwrap_or(0)
             }

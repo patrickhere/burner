@@ -59,11 +59,19 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
 fi
 
 token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
+# how this init talks to the host (console markers, /result layout). burner
+# passes the one it speaks; an image from another burner version gets refused
+PROTO=1
+want=$(sed -n 's/.*burner\.proto=\([0-9]*\).*/\1/p' /proc/cmdline)
+# seconds the job gets, a little under the VM's own time limit, so a job that
+# runs long still hands back its log and /out before the host kills the VM
+limit=$(sed -n 's/.*burner\.limit=\([0-9]*\).*/\1/p' /proc/cmdline)
 mkdir -p /job /work /out /result
 # rc and the log live in their own small tmpfs, so a full scratch disk can't lose
 # them. the log never touches scratch at all: 64K head + 5 rolling 4M chunks
 mount -t tmpfs -o size=40m,mode=0700 tmpfs /result || { echo "burner-init: /result tmpfs failed" > /dev/console; halt; }
 C=/result/chunks; mkdir -p "$C"
+echo "$PROTO" > /result/proto
 
 # raw console: no \n -> \r\n, so the live bytes match the log exactly
 stty -opost 2>/dev/null
@@ -103,7 +111,9 @@ capture() {
     echo "$total $n" > /result/total
 }
 
-if ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
+if [ "$want" != "$PROTO" ]; then
+    fail "this image's guest init speaks protocol $PROTO and burner wants ${want:-none}, rebuild the image with tools/build-image"
+elif ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
     fail "job disk unreadable"
 elif [ -f /job/input.tar ] && ! tar -x -C /work -f /job/input.tar 2>/result/untar.err; then
     fail "input tar did not unpack: $(head -c 300 /result/untar.err)"
@@ -115,7 +125,21 @@ else
     echo "BURNER-$token-BEGIN"
     # the serial console is slow (nested virt), so only the first 64K goes out live.
     # the log goes back on the result disk and the host prints the rest
-    { /bin/sh /job/run.sh < "$stdin"; echo $? > /result/rc; } 2>&1 | capture
+    # the job runs in its own session, so the watchdog can stop all of it
+    if [ -n "$limit" ]; then
+        (
+            sleep "$limit"
+            [ -f /result/rc ] && exit 0
+            : > /result/timed_out
+            pg=$(cat /result/jobpid 2>/dev/null)
+            [ -n "$pg" ] || exit 0
+            kill -TERM -"$pg" 2>/dev/null; sleep 3; kill -KILL -"$pg" 2>/dev/null
+        ) &
+        watchdog=$!
+    fi
+    # shellcheck disable=SC2016
+    { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec /bin/sh /job/run.sh' < "$stdin"; echo $? > /result/rc; } 2>&1 | capture
+    [ -n "${watchdog:-}" ] && kill "$watchdog" 2>/dev/null
     live=$(wc -c < /result/head 2>/dev/null || echo 0)
     read -r total n < /result/total 2>/dev/null || { total=0; n=0; }
     last=""

@@ -39,6 +39,15 @@ const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
 /// what the VM's cgroup may use on top of guest RAM: firecracker itself, plus
 /// host page cache from writes to its disks, which is charged to the same cgroup
+/// the guest init protocol this burner speaks (guest/init has the same number)
+const GUEST_PROTO: u32 = 1;
+
+/// how long the guest lets the job run: a little under the VM's limit, so a job
+/// that runs long still gets its log and /out written before the host kills it
+fn guest_limit(ttl: u32) -> u32 {
+    ttl.saturating_sub((ttl / 4).clamp(5, 30)).max(1)
+}
+
 pub const VMM_OVERHEAD_MIB: u64 = 256;
 /// past this much over guest RAM the kernel starts flushing and throttling the
 /// VM's writes, long before the hard limit would kill firecracker
@@ -577,8 +586,11 @@ fn run_vm(
     prep_ok(cfg, id)?;
     let token = sys::random_hex(8)?;
     let mut boot = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token}"
+        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token} burner.proto={GUEST_PROTO}"
     );
+    if !p.shell {
+        boot += &format!(" burner.limit={}", guest_limit(p.ttl));
+    }
     let mut ifaces = Vec::new();
     if let Some(i) = net_slot {
         let s = net::tap_up(cfg, i, p.net, uid, gid)?;
@@ -836,6 +848,31 @@ fn run_vm(
             match meta.rc {
                 Some(rc) if !meta.guest_error => set_status("exited", Some(rc)),
                 _ => set_status("sandbox_error", None),
+            }
+            if meta.timed_out {
+                diag.put(
+                    format!(
+                        "burner: stopped at the {}s time limit, the output and /out up to then are above\n",
+                        p.ttl
+                    )
+                    .as_bytes(),
+                    None,
+                );
+                code = EXIT_TIMEOUT;
+                set_status("timeout", None);
+            }
+            // an image built from another burner's guest init: its results can't be trusted
+            if meta.rc.is_some() && meta.proto != Some(GUEST_PROTO) {
+                diag.put(
+                    format!(
+                        "burner: image {} runs a guest init from another burner version, rebuild it: tools/build-image {}\n",
+                        p.img, p.img
+                    )
+                    .as_bytes(),
+                    None,
+                );
+                code = EXIT_SANDBOX;
+                set_status("sandbox_error", None);
             }
             if let (Some(out), false) = (&tar_out, meta.fatal) {
                 // a tar that didn't arrive whole is a failed run, whatever the guest said
@@ -1887,6 +1924,14 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_limits() {
+        assert_eq!(guest_limit(10), 5);
+        assert_eq!(guest_limit(60), 45);
+        assert_eq!(guest_limit(3600), 3570);
+        assert_eq!(guest_limit(3), 1);
+    }
 
     #[test]
     fn shell_escape() {
