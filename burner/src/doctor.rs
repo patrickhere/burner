@@ -179,13 +179,35 @@ fn network(r: &mut Report, cfg: &Config) {
             let public_block = cfg.net.block.iter().any(|b| {
                 config::parse_cidr(b).is_ok_and(|(ip, _)| !ip.is_private() && !ip.is_loopback())
             });
-            if natted && !public_block {
+            if cfg.net.block_public_ip {
+                match crate::net::public_ip(cfg) {
+                    Some((ip, age)) if age.as_secs() < 3600 => r.line(
+                        Level::Ok,
+                        "public ip",
+                        format!("{ip} is blocked, looked up {} min ago", age.as_secs() / 60),
+                    ),
+                    Some((ip, age)) => r.line(
+                        Level::Warn,
+                        "public ip",
+                        format!(
+                            "{ip} is blocked, but the last lookup that worked was {} min ago (journalctl -t burner)",
+                            age.as_secs() / 60
+                        ),
+                    ),
+                    None => r.line(
+                        Level::Fail,
+                        "public ip",
+                        "net.block_public_ip is on but no address was found yet, so runs with a network are \
+                         refused. the reaper looks it up (journalctl -t burner)",
+                    ),
+                }
+            } else if natted && !public_block {
                 r.line(
                     Level::Warn,
                     "router",
                     "this host is behind NAT. VMs can reach your router's public address, and from the inside \
-                     that's often its admin page, its ssh or your port forwards. put that address in net.block \
-                     (curl ifconfig.me shows it; update it if it changes)",
+                     that's often its admin page, its ssh or your port forwards. set net.block_public_ip = true \
+                     to have burner look it up and block it, or put it in net.block yourself",
                 );
             }
         }

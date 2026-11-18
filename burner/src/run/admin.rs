@@ -387,6 +387,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             remove_tree(&e.path());
         }
     }
+    net::refresh_public_ip(cfg);
     net::check(cfg);
     let _ = fs::write(
         cfg.paths.state.join(REAPED),

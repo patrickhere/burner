@@ -4,7 +4,7 @@
 
 use std::net::Ipv4Addr;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
@@ -19,6 +19,9 @@ const TAP_PREFIX: &str = "bn";
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 const FORWARD_MARK: &str = "forwarding-turned-on";
+const PUBLIC_IP: &str = "public-ip";
+const PUBLIC_IP_EVERY: Duration = Duration::from_secs(600);
+const PUBLIC_IP_URLS: [&str; 2] = ["https://ipv4.icanhazip.com", "https://api.ipify.org"];
 
 fn helper(prog: &str, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output> {
     sys::run_timeout(Command::new(prog).args(args), input, HELPER_TIMEOUT)
@@ -104,6 +107,9 @@ pub fn blocked(cfg: &Config) -> Result<Vec<String>> {
         add(config::parse_cidr(&s).with_context(|| format!("net.block {s:?}"))?);
     }
     add(cfg.subnet()?);
+    if let Some((ip, _)) = public_ip(cfg) {
+        add((ip, 32));
+    }
     for (addr, prefix) in local_addrs()? {
         add((addr, 32));
         add((addr, prefix));
@@ -454,6 +460,67 @@ pub fn down(cfg: &Config) -> Result<usize> {
     Ok(killed)
 }
 
+/// the last public address found for net.block_public_ip and how old that
+/// answer is. a stale one stays blocked: the old address is more likely still
+/// the router's than not
+pub fn public_ip(cfg: &Config) -> Option<(Ipv4Addr, Duration)> {
+    if !cfg.net.block_public_ip {
+        return None;
+    }
+    let path = cfg.paths.state.join(PUBLIC_IP);
+    let ip = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let age = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .unwrap_or_default();
+    Some((ip, age))
+}
+
+/// a public address worth blocking. anything else an outside service says is ignored
+fn plausible_public(ip: Ipv4Addr) -> bool {
+    !(ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
+}
+
+/// from the reaper, before check(): ask again when the last answer is 10 min
+/// old. the worst a lying service can do is get one more address blocked
+pub fn refresh_public_ip(cfg: &Config) {
+    if !cfg.net.block_public_ip || public_ip(cfg).is_some_and(|(_, age)| age < PUBLIC_IP_EVERY) {
+        return;
+    }
+    for url in PUBLIC_IP_URLS {
+        let Ok(out) = sys::run_timeout(
+            Command::new("curl").args(["-4", "-sSf", "-m", "5", "--max-filesize", "64", url]),
+            None,
+            Duration::from_secs(8),
+        ) else {
+            continue;
+        };
+        let Some(ip) = std::str::from_utf8(&out.stdout)
+            .ok()
+            .and_then(|s| s.trim().parse::<Ipv4Addr>().ok())
+            .filter(|ip| out.status.success() && plausible_public(*ip))
+        else {
+            continue;
+        };
+        let path = cfg.paths.state.join(PUBLIC_IP);
+        let tmp = path.with_extension("new");
+        if std::fs::write(&tmp, format!("{ip}\n")).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            return;
+        }
+    }
+    sys::syslog(
+        "couldn't look up the public address for net.block_public_ip, keeping the last one",
+    );
+}
+
 /// from the reaper: keep the blocked set current as routes and addresses change,
 /// and if something wiped the table while taps are up, put it back or kill them
 pub fn check(cfg: &Config) {
@@ -707,6 +774,27 @@ pub fn taps_present(cfg: &Config) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_ip_answers() {
+        for ok in ["8.8.8.8", "1.1.1.1"] {
+            assert!(plausible_public(ok.parse().unwrap()), "{ok}");
+        }
+        for bad in [
+            "10.1.0.1",
+            "192.168.1.1",
+            "172.16.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "169.254.169.254",
+            "255.255.255.255",
+            "224.0.0.1",
+            "192.0.2.1",
+        ] {
+            assert!(!plausible_public(bad.parse().unwrap()), "{bad}");
+        }
+    }
 
     #[test]
     fn collapsing() {

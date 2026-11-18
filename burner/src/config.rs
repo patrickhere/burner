@@ -41,6 +41,9 @@ pub struct Net {
     /// extra destinations VMs may never reach, on top of private ranges and
     /// everything the host itself has a route to
     pub block: Vec<String>,
+    /// look up this host's public IPv4 every 10 min (behind NAT, the router's)
+    /// and block it too. asks icanhazip.com, ipify.org as a fallback
+    pub block_public_ip: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +97,7 @@ impl Default for Net {
             resolvers: vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)],
             rate: 2_500_000,
             block: Vec::new(),
+            block_public_ip: false,
         }
     }
 }

@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use super::admin::reaper_alive;
 use super::launch::main;
-use super::{EXIT_USAGE, usage};
+use super::{EXIT_SANDBOX, EXIT_USAGE, Exit, usage};
 use crate::config::Config;
 use crate::net;
 use crate::sys;
@@ -269,6 +269,15 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     }
     if net != net::Mode::None {
         reaper_alive(cfg)?;
+        if cfg.net.block_public_ip && net::public_ip(cfg).is_none() {
+            return Err(Exit(
+                EXIT_SANDBOX,
+                "net.block_public_ip is on but no public address has been found yet \
+                 (journalctl -t burner), refusing a VM with a network. --net none still works"
+                    .into(),
+            )
+            .into());
+        }
     }
     let tag = a.tag.clone().unwrap_or_else(|| "-".into());
     if tag != "-" && !valid_name(&tag) {
