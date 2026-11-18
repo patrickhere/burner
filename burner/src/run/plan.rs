@@ -42,7 +42,6 @@ pub struct RunArgs {
     /// network: none, web (http/https, dns, ping) or open (any port but mail). never the LAN
     #[arg(long, default_value = "none")]
     net: String,
-    /// one argument runs as a shell string; several are quoted as they are
     /// write one JSON line to this fd when done: how the run ended, the guest's
     /// exit code if it has one, the VM id. for wrappers that need to tell a
     /// timeout from a command that exited 124 itself. sudo closes fds above 2,
@@ -52,6 +51,7 @@ pub struct RunArgs {
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
+    /// one argument runs as a shell string; several are quoted as they are
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
     #[arg(skip)]

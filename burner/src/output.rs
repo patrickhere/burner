@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const QUEUE_CAP: usize = 8 << 20;
@@ -17,6 +17,7 @@ pub struct Out {
     broken: Arc<AtomicBool>,
     dropped: AtomicBool,
     tty: bool,
+    esc: Mutex<TtyEscape>,
 }
 
 pub enum Dest {
@@ -61,6 +62,7 @@ impl Out {
             broken,
             dropped: AtomicBool::new(false),
             tty: crate::sys::is_tty(fd),
+            esc: Mutex::new(TtyEscape::default()),
         }
     }
 
@@ -69,11 +71,18 @@ impl Out {
         if b.is_empty() || self.broken.load(Ordering::Relaxed) {
             return;
         }
-        let b = if self.tty {
-            escape_controls(b)
-        } else {
-            b.to_vec()
-        };
+        if !self.tty {
+            return self.send(b.to_vec(), wait_until);
+        }
+        // held through the send so chunks queue in the order they were escaped
+        let mut esc = self.esc.lock().unwrap_or_else(|e| e.into_inner());
+        self.send(esc.feed(b), wait_until);
+    }
+
+    fn send(&self, b: Vec<u8>, wait_until: Option<Instant>) {
+        if b.is_empty() {
+            return;
+        }
         loop {
             let q = self.queued.load(Ordering::Relaxed);
             if q + b.len() + CHUNK_COST <= QUEUE_CAP {
@@ -105,6 +114,10 @@ impl Out {
     }
 
     pub fn drain(&self, until: Instant) {
+        if self.tty && !self.broken.load(Ordering::Relaxed) {
+            let mut esc = self.esc.lock().unwrap_or_else(|e| e.into_inner());
+            self.send(esc.finish(), Some(until));
+        }
         while Instant::now() < until {
             if self.queued.load(Ordering::Relaxed) == 0 || self.broken.load(Ordering::Relaxed) {
                 return;
@@ -140,6 +153,40 @@ pub fn escape_controls(b: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// escape_controls over a stream. a trailing \r and a cut-off utf-8 char wait
+/// for the next chunk, so where the reads split doesn't change what's shown
+#[derive(Default)]
+pub struct TtyEscape {
+    held: Vec<u8>,
+}
+
+impl TtyEscape {
+    pub fn feed(&mut self, b: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(b);
+        let keep = unfinished_tail(&buf);
+        self.held = buf.split_off(buf.len() - keep);
+        escape_controls(&buf)
+    }
+
+    /// whatever is still held, escaped as it stands
+    pub fn finish(&mut self) -> Vec<u8> {
+        escape_controls(&std::mem::take(&mut self.held))
+    }
+}
+
+/// how many bytes at the end could still change meaning: the start of a utf-8
+/// char, or a \r that a \n may follow
+fn unfinished_tail(b: &[u8]) -> usize {
+    let from = b.len().saturating_sub(3);
+    if let Some(i) = (from..b.len()).rev().find(|&i| b[i] & 0xc0 != 0x80)
+        && std::str::from_utf8(&b[i..]).is_err_and(|e| e.error_len().is_none())
+    {
+        return b.len() - i;
+    }
+    usize::from(b.last() == Some(&b'\r'))
 }
 
 /// an allowlist for what the VM may send to the caller's terminal in `burner
@@ -395,5 +442,47 @@ mod tests {
             b"x\\u{9b}31m".to_vec()
         );
         assert_eq!(escape_controls(b"bad\xffbyte"), b"bad\\xffbyte".to_vec());
+    }
+
+    fn stream(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut e = TtyEscape::default();
+        let mut out: Vec<u8> = chunks.iter().flat_map(|c| e.feed(c)).collect();
+        out.extend(e.finish());
+        out
+    }
+
+    #[test]
+    fn tty_escape_any_split() {
+        for s in [&b"a\r\nb\n"[..], "caf\u{e9} \u{20ac}\n".as_bytes()] {
+            let whole = stream(&[s]);
+            assert_eq!(whole, escape_controls(s));
+            for i in 0..=s.len() {
+                assert_eq!(stream(&[&s[..i], &s[i..]]), whole, "split at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn tty_escape_bare_cr() {
+        assert_eq!(stream(&[b"fake\r", b"prompt"]), b"fake\\x0dprompt".to_vec());
+        assert_eq!(stream(&[b"a\r", b"\r\n"]), b"a\\x0d\r\n".to_vec());
+    }
+
+    #[test]
+    fn tty_escape_invalid() {
+        assert_eq!(stream(&[b"bad\xff", b"byte"]), b"bad\\xffbyte".to_vec());
+        // a lead byte whose char never finishes
+        assert_eq!(stream(&[b"x\xc3", b"y"]), b"x\\xc3y".to_vec());
+        assert_eq!(stream(&[b"\xe2\x82", b"\n"]), b"\\xe2\\x82\n".to_vec());
+    }
+
+    #[test]
+    fn tty_escape_finish() {
+        let mut e = TtyEscape::default();
+        assert_eq!(e.feed(b"ok\r"), b"ok".to_vec());
+        assert_eq!(e.finish(), b"\\x0d".to_vec());
+        assert_eq!(e.feed(&"\u{2713}".as_bytes()[..2]), b"".to_vec());
+        assert_eq!(e.finish(), b"\\xe2\\x9c".to_vec());
+        assert_eq!(e.finish(), b"".to_vec());
     }
 }
