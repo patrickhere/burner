@@ -52,6 +52,8 @@ pub struct Limits {
     pub total_mem_mib: u32,
     /// the most network any run may ask for: none, web or open. default web
     pub net: String,
+    /// how long --in stdin and --in tar wait for the next byte before giving up
+    pub stdin_idle_secs: u32,
 }
 
 impl Default for Paths {
@@ -87,6 +89,7 @@ impl Default for Limits {
             total_mem_mib: 3072,
             // open (any port but mail) is something you opt into
             net: "web".into(),
+            stdin_idle_secs: 60,
         }
     }
 }
@@ -129,7 +132,13 @@ impl Config {
         if crate::net::Mode::parse(&l.net).is_none() {
             bail!("limits.net must be none, web or open");
         }
-        if l.vcpus == 0 || l.mem_mib < 128 || l.disk_gib == 0 || l.ttl_secs < 10 || l.max_vms == 0 {
+        if l.vcpus == 0
+            || l.mem_mib < 128
+            || l.disk_gib == 0
+            || l.ttl_secs < 10
+            || l.max_vms == 0
+            || l.stdin_idle_secs < 5
+        {
             bail!("limits are too low to start a VM");
         }
         if l.total_mem_mib < l.mem_mib {

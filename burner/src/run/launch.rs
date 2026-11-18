@@ -26,7 +26,6 @@ use crate::result;
 use crate::sys;
 
 const STDIN_CAP: u64 = 512 << 20;
-const STDIN_IDLE: Duration = Duration::from_secs(60);
 const STDIN_TOTAL: Duration = Duration::from_secs(600);
 const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
@@ -164,7 +163,8 @@ fn run_vm(
     if a.input != Input::None && !disk_left(run_dir, 0) {
         return Err(Exit(EXIT_SANDBOX, "not enough disk to hold the input".into()).into());
     }
-    let spool = spool_input(&run_dir.join("stdin"), a.input)?;
+    let idle = Duration::from_secs(u64::from(cfg.limits.stdin_idle_secs));
+    let spool = spool_input(&run_dir.join("stdin"), a.input, idle)?;
     let job = run_dir.join("job.tar");
     // the job disk copies the spool before the spool goes away
     if let Some(sp) = &spool
@@ -540,7 +540,7 @@ fn run_vm(
 }
 
 /// read the caller's stdin before taking a slot, with idle and total deadlines
-fn spool_input(path: &Path, mode: Input) -> Result<Option<PathBuf>> {
+fn spool_input(path: &Path, mode: Input, idle: Duration) -> Result<Option<PathBuf>> {
     if mode == Input::None {
         return Ok(None);
     }
@@ -559,8 +559,11 @@ fn spool_input(path: &Path, mode: Input) -> Result<Option<PathBuf>> {
         if start.elapsed() > STDIN_TOTAL {
             return Err(usage("input took longer than 10 min"));
         }
-        if last.elapsed() > STDIN_IDLE {
-            return Err(usage("no input for 60s (does the pipe ever close?)"));
+        if last.elapsed() > idle {
+            return Err(usage(format!(
+                "no input for {}s (does the pipe ever close?)",
+                idle.as_secs()
+            )));
         }
         if !sys::readable(0, Duration::from_secs(1)) {
             continue;

@@ -27,18 +27,21 @@ out=$(sudo burner run --mem 256 -- 'awk "BEGIN{while(1) s=s sprintf(\"%1000000s\
 echo "$out" | grep -qE 'after=(137|1|2)' && [ "$rc" = 0 ] && ok "memory bomb contained (guest OOM, VM survived)" \
   || bad "memory bomb" "rc=$rc out=$(echo "$out" | tail -2 | tr '\n' ' ')"
 
-# 4 fork bomb + busy loops: the VM's cgroup stays within 1 core, run dies at the TTL
+# 4 fork bomb + busy loops: the VM's cgroup stays within 1 core and the run ends
+# by the TTL. a bomb that brings the guest kernel down ends it early with 125,
+# which is just as contained
 s=$(date +%s)
 ( sudo burner run --ttl 25s --tag forkbomb -- 'for i in 1 2 3 4; do (while :; do :; done) & done; f(){ f|f& }; f' </dev/null >/dev/null 2>&1; echo $? > "$T/fork.rc" ) &
-sleep 10
+sleep 4
 vid=$(sudo burner ls | awk '/forkbomb/{print $1}')
-u1=$(sudo awk '/usage_usec/{print $2}' /sys/fs/cgroup/burner/$vid/cpu.stat); sleep 5
-u2=$(sudo awk '/usage_usec/{print $2}' /sys/fs/cgroup/burner/$vid/cpu.stat)
-cores=$(awk -v a="$u1" -v b="$u2" 'BEGIN{printf "%.2f", (b-a)/5000000}')
+u1=$(sudo awk '/usage_usec/{print $2}' "/sys/fs/cgroup/burner/$vid/cpu.stat"); sleep 4
+u2=$(sudo awk '/usage_usec/{print $2}' "/sys/fs/cgroup/burner/$vid/cpu.stat")
+cores=$(awk -v a="$u1" -v b="$u2" 'BEGIN{printf "%.2f", (b-a)/4000000}')
 wait
 e=$(date +%s); rc=$(cat "$T/fork.rc")
-awk -v c="$cores" 'BEGIN{exit !(c <= 1.05)}' && [ "$rc" = 124 ] && [ $((e-s)) -le 40 ] \
-  && ok "fork bomb + busy loops: VM held to ${cores} cores, killed at TTL after $((e-s))s" \
+[ -n "$u1" ] && [ -n "$u2" ] && awk -v c="$cores" 'BEGIN{exit !(c <= 1.05)}' \
+  && { [ "$rc" = 124 ] || [ "$rc" = 125 ]; } && [ $((e-s)) -le 40 ] \
+  && ok "fork bomb + busy loops: VM held to ${cores} cores, ended after $((e-s))s (rc $rc)" \
   || bad "fork bomb" "rc=$rc cores=$cores secs=$((e-s))"
 
 # 5 disk flood: scratch fills, job sees ENOSPC, host disk untouched
@@ -86,7 +89,7 @@ bytes=$(sudo burner run --ttl 120s -- 'head -c 50000000 /dev/zero | tr "\0" "a"'
   || bad "big output" "bytes=$bytes secs=$((e-s)) err=$(head -c 200 "$T/big.err")"
 
 # 8b hostile direct console flood: capped at 1M, killed at TTL
-sudo burner run --ttl 20s -- 'cat /dev/zero > /dev/console' </dev/null 2>/dev/null > "$T/flood.out"; rc=$?; bytes=$(wc -c < "$T/flood.out")
+sudo burner run --ttl 12s -- 'cat /dev/zero > /dev/console' </dev/null 2>/dev/null > "$T/flood.out"; rc=$?; bytes=$(wc -c < "$T/flood.out")
 [ "$bytes" -le $((1 << 20)) ] && [ "$rc" = 124 ] && ok "direct console flood capped ($bytes bytes, rc $rc)" || bad "console flood" "bytes=$bytes rc=$rc"
 
 # 8c byte-exact output: no trailing newline, CRLF, binary
@@ -141,10 +144,13 @@ sudo burner run -- "$(head -c 70000 /dev/zero | tr '\0' a)" </dev/null >/dev/nul
 out=$(sudo burner run -- printf '%s|' 'a b' c </dev/null)
 [ "$out" = "a b|c|" ] && ok "several args are quoted as-is" || bad "argv mode" "$out"
 
-# 16 a stdin pipe that never closes: refused after 60s idle, no slot held meanwhile
+# 16 a stdin pipe that never closes: refused once it's idle too long, no slot held
+# meanwhile. a test config with a 10s limit instead of the default 60s
+sudo burner config | sed 's/^stdin_idle_secs = .*/stdin_idle_secs = 10/' | sudo tee /etc/burner/tests.toml >/dev/null
 s=$(date +%s)
-( sleep 90 | sudo burner run --in stdin -- cat >/dev/null 2>"$T/idle.err"; echo $? > "$T/idle.rc" ) &
-sleep 20; held=$(sudo burner ls | grep -c '^burner-'); wait; e=$(date +%s)
+( sleep 15 | sudo burner --config /etc/burner/tests.toml run --in stdin -- cat >/dev/null 2>"$T/idle.err"; echo $? > "$T/idle.rc" ) &
+sleep 5; held=$(sudo burner ls | grep -c '^burner-'); wait; e=$(date +%s)
+sudo rm -f /etc/burner/tests.toml
 [ "$(cat "$T/idle.rc")" = 2 ] && [ "$held" = 0 ] && grep -q 'no input for' "$T/idle.err" \
   && ok "idle stdin refused after $((e-s))s without holding a slot" || bad "idle stdin" "rc=$(cat "$T/idle.rc") held=$held"
 
@@ -152,7 +158,8 @@ sleep 20; held=$(sudo burner ls | grep -c '^burner-'); wait; e=$(date +%s)
 # shellcheck disable=SC2216
 ( sudo burner run --ttl 60s -- 'head -c 30000000 /dev/zero' | sleep 100 ) >/dev/null 2>&1 &
 bg=$!
-sleep 45; held=$(sudo burner ls | grep -c '^burner-')
+# the VM ends on its own once its output is written; poll instead of a fixed wait
+for _ in $(seq 30); do held=$(sudo burner ls | grep -c '^burner-'); [ "$held" = 0 ] && break; sleep 2; done
 pkill -P "$bg" 2>/dev/null; kill "$bg" 2>/dev/null; wait 2>/dev/null
 [ "$held" = 0 ] && ok "stuck reader: VM done and slot freed while output waits" || bad "stuck reader" "slots held=$held"
 sleep 2
