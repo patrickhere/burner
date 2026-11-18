@@ -416,3 +416,118 @@ pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
         ok
     }
 }
+
+/// the mount a file descriptor lives on, from /proc/self/fdinfo
+fn mnt_id(fd: libc::c_int) -> Option<u64> {
+    fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("mnt_id:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// delete a tree without following symlinks or leaving the mount it starts on.
+/// every directory is opened relative to its parent's fd with O_NOFOLLOW, so a
+/// path swapped mid-walk can't redirect it, and a directory on another mount
+/// (a bind mount included) stops the delete. true only when it's all gone
+pub fn remove_tree_at(path: &std::path::Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    let (Ok(parent), Ok(name)) = (
+        CString::new(parent.as_os_str().as_bytes()),
+        CString::new(name.as_bytes()),
+    ) else {
+        return false;
+    };
+    // SAFETY: plain open(2) of a NUL-terminated path
+    let pfd = unsafe {
+        libc::open(
+            parent.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if pfd < 0 {
+        return false;
+    }
+    let ok = match mnt_id(pfd) {
+        Some(mnt) => remove_at(pfd, &name, mnt),
+        None => false,
+    };
+    // SAFETY: closing the fd opened above
+    unsafe { libc::close(pfd) };
+    ok
+}
+
+fn remove_at(dirfd: libc::c_int, name: &std::ffi::CStr, mnt: u64) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: openat(2) relative to a dir fd we hold, never following a symlink
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = io::Error::last_os_error().raw_os_error();
+        return match err {
+            // a file or a symlink: unlink the name itself
+            // SAFETY: unlinkat(2) of a name in a dir fd we hold
+            Some(libc::ENOTDIR) | Some(libc::ELOOP) => unsafe {
+                libc::unlinkat(dirfd, name.as_ptr(), 0) == 0
+            },
+            Some(libc::ENOENT) => true,
+            _ => false,
+        };
+    }
+    let mut ok = mnt_id(fd) == Some(mnt);
+    if ok {
+        // listing through the fd's /proc entry keeps it anchored to this directory
+        let names: Vec<CString> = fs::read_dir(format!("/proc/self/fd/{fd}"))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter_map(|e| CString::new(e.file_name().as_bytes()).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|_| {
+                ok = false;
+                Vec::new()
+            });
+        for n in names {
+            ok &= remove_at(fd, &n, mnt);
+        }
+    }
+    // SAFETY: closing the fd opened above
+    unsafe { libc::close(fd) };
+    // SAFETY: unlinkat(2) of a name in a dir fd we hold
+    ok && unsafe { libc::unlinkat(dirfd, name.as_ptr(), libc::AT_REMOVEDIR) == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_tree_stays_inside() {
+        let base = std::env::temp_dir().join(format!("burner-rm-{}", random_hex(6).unwrap()));
+        let keep = base.join("keep");
+        let tree = base.join("tree");
+        fs::create_dir_all(tree.join("a/b/c")).unwrap();
+        fs::create_dir_all(&keep).unwrap();
+        fs::write(keep.join("precious"), "x").unwrap();
+        fs::write(tree.join("a/b/c/f"), "y").unwrap();
+        std::os::unix::fs::symlink(&keep, tree.join("a/link")).unwrap();
+        std::os::unix::fs::symlink(keep.join("precious"), tree.join("flink")).unwrap();
+        assert!(remove_tree_at(&tree));
+        assert!(!tree.exists());
+        assert!(keep.join("precious").exists());
+        assert!(remove_tree_at(&tree), "already gone counts as removed");
+        fs::remove_dir_all(&base).unwrap();
+    }
+}

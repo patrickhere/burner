@@ -1273,25 +1273,17 @@ fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> O
     }
 }
 
-/// delete a jail or run dir. refuses when anything is mounted inside it, so a
-/// bind mount someone left there never gets its contents deleted
+/// delete a jail or run dir. stops at anything mounted inside it, so a bind
+/// mount someone left there never gets its contents deleted
 fn remove_tree(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
-    }
-    let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let mounted_inside = mounts.lines().filter_map(|l| l.split(' ').nth(4)).any(|m| {
-        let m = m.replace("\\040", " ");
-        Path::new(&m).starts_with(path)
-    });
-    if mounted_inside {
+    let ok = sys::remove_tree_at(path);
+    if !ok && path.exists() {
         log_line(&format!(
-            "not removing {}: something is mounted inside it",
+            "couldn't fully remove {}, keeping it for the reaper",
             path.display()
         ));
-        return false;
     }
-    fs::remove_dir_all(path).is_ok()
+    ok
 }
 
 /// stop the VM and only then free its disks and its slot. false when it couldn't be confirmed dead
@@ -1585,8 +1577,10 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
                 continue;
             }
             cgroup::kill(&name);
-            if !cgroup::populated(&name) && cgroup::remove(&name) {
-                remove_tree(&cfg.paths.root.join("jail/firecracker").join(&name));
+            if !cgroup::populated(&name)
+                && cgroup::remove(&name)
+                && remove_tree(&cfg.paths.root.join("jail/firecracker").join(&name))
+            {
                 log_line(&format!("reap orphan {name}"));
             }
         }
