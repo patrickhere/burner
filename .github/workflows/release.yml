@@ -1,0 +1,96 @@
+# a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
+# and what it needs, and publishes them with SHA256SUMS as a github release
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal -c clippy,rustfmt -t ${{ matrix.target }}
+          rustup default stable
+          sudo apt-get install -y -qq musl-tools
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: static binary
+        run: |
+          for b in burner burner-tui; do
+            f=target/${{ matrix.target }}/release/$b
+            file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
+            "$f" --version
+          done
+      - name: package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name="burner-$TAG-$ARCH-linux"
+          d="pkg/$name"
+          mkdir -p "$d/guest"
+          install -m 0755 "target/$TARGET/release/burner" "target/$TARGET/release/burner-tui" "$d/"
+          cp guest/init "$d/guest/"
+          cp -R install.sh dist images tools README.md LICENSE-MIT LICENSE-APACHE SECURITY.md "$d/"
+          chmod -R u=rwX,go=rX "$d"
+          tar -C pkg --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct)" -cf - "$name" | gzip -9n > "$name.tar.gz"
+          tar -tzvf "$name.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: burner-${{ matrix.arch }}
+          path: burner-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: burner-*
+          path: out
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd out
+          tarballs=(burner-*.tar.gz)
+          [ "${#tarballs[@]}" = 2 ] || { echo "expected 2 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
+          sha256sum burner-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # the CHANGELOG.md section for this version, empty if there is none
+          awk -v h="## ${TAG#v}" '$0 == h { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notes.md 2>/dev/null || true
+          gh release create "$TAG" out/burner-*.tar.gz out/SHA256SUMS \
+            --verify-tag --title "$TAG" --notes-file notes.md

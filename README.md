@@ -77,12 +77,18 @@ what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel 
 
 linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack. aarch64 is untested so far.
 
+grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
+
 ```
-cargo build --release
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf burner-v0.1.0-x86_64-linux.tar.gz
+cd burner-v0.1.0-x86_64-linux
 sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), a user, units
 tools/build-image alpine         # an image to boot, uses sudo, no docker
 sudo burner doctor
 ```
+
+or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
 
 an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
 
@@ -96,7 +102,7 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
 
 `burner-tui` is a small terminal UI on top of the same commands. pick an image, network, cpus, memory and time limit, see the exact `sudo burner ...` line it'll run, and enter starts the shell or run in your terminal and comes back when it ends. tab shows the running VMs, refreshed every 2s, and `k` kills one after asking.
 
-it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so the sudoers rule above covers it. `cargo build --release` builds it next to burner, and `install.sh` puts it in `/usr/local/bin`.
+it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so the sudoers rule above covers it. release tarballs have it next to burner, `cargo build --release` builds it too, and `install.sh` puts it in `/usr/local/bin`.
 
 ## why not docker, gvisor or a hosted sandbox
 

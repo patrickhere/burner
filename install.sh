@@ -1,5 +1,6 @@
 #!/bin/sh
-# install burner on this machine. run from a checkout after `cargo build --release`:
+# install burner on this machine. run from an unpacked release tarball, or from a
+# checkout after `cargo build --release`:
 #   sudo ./install.sh
 # downloads firecracker, the jailer and a guest kernel (pinned and checksummed),
 # creates the burner-parse user, installs the binary and systemd
@@ -53,7 +54,12 @@ esac
 ARCH=$(uname -m)
 
 src=$(cd "$(dirname "$0")" && pwd)
-bin="$src/target/release/burner"
+# a release tarball has the binary next to this script, a checkout has burner/ (the crate) there
+if [ -f "$src/burner" ] && [ -x "$src/burner" ]; then
+    bin="$src/burner" tui="$src/burner-tui"
+else
+    bin="$src/target/release/burner" tui="$src/target/release/burner-tui"
+fi
 [ -x "$bin" ] || die "no $bin, build it first: cargo build --release"
 for t in curl tar sha256sum ip nft mkfs.ext4 conntrack systemctl useradd; do
     command -v "$t" >/dev/null 2>&1 || die "missing $t"
@@ -146,8 +152,8 @@ ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux.new"
 mv -fT "$ROOT/kernel/vmlinux.new" "$ROOT/kernel/vmlinux"
 put 0755 "$bin" "$BIN"
 # the tui is optional, it only runs the burner binary
-if [ -x "$src/target/release/burner-tui" ]; then
-    put 0755 "$src/target/release/burner-tui" "$TUI"
+if [ -f "$tui" ] && [ -x "$tui" ]; then
+    put 0755 "$tui" "$TUI"
 fi
 
 install -d -m 0755 /etc/burner
