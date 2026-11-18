@@ -1,12 +1,13 @@
 //! the result disk is a raw tar written by the guest, so it's hostile input.
-//! it's read by a separate burner process running as the unprivileged burner
-//! user with hard rlimits, and only regular files and directories come back.
+//! it's read by a separate burner process running as its own unprivileged user
+//! with hard rlimits, one at a time, and only regular files and directories
+//! come back. any cap hit or missing exit code makes the whole result invalid.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
 use std::process::{Command, ExitCode, Stdio};
@@ -21,6 +22,8 @@ pub const LOG_CAP: u64 = 16 << 20;
 const MEMBERS: u32 = 20_000;
 const PARSE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PARSE_ARG: &str = "__parse-result";
+/// the parser's own account, so a parser bug can't touch what the VM's user owns
+pub const PARSE_USER: &str = "burner-parse";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Meta {
@@ -30,9 +33,10 @@ pub struct Meta {
     pub fatal: bool,
 }
 
-/// parent side: parse `raw` in a limited child, write the log and (optionally) a clean tar
-pub fn parse(raw: &Path, log: &Path, tar_out: Option<&Path>, uid: u32, gid: u32) -> Meta {
-    match parse_inner(raw, log, tar_out, uid, gid) {
+/// parent side: parse the already-open result disk in a limited child, write the
+/// log and (optionally) a clean tar
+pub fn parse(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> Meta {
+    match parse_inner(raw, log, tar_out, state) {
         Ok(m) => m,
         Err(e) => Meta {
             problem: Some(format!("result unreadable ({e})")),
@@ -42,17 +46,15 @@ pub fn parse(raw: &Path, log: &Path, tar_out: Option<&Path>, uid: u32, gid: u32)
     }
 }
 
-fn parse_inner(
-    raw: &Path,
-    log: &Path,
-    tar_out: Option<&Path>,
-    uid: u32,
-    gid: u32,
-) -> io::Result<Meta> {
-    let raw = File::open(raw)?;
+fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> io::Result<Meta> {
+    let (uid, gid) = sys::user_ids(PARSE_USER)
+        .ok_or_else(|| io::Error::other(format!("no {PARSE_USER} user, rerun install.sh")))?;
     if raw.metadata()?.len() > RESULT_SIZE {
         return Err(io::Error::other("result disk larger than expected"));
     }
+    // one parser at a time keeps the host-side memory budget to one rlimit
+    let deadline = Instant::now() + PARSE_TIMEOUT;
+    let _lock = sys::Lock::exclusive_until(&state.join("parse.lock"), deadline)?;
     let new = || {
         OpenOptions::new()
             .write(true)
@@ -66,7 +68,10 @@ fn parse_inner(
         Some(p) => new().open(p)?,
         None => OpenOptions::new().write(true).open("/dev/null")?,
     };
-    let (log_fd, tar_fd) = (logf.as_raw_fd(), tarf.as_raw_fd());
+    // staged above 10 so moving them to 3 and 4 in the child can't clobber each other
+    let log_fd = sys::dup_above(logf.as_raw_fd(), 10)?;
+    let tar_fd = sys::dup_above(tarf.as_raw_fd(), 10)?;
+    let (l, t) = (log_fd.as_raw_fd(), tar_fd.as_raw_fd());
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg(PARSE_ARG)
         .arg(if tar_out.is_some() { "1" } else { "0" })
@@ -77,28 +82,28 @@ fn parse_inner(
         .current_dir("/")
         .uid(uid)
         .gid(gid);
-    // SAFETY: only async-signal-safe calls between fork and exec
+    // SAFETY: dup2 and setrlimit only, both async-signal-safe on linux
     unsafe {
         cmd.pre_exec(move || {
-            sys::dup_to(log_fd, 3)?;
-            sys::dup_to(tar_fd, 4)?;
+            sys::dup_to(l, 3)?;
+            sys::dup_to(t, 4)?;
             sys::limit_child(&[
-                (libc::RLIMIT_AS, 768 << 20),
-                (libc::RLIMIT_CPU, 60),
+                (libc::RLIMIT_AS, 512 << 20),
+                (libc::RLIMIT_CPU, 30),
                 (libc::RLIMIT_FSIZE, RESULT_SIZE + (8 << 20)),
                 (libc::RLIMIT_CORE, 0),
-                (libc::RLIMIT_NOFILE, 32),
+                (libc::RLIMIT_NOFILE, 16),
+                (libc::RLIMIT_NPROC, 0),
             ])
         });
     }
     let mut child = cmd.spawn()?;
-    drop((logf, tarf));
-    let start = Instant::now();
+    drop((logf, tarf, log_fd, tar_fd));
     let status = loop {
         if let Some(s) = child.try_wait()? {
             break s;
         }
-        if start.elapsed() > PARSE_TIMEOUT {
+        if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::other("parser timed out"));
@@ -121,23 +126,55 @@ fn parse_inner(
             .map(|c| if c.is_control() { '?' } else { c })
             .collect()
     });
+    if meta.rc.is_none() && !meta.fatal {
+        meta.fatal = true;
+        meta.problem
+            .get_or_insert_with(|| "the VM gave no exit code".into());
+    }
     if meta.fatal {
         meta.rc = None;
     }
     Ok(meta)
 }
 
-/// child side, as user burner: fd 0 the raw tar, fd 3 the log, fd 4 the clean tar
+/// child side: fd 0 the raw tar, fd 3 the log, fd 4 the clean tar. refuses to
+/// run as root or with anything else wired to those fds
 pub fn child_main(emit: bool) -> ExitCode {
-    let mut meta = Meta::default();
-    // SAFETY: the parent set up exactly these fds before exec
+    // SAFETY: geteuid has no preconditions
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("burner: {PARSE_ARG} is internal and never runs as root");
+        return ExitCode::from(2);
+    }
+    let fd_ok = |fd: i32, devnull_ok: bool| -> bool {
+        // SAFETY: zeroed stat is a valid out-parameter; fstat on any int is safe
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return false;
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        kind == libc::S_IFREG || (devnull_ok && kind == libc::S_IFCHR)
+    };
+    if !(fd_ok(0, false) && fd_ok(3, false) && fd_ok(4, true)) {
+        eprintln!("burner: {PARSE_ARG} is internal, run by burner run");
+        return ExitCode::from(2);
+    }
+    // SAFETY: checked above that these are open files we were handed
     let (src, logf, tarf) = unsafe {
         (
             File::from_raw_fd(0),
             File::from_raw_fd(3),
-            File::from_raw_fd(4),
+            OwnedFd::from_raw_fd(4),
         )
     };
+    let tarf = File::from(tarf);
+    if tarf
+        .metadata()
+        .is_ok_and(|m| m.file_type().is_char_device())
+        && emit
+    {
+        return ExitCode::from(2);
+    }
+    let mut meta = Meta::default();
     let mut out = emit.then(|| {
         tar::Builder::new(Capped {
             f: tarf,
@@ -146,7 +183,7 @@ pub fn child_main(emit: bool) -> ExitCode {
         })
     });
     if let Err(e) = walk(src, logf, out.as_mut(), &mut meta) {
-        meta.problem = Some(format!("result unreadable ({e})"));
+        meta.problem = Some(e.to_string());
         meta.fatal = true;
     }
     if let Some(b) = out
@@ -160,6 +197,10 @@ pub fn child_main(emit: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn fatal(msg: &str) -> io::Error {
+    io::Error::other(msg.to_string())
+}
+
 fn walk(
     src: File,
     mut logf: File,
@@ -169,12 +210,14 @@ fn walk(
     let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 16, src));
     let (mut count, mut total, mut logged) = (0u32, 0u64, 0u64);
     let mut seen = HashSet::new();
-    for e in ar.entries()? {
-        let mut e = e?;
+    for e in ar
+        .entries()
+        .map_err(|e| fatal(&format!("result unreadable ({e})")))?
+    {
+        let mut e = e.map_err(|e| fatal(&format!("result unreadable ({e})")))?;
         count += 1;
         if count > MEMBERS {
-            meta.problem = Some("result has too many entries, rest dropped".into());
-            break;
+            return Err(fatal("result has too many entries"));
         }
         let kind = e.header().entry_type();
         if !(kind.is_file() || kind.is_dir()) {
@@ -184,6 +227,10 @@ fn walk(
             meta.problem = Some("result had unsafe entries, dropped".into());
             continue;
         };
+        if !seen.insert(name.clone()) {
+            meta.problem = Some(format!("result had {name} twice, kept the first"));
+            continue;
+        }
         let mtime = e.header().mtime().unwrap_or(0).min(1 << 33);
         if kind.is_dir() {
             if let Some(b) = out.as_deref_mut()
@@ -194,15 +241,11 @@ fn walk(
             }
             continue;
         }
-        if name.starts_with("result/") && !seen.insert(name.clone()) {
-            continue; // one of each result field, the first wins
-        }
         let size = e.size();
-        total += size;
-        if total > RESULT_SIZE {
-            meta.problem = Some("result over the size cap, rest dropped".into());
-            break;
-        }
+        total = total
+            .checked_add(size)
+            .filter(|t| *t <= RESULT_SIZE)
+            .ok_or_else(|| fatal("result over the size cap"))?;
         match name.as_str() {
             "result/rc" if size <= 8 => meta.rc = read_small(&mut e)?.trim().parse().ok(),
             "result/log_skipped" if size <= 20 => {
@@ -211,11 +254,14 @@ fn walk(
             "result/error" if size <= 1000 => {
                 meta.problem = Some(read_small(&mut e)?.trim().to_string())
             }
-            "result/log.txt" if logged + size <= LOG_CAP => {
+            "result/log.txt" => {
+                logged = logged
+                    .checked_add(size)
+                    .filter(|l| *l <= LOG_CAP)
+                    .ok_or_else(|| fatal("log over the cap"))?;
                 let mut buf = Vec::with_capacity(size as usize);
                 e.read_to_end(&mut buf)?;
                 logf.write_all(&buf)?;
-                logged += size;
                 if let Some(b) = out.as_deref_mut() {
                     let mut h = header(tar::EntryType::Regular, 0o644, size, mtime);
                     b.append_data(&mut h, "log.txt", buf.as_slice())?;

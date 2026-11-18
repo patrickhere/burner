@@ -449,6 +449,9 @@ fn run_vm(
     mkfs(&scratch)?;
     let raw = root.join("result.raw");
     reserve(&raw, result::RESULT_SIZE)?;
+    // opened now, before anything runs as the VM's user, and read through this fd
+    // later: the path inside the jail can't be swapped for something else
+    let raw_fd = File::open(&raw)?;
     for f in [&scratch, &raw] {
         chown(f, Some(uid), Some(gid))?;
         fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
@@ -642,7 +645,12 @@ fn run_vm(
         Outcome::Done => {
             let log = run_dir.join("log.bin");
             let tar_path = run_dir.join("result.tar");
-            let meta = result::parse(&raw, &log, a.result.map(|_| tar_path.as_path()), uid, gid);
+            let meta = result::parse(
+                raw_fd,
+                &log,
+                a.result.map(|_| tar_path.as_path()),
+                &cfg.paths.state,
+            );
             let fc_tail = if meta.rc.is_none() {
                 tail_of(&jail.join("firecracker.log"), 1500)
             } else {
@@ -660,27 +668,29 @@ fn run_vm(
                 diag.put(&escape_controls(&fc_tail), None);
                 diag.put(b"\n", None);
             }
+            let mut code = meta.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX);
             if let (Some(out), false) = (&tar_out, meta.fatal) {
                 deliver(&tar_path, out, until);
-                if out.dropped() {
+                // a tar that didn't arrive whole is a failed run, whatever the guest said
+                if !out.complete(until) {
                     diag.put(
-                        b"burner: result tar not fully delivered (reader too slow)\n",
+                        b"burner: result tar not fully delivered, failing the run\n",
                         None,
                     );
+                    code = EXIT_SANDBOX;
                 }
             }
-            meta.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX)
+            code
         }
     };
     let until = Instant::now() + Duration::from_secs(30);
-    live.drain(until);
+    if !live.complete(until) {
+        diag.put(
+            b"burner: some live output was dropped (reader too slow)\n",
+            None,
+        );
+    }
     diag.drain(until);
-    if let Some(o) = &tar_out {
-        o.drain(until);
-    }
-    if live.dropped() {
-        eprintln!("burner: some live output was dropped (reader too slow)");
-    }
     log_line(&format!(
         "end {id} tag={} secs={:.1} code={code}",
         p.tag,

@@ -84,6 +84,15 @@ impl Out {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// waits until everything queued is written. false if anything was dropped,
+    /// the writer broke, or the deadline came first
+    pub fn complete(&self, until: Instant) -> bool {
+        self.drain(until);
+        self.queued.load(Ordering::Relaxed) == 0
+            && !self.broken.load(Ordering::Relaxed)
+            && !self.dropped()
+    }
+
     pub fn drain(&self, until: Instant) {
         while Instant::now() < until {
             if self.queued.load(Ordering::Relaxed) == 0 || self.broken.load(Ordering::Relaxed) {

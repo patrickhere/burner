@@ -60,6 +60,30 @@ impl Lock {
     }
 }
 
+impl Lock {
+    /// like exclusive, but gives up at the deadline instead of waiting forever
+    pub fn exclusive_until(path: &std::path::Path, until: std::time::Instant) -> io::Result<Lock> {
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        loop {
+            // SAFETY: valid fd for the life of the call
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Lock(f));
+            }
+            if std::time::Instant::now() > until {
+                return Err(io::Error::other(format!(
+                    "timed out waiting for {}",
+                    path.display()
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
         // SAFETY: valid fd
@@ -187,4 +211,16 @@ pub fn preallocate(f: &File, size: u64) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// a close-on-exec copy of fd numbered at least `min`
+pub fn dup_above(fd: i32, min: i32) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: F_DUPFD_CLOEXEC on an fd we own returns a new fd we then own
+    let n = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, min) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: n is a fresh fd nobody else owns
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(n) })
 }
