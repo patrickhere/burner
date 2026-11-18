@@ -76,7 +76,7 @@ pub struct RunArgs {
     /// a label for burner ls
     #[arg(long)]
     tag: Option<String>,
-    /// network: none, web (http/https and dns) or open (any port but mail). never the LAN
+    /// network: none, web (http/https, dns, ping) or open (any port but mail). never the LAN
     #[arg(long, default_value = "none")]
     net: String,
     /// one argument runs as a shell string; several are quoted as they are

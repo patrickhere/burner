@@ -17,6 +17,8 @@ pub const TABLE: &str = "burner";
 pub const NAT_TABLE: &str = "burner_nat";
 const TAP_PREFIX: &str = "bn";
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+const FORWARD_MARK: &str = "forwarding-turned-on";
 
 fn helper(prog: &str, args: &[&str], input: Option<&[u8]>) -> Result<std::process::Output> {
     sys::run_timeout(Command::new(prog).args(args), input, HELPER_TIMEOUT)
@@ -233,9 +235,11 @@ table inet {TABLE} {{
         iifname "{t}*" oifname != "{uplink}" drop
         iifname "{t}*" ip daddr @blocked4 drop
         iifname "{t}*" ct state established,related accept
-        iifname "{t}*" meta l4proto {{ tcp, udp }} th dport 53 ip daddr @resolvers accept
+        iifname @mode_web meta l4proto {{ tcp, udp }} th dport 53 ip daddr @resolvers meter {TABLE}_dns_web {{ iifname limit rate 20/second burst 50 packets }} accept
+        iifname @mode_open meta l4proto {{ tcp, udp }} th dport 53 ip daddr @resolvers meter {TABLE}_dns_open {{ iifname limit rate 20/second burst 50 packets }} accept
         iifname "{t}*" meta l4proto {{ tcp, udp }} th dport 53 drop
-        iifname "{t}*" icmp type echo-request limit rate 5/second accept
+        iifname @mode_web icmp type echo-request limit rate 5/second accept
+        iifname @mode_open icmp type echo-request limit rate 5/second accept
         iifname @mode_web tcp dport {{ 80, 443 }} ct state new meter {TABLE}_web {{ iifname limit rate 20/second burst 40 packets }} accept
         iifname @mode_open tcp dport {{ 25, 465, 587 }} drop
         iifname @mode_open ct state new meter {TABLE}_open {{ iifname limit rate 50/second burst 100 packets }} accept
@@ -382,8 +386,10 @@ pub fn up(cfg: &Config) -> Result<Vec<String>> {
     nft(&rules, false)?;
     readd_running(cfg)?;
     let mut notes = Vec::new();
-    if std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").is_ok_and(|v| v.trim() != "1") {
-        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1")?;
+    if std::fs::read_to_string(IP_FORWARD).is_ok_and(|v| v.trim() != "1") {
+        std::fs::write(IP_FORWARD, "1")?;
+        // remembered, so net down only turns it off again if burner turned it on
+        std::fs::write(cfg.paths.state.join(FORWARD_MARK), b"")?;
         notes.push("turned on ipv4 forwarding".into());
     }
     if let Some(cmd) = ufw_rule_missing(cfg)? {
@@ -442,6 +448,9 @@ pub fn down(cfg: &Config) -> Result<usize> {
     let _ = run("nft", &["delete", "table", "inet", TABLE]);
     let _ = run("nft", &["delete", "table", "ip", NAT_TABLE]);
     routing_down();
+    if std::fs::remove_file(cfg.paths.state.join(FORWARD_MARK)).is_ok() {
+        let _ = std::fs::write(IP_FORWARD, "0");
+    }
     Ok(killed)
 }
 

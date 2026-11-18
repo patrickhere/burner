@@ -168,7 +168,26 @@ fn network(r: &mut Report, cfg: &Config) {
                 Level::Ok,
                 "uplink",
                 format!("{uplink} ({})", list.join(", ")),
-            )
+            );
+            // behind NAT the router's public address is just "internet" to the
+            // filter, and from inside it usually answers with its own admin and
+            // ssh, or loops back into port forwards. burner can't know that
+            // address without asking an outside service, so it asks you
+            let natted = a
+                .iter()
+                .all(|ip| ip.is_private() || ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64);
+            let public_block = cfg.net.block.iter().any(|b| {
+                config::parse_cidr(b).is_ok_and(|(ip, _)| !ip.is_private() && !ip.is_loopback())
+            });
+            if natted && !public_block {
+                r.line(
+                    Level::Warn,
+                    "router",
+                    "this host is behind NAT. VMs can reach your router's public address, and from the inside \
+                     that's often its admin page, its ssh or your port forwards. put that address in net.block \
+                     (curl ifconfig.me shows it; update it if it changes)",
+                );
+            }
         }
         Ok(_) => r.line(
             Level::Fail,
