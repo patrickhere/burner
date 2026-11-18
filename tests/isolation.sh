@@ -153,9 +153,31 @@ sleep 20; held=$(sudo burner ls | grep -c '^burner-'); wait; e=$(date +%s)
 ( sudo burner run --ttl 60s -- 'head -c 30000000 /dev/zero' | sleep 100 ) >/dev/null 2>&1 &
 bg=$!
 sleep 45; held=$(sudo burner ls | grep -c '^burner-')
-kill $bg 2>/dev/null; pkill -f 'sleep 100' 2>/dev/null; wait 2>/dev/null
+pkill -P "$bg" 2>/dev/null; kill "$bg" 2>/dev/null; wait 2>/dev/null
 [ "$held" = 0 ] && ok "stuck reader: VM done and slot freed while output waits" || bad "stuck reader" "slots held=$held"
 sleep 2
+
+# 18 live output: a line printed early shows up while the command is still running
+first=""; last=""
+while read -r l; do
+    case "$l" in early) first=$(date +%s) ;; late) last=$(date +%s) ;; esac
+done < <(sudo burner run -- 'echo early; sleep 8; echo late' </dev/null 2>/dev/null)
+[ -n "$first" ] && [ -n "$last" ] && [ $((last - first)) -ge 6 ] \
+  && ok "output streams live ($((last - first))s between early and late lines)" \
+  || bad "live output" "early=$first late=$last"
+
+# 19 a wrapper killed with SIGKILL: the reaper stops its VM and frees the slot
+( sudo burner run --tag sigkill -- 'sleep 300' </dev/null >/dev/null 2>&1 & )
+vid=""
+for _ in $(seq 30); do vid=$(sudo burner ls | awk '/ sigkill /{print $1}'); [ -n "$vid" ] && break; sleep 1; done
+sleep 3
+sudo pkill -KILL -f '^burner run --tag sigkill'
+s=$(date +%s)
+for _ in $(seq 45); do sudo burner ls | grep -q ' sigkill ' || break; sleep 2; done
+e=$(date +%s)
+[ -n "$vid" ] && ! sudo burner ls | grep -q ' sigkill ' && ! sudo test -d "/sys/fs/cgroup/burner/$vid" \
+  && ok "SIGKILLed wrapper: reaper stopped the VM and freed the slot in $((e - s))s" \
+  || bad "sigkill wrapper" "vid=$vid still=$(sudo burner ls | grep -c ' sigkill ')"
 
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
