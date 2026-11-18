@@ -70,6 +70,19 @@ sudo burner doctor
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, `burner config` shows them with defaults filled in.
 
+## letting other users run VMs
+
+anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, give them only `run`, `shell`, `ls` and `kill`:
+
+```
+# /etc/sudoers.d/burner
+alice ALL=(root) NOPASSWD: /usr/local/bin/burner run *, /usr/local/bin/burner shell, \
+    /usr/local/bin/burner shell *, /usr/local/bin/burner ls, /usr/local/bin/burner ls *, \
+    /usr/local/bin/burner kill *
+```
+
+through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `limits` in the config (`max_vms`, memory, disk, time, `net`) apply to everyone.
+
 ## when something breaks
 
 - `sudo burner doctor` first. it checks kvm, the tools, the network setup, the reaper and the install, and says what to fix
