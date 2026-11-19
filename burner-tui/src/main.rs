@@ -237,9 +237,19 @@ fn run() -> io::Result<()> {
     Ok(())
 }
 
+/// the screen modes a guest can leave on through burner shell, off again, for
+/// a burner that died before it could do that itself
+const MODES_RESET: &[u8] =
+    b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l\x1b7\x1b[r\x1b8\r\n";
+
 /// gives the real terminal to burner shell or run and takes it back after
 fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String> {
     leave();
+    // burner puts the terminal back when it ends, unless it's killed outright
+    // SAFETY: zeroed termios is a valid out-parameter for tcgetattr on fd 0
+    let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: fd 0 and a valid termios pointer
+    let have_tty = unsafe { libc::tcgetattr(0, &mut saved) } == 0;
     println!("$ {}", burner::join(argv));
     // ctrl-c and ctrl-\ are for burner now. a handler instead of SIG_IGN, so
     // the child starts with the default again
@@ -250,6 +260,15 @@ fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String>
         Ok(st) => burner::describe_exit(st.code()),
         Err(e) => format!("can't run {}: {e}", argv[0]),
     };
+    if have_tty {
+        // SAFETY: fd 0 and the termios read above
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &saved) };
+    }
+    if res.as_ref().is_ok_and(|s| s.code().is_none()) {
+        let mut out = io::stdout();
+        out.write_all(MODES_RESET)?;
+        out.flush()?;
+    }
     // run's output and a failed shell's error stay up until enter
     if mode == Mode::Run || !res.as_ref().is_ok_and(|s| s.success()) {
         print!("\n[{msg}, enter goes back to burner-tui] ");
