@@ -2,7 +2,8 @@
 # install or upgrade burner from the latest release:
 #   curl -fsSL https://get.burnervm.dev | sh
 # downloads the release for this cpu, checks it against SHA256SUMS, installs the
-# packages burner needs, runs install.sh and builds the alpine image.
+# packages burner needs, runs install.sh and builds the alpine image. on a mac
+# it installs the homebrew tap and sets up the linux VM burner runs in.
 #   BURNER_VERSION=v0.1.0   install that release instead of the latest
 #   NO_COLOR=1              plain output
 # everything runs from main() at the bottom, so a download cut off halfway
@@ -78,19 +79,50 @@ as_root() {
 
 not_linux() {
     case "$(uname -s)" in
-        Darwin)
-            die "burner runs on linux with kvm, so on a mac it runs inside a linux VM." \
-                "on an M3 or newer with macOS 15 or later, homebrew sets that up:" \
-                "" \
-                "  brew install burnervm/tap/burner" \
-                "  burner setup"
-            ;;
         MINGW* | MSYS* | CYGWIN* | Windows*)
             die "burner runs on linux with kvm. on windows 11, run this installer inside WSL2" \
                 "with nested virtualization on (/dev/kvm has to exist in there)."
             ;;
         *) die "burner runs on linux with kvm, this is $(uname -s)" ;;
     esac
+}
+
+# a mac can't run firecracker itself. homebrew installs the burner command,
+# which keeps a lima VM with nested virtualization and runs burner in there
+mac() {
+    [ "$(uname -m)" = arm64 ] || die "burner needs an apple silicon mac, an M3 or newer"
+    v=$(sw_vers -productVersion)
+    [ "${v%%.*}" -ge 15 ] || die "burner needs macOS 15 or later for nested virtualization, this is $v"
+    chip=$(sysctl -n machdep.cpu.brand_string)
+    case "$chip" in
+        *M1* | *M2*) die "the $chip can't pass kvm through to a VM, burner needs an M3 or newer" ;;
+    esac
+    ok "this machine" "macOS $v, $chip"
+    command -v brew >/dev/null 2>&1 || die "on a mac burner installs through homebrew, and it isn't here." \
+        "get it from https://brew.sh, then run this again."
+
+    LOG=$(mktemp /tmp/burner-install-XXXXXX)
+    KEEP_LOG=""
+    trap '[ -n "$KEEP_LOG" ] || rm -f "$LOG"' EXIT
+    if brew list --formula burner >/dev/null 2>&1; then
+        run "upgrading with homebrew" brew upgrade burnervm/tap/burner
+        ok "homebrew" "burnervm/tap/burner, up to date"
+    else
+        run "installing with homebrew" brew install burnervm/tap/burner
+        ok "homebrew" "burnervm/tap/burner, with lima"
+    fi
+    run "setting up the linux VM, a few minutes the first time" burner setup
+    version=$(burner --version 2>/dev/null | awk '{print $2}')
+    ok "linux VM" "lima, nested kvm, burner ${version:-installed}"
+
+    took=$(($(date +%s) - start))
+    printf '\n  %sburner %s is ready%s %s(%ss)%s\n\n' "$B" "${version:-}" "$R" "$D" "$took" "$R"
+    printf '  %stry it%s\n' "$D" "$R"
+    printf "    burner run -- 'uname -a; cat /etc/alpine-release'\n"
+    printf '    burner shell alpine\n'
+    printf '    burner-tui\n'
+    printf '\n  %sthe VM: burner vm start|stop|shell|delete%s\n' "$D" "$R"
+    printf '  %sdocs: https://github.com/%s%s\n\n' "$D" "$REPO" "$R"
 }
 
 # the tools install.sh checks for, and the package each one comes in
@@ -137,6 +169,10 @@ main() {
     # ip, nft and mkfs.ext4 live in sbin, which isn't on every user's PATH
     PATH="$PATH:/usr/sbin:/sbin"
 
+    if [ "$(uname -s)" = Darwin ]; then
+        mac
+        return
+    fi
     [ "$(uname -s)" = Linux ] || not_linux
     case "$(uname -m)" in
         x86_64 | aarch64) arch=$(uname -m) ;;

@@ -106,7 +106,7 @@ sudo burner doctor
 
 releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
 
-on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and the homebrew tap sets that up with [lima](https://lima-vm.io):
+on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and the homebrew tap sets that up with [lima](https://lima-vm.io). the same `curl ... | sh` line does it for you when it sees a mac, or by hand:
 
 ```
 brew install burnervm/tap/burner
