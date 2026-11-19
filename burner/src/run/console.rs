@@ -428,8 +428,9 @@ pub(super) fn relay(
                         }
                         ready_at.get_or_insert_with(Instant::now);
                     }
-                    held_since =
-                        (!end.held.is_empty()).then(|| held_since.unwrap_or_else(Instant::now));
+                    held_since = end
+                        .unshown()
+                        .then(|| held_since.unwrap_or_else(Instant::now));
                     if end.ended.is_some() && ended_at.is_none() {
                         ended_at = Some(Instant::now());
                         to_vm.clear();
@@ -658,10 +659,14 @@ fn sched_runs(line: &str) -> Option<u64> {
 ///
 /// bytes that could be the start of a marker are held until it's clear. once
 /// they have the whole `BURNER-<token>-`, they're held for as long as it takes
-/// (only the guest knows the token, so it can only hide its own output)
+/// (only the guest knows the token, so it can only hide its own output). a
+/// shorter start goes out after a moment, but is still matched: a record that
+/// comes in with a gap inside it still counts
 struct Markers {
     prefix: Vec<u8>,
     held: Vec<u8>,
+    /// how many of the held bytes went out already
+    shown: usize,
     /// the guest's record version: from SHELL, 1 for a READY without it,
     /// None for an image that says neither
     proto: Option<u32>,
@@ -760,6 +765,7 @@ impl Markers {
         Markers {
             prefix: format!("BURNER-{token}-").into_bytes(),
             held: Vec::new(),
+            shown: 0,
             proto: None,
             ready: false,
             ended: None,
@@ -771,9 +777,15 @@ impl Markers {
         if self.ended.is_some() {
             return Vec::new();
         }
+        let shown = std::mem::take(&mut self.shown);
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(b);
         let mut out = Vec::with_capacity(buf.len());
+        let emit = |out: &mut Vec<u8>, from: usize, to: usize| {
+            if to > shown {
+                out.extend_from_slice(&buf[from.max(shown)..to]);
+            }
+        };
         let mut at = 0;
         loop {
             let Some(i) = buf[at..]
@@ -787,11 +799,13 @@ impl Markers {
                     .rev()
                     .find(|&k| tail.ends_with(&self.prefix[..k]))
                     .unwrap_or(0);
-                out.extend_from_slice(&tail[..tail.len() - keep]);
-                self.held = tail[tail.len() - keep..].to_vec();
+                let from = buf.len() - keep;
+                emit(&mut out, at, from);
+                self.held = buf[from..].to_vec();
+                self.shown = shown.saturating_sub(from);
                 return out;
             };
-            out.extend_from_slice(&buf[at..i]);
+            emit(&mut out, at, i);
             let rest = &buf[i + self.prefix.len()..];
             if let Some(after) = rest.strip_prefix(b"READY") {
                 self.ready = true;
@@ -827,10 +841,11 @@ impl Markers {
             };
             if matches!(record, Record::Partial) {
                 self.held = buf[i..].to_vec();
+                self.shown = shown.saturating_sub(i);
                 return out;
             }
             // not a marker after all: the guest's own text
-            out.push(buf[i]);
+            emit(&mut out, i, i + 1);
             at = i + 1;
         }
     }
@@ -845,9 +860,17 @@ impl Markers {
         }
     }
 
-    /// nothing more came, so what was held back wasn't a marker
+    /// held bytes not shown yet
+    fn unshown(&self) -> bool {
+        self.held.len() > self.shown
+    }
+
+    /// nothing more came for a while: what's held goes out, and stays held
+    /// in case the rest of a marker still comes
     fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.held)
+        let out = self.held[self.shown..].to_vec();
+        self.shown = self.held.len();
+        out
     }
 }
 
@@ -1189,10 +1212,26 @@ mod tests {
         assert_eq!(e.hold(), Duration::MAX);
         assert_eq!(e.feed(b";[ 3.05] reboot: Restarting system"), b"".to_vec());
         assert_eq!(e.ended, Some(Ended::Exit(0)));
-        // before the token is whole it's let out after a moment
+        // before the token is whole it's let out after a moment, and still
+        // counts when the rest comes
         let mut e = v2("f72b08526ecfa370");
-        assert_eq!(e.feed(b"BURNER-f72b"), b"".to_vec());
+        assert_eq!(e.feed(b"$ BURNER-f72b"), b"$ ".to_vec());
         assert_eq!(e.hold(), Duration::from_millis(30));
+        assert_eq!(e.flush(), b"BURNER-f72b".to_vec());
+        assert!(!e.unshown());
+        assert_eq!(e.flush(), b"".to_vec());
+        assert_eq!(e.feed(b"08526ecfa"), b"".to_vec());
+        assert_eq!(e.flush(), b"08526ecfa".to_vec());
+        assert_eq!(e.feed(b"370-END3;\r\n[ 1.0] reboot"), b"".to_vec());
+        assert_eq!(e.ended, Some(Ended::Exit(3)));
+        // and when it doesn't, nothing shows twice
+        let mut e = v2("f72b08526ecfa370");
+        assert_eq!(e.feed(b"BURNER-f72"), b"".to_vec());
+        assert_eq!(e.flush(), b"BURNER-f72".to_vec());
+        assert_eq!(e.feed(b"x BURNER-f"), b"x ".to_vec());
+        assert_eq!(e.flush(), b"BURNER-f".to_vec());
+        assert_eq!(e.feed(b"oo"), b"oo".to_vec());
+        assert!(e.ended.is_none() && !e.unshown());
     }
 
     #[test]
