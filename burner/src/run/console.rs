@@ -364,17 +364,34 @@ impl ShellEnd {
 
 /// ssh-style escape for burner shell: `~` right after enter (or at the start)
 /// is held, `~.` leaves, `~~` sends one `~`, anything else goes through as is.
-/// a way out when the guest hangs and ctrl-c only reaches the VM
+/// a way out when the guest hangs and ctrl-c only reaches the VM. a bracketed
+/// paste (ESC[200~ .. ESC[201~, when the guest asked for them) is pasted text,
+/// not keys, and goes through untouched
 #[derive(Default)]
 struct Escape {
     mid_line: bool,
     tilde: bool,
+    paste: bool,
+    /// the last few bytes, to spot the paste brackets across reads
+    recent: Vec<u8>,
 }
 
 impl Escape {
     /// true when the caller asked to leave
     fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
         for &b in input {
+            if self.recent.len() == 6 {
+                self.recent.remove(0);
+            }
+            self.recent.push(b);
+            if self.paste {
+                out.push(b);
+                if self.recent.ends_with(b"\x1b[201~") {
+                    self.paste = false;
+                    self.mid_line = true;
+                }
+                continue;
+            }
             if self.tilde {
                 self.tilde = false;
                 match b {
@@ -392,6 +409,7 @@ impl Escape {
             }
             out.push(b);
             self.mid_line = !matches!(b, b'\r' | b'\n');
+            self.paste = self.recent.ends_with(b"\x1b[200~");
         }
         false
     }
@@ -549,6 +567,24 @@ mod tests {
         assert_eq!(run(&[b"~~x"]), (false, b"~x".to_vec()));
         assert_eq!(run(&[b"~x"]), (false, b"~x".to_vec()));
         assert_eq!(run(&[b"\r~."]), (true, b"\r".to_vec()));
+    }
+
+    #[test]
+    fn shell_escape_skips_bracketed_paste() {
+        let run = |chunks: &[&[u8]]| {
+            let (mut e, mut out) = (Escape::default(), Vec::new());
+            let left = chunks.iter().any(|c| e.feed(c, &mut out));
+            (left, out)
+        };
+        let paste = b"\x1b[200~before\r~.after\r~~tilde\r\x1b[201~";
+        assert_eq!(run(&[paste]), (false, paste.to_vec()));
+        // brackets split across reads
+        let (a, b) = paste.split_at(4);
+        let (b, c) = b.split_at(b.len() - 3);
+        assert_eq!(run(&[a, b, c]), (false, paste.to_vec()));
+        // typed keys after the paste still get the escape, after enter
+        assert!(run(&[paste, b"\r", b"~."]).0);
+        assert!(!run(&[paste, b"~."]).0);
     }
 
     #[test]
