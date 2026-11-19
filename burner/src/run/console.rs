@@ -22,6 +22,8 @@ const END_GRACE: Duration = Duration::from_secs(5);
 /// an image whose init should say it's ready but hasn't by then gets the
 /// caller's keys anyway
 const READY_WAIT: Duration = Duration::from_secs(60);
+/// how long the vCPUs must sit still after the kernel's halt line
+const HALT_CHECK: Duration = Duration::from_millis(1500);
 
 /// copy the console between the BEGIN/END markers to `out`, byte for byte.
 /// the markers are only presentation: the guest knows the token and can end its
@@ -263,6 +265,10 @@ pub(super) fn relay(
     let mut filter = crate::output::TermFilter::new(!crate::output::term_utf8());
     let mut escape = Escape::default();
     let mut end = Markers::new(token);
+    // the last of the console, and when it ended in the kernel's halt line,
+    // with the vCPUs' run count then
+    let (mut tail, mut halt_seen): (Vec<u8>, Option<(Instant, Option<u64>)>) = (Vec::new(), None);
+    let mut halted = false;
     let mut held_since: Option<Instant> = None;
     // when guest init's end marker came: the VM stops right after it
     let mut ended_at: Option<Instant> = None;
@@ -288,6 +294,21 @@ pub(super) fn relay(
         // with nothing shown
         if ended_at.is_some_and(|t| t.elapsed() >= END_GRACE) {
             break Outcome::Done;
+        }
+        // a guest kernel that stops without a reset (poweroff -f where the
+        // shell has no pid namespace of its own, sysrq o) leaves firecracker
+        // running. its last line can be printed by anyone, so it only counts
+        // once the vCPUs have stopped running too
+        if let Some((t, runs)) = halt_seen
+            && t.elapsed() >= HALT_CHECK
+        {
+            let now = vcpu_runs(child.id());
+            if runs.is_some() && now == runs {
+                halted = true;
+                break Outcome::Done;
+            }
+            // still running: it can take a moment after the line to stop
+            halt_seen = Some((Instant::now(), now));
         }
         if !raw && started.elapsed() >= READY_WAIT {
             let _ = sys::set_raw(0);
@@ -354,6 +375,12 @@ pub(super) fn relay(
                 Ok(n) if n > 0 => {
                     let show = end.feed(&buf[..n]);
                     screen.put(&filter.feed(&show), None);
+                    if !show.is_empty() {
+                        tail.extend_from_slice(&show);
+                        tail.drain(..tail.len().saturating_sub(128));
+                        halt_seen =
+                            halt_line(&tail).then(|| (Instant::now(), vcpu_runs(child.id())));
+                    }
                     if end.ready && !raw {
                         let _ = sys::set_raw(0);
                         raw = true;
@@ -394,14 +421,60 @@ pub(super) fn relay(
     // that has stopped reading would leave the reset stuck behind it
     screen.drain(Instant::now() + Duration::from_secs(2));
     screen.finish(&filter.reset());
-    Shell {
-        outcome,
-        end: end.ended.then(|| Ended {
+    let end = if halted {
+        Some(Ended {
+            rc: 0,
+            how: Some(b'p'),
+        })
+    } else {
+        end.ended.then(|| Ended {
             rc: end.rc().unwrap_or(0),
             how: end.how(),
-        }),
+        })
+    };
+    Shell {
+        outcome,
+        end,
         screen,
     }
+}
+
+/// whether the console ends in the line the guest kernel prints when it stops
+/// for good: `[    1.389719] reboot: System halted` or `... reboot: Power down`
+fn halt_line(tail: &[u8]) -> bool {
+    let t = tail.strip_suffix(b"\n").unwrap_or(tail);
+    let t = t.strip_suffix(b"\r").unwrap_or(t);
+    let Some(t) = [&b"] reboot: System halted"[..], b"] reboot: Power down"]
+        .iter()
+        .find_map(|m| t.strip_suffix(*m))
+    else {
+        return false;
+    };
+    let line = t.rsplit(|&b| b == b'\n').next().unwrap_or(t);
+    let line = line.strip_prefix(b"\r").unwrap_or(line);
+    line.strip_prefix(b"[").is_some_and(|ts| {
+        !ts.is_empty() && ts.iter().all(|b| b.is_ascii_digit() || b" .".contains(b))
+    })
+}
+
+/// how many times firecracker's vCPU threads have been scheduled, from
+/// /proc/PID/task/*/schedstat. a halted guest's vCPUs never run again; an idle
+/// one still wakes for its timers
+fn vcpu_runs(pid: u32) -> Option<u64> {
+    let mut total = None;
+    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        let p = t.path();
+        if !std::fs::read_to_string(p.join("comm")).is_ok_and(|c| c.starts_with("fc_vcpu")) {
+            continue;
+        }
+        let stat = std::fs::read_to_string(p.join("schedstat")).ok()?;
+        let runs: u64 = stat.split_whitespace().nth(2)?.parse().ok()?;
+        total = Some(total.unwrap_or(0) + runs);
+    }
+    total
 }
 
 /// watches the shell's console for guest init's markers and keeps them off the
@@ -703,6 +776,21 @@ mod tests {
             b"BURNER-xyz-END\r\n".to_vec()
         );
         assert!(!e.ended);
+    }
+
+    #[test]
+    fn halt_lines() {
+        assert!(halt_line(
+            b"# poweroff -f\r\n[    1.389719] reboot: System halted\r\n"
+        ));
+        assert!(halt_line(b"[ 12.5] reboot: Power down\r\n"));
+        assert!(halt_line(b"[    1.0] reboot: Power down"));
+        assert!(!halt_line(
+            b"[    1.389719] reboot: System halted\r\nburner:~# "
+        ));
+        assert!(!halt_line(b"echo [ 1.0] reboot: System halted\r\n"));
+        assert!(!halt_line(b"reboot: System halted\r\n"));
+        assert!(!halt_line(b"[    1.0] reboot: Restarting system\r\n"));
     }
 
     #[test]
