@@ -375,7 +375,7 @@ fn run_vm(
         .spawn()
         .context("starting the jailer")?;
     if p.shell {
-        let outcome = relay(&mut child, deadline, cfg, id);
+        let outcome = relay(&mut child, &token, deadline, cfg, id);
         sys::restore_tty(saved_tty.as_ref());
         if matches!(outcome, Outcome::Failed) {
             // the jail and its firecracker.log are gone after teardown
@@ -409,7 +409,12 @@ fn run_vm(
             }
             Outcome::Timeout => {
                 set_status("timeout", None);
-                eprintln!("burner: shell closed at the {} min limit", p.ttl / 60);
+                let limit = if p.ttl.is_multiple_of(60) {
+                    format!("{} min", p.ttl / 60)
+                } else {
+                    format!("{}s", p.ttl)
+                };
+                eprintln!("burner: shell closed at the {limit} limit");
                 EXIT_TIMEOUT
             }
             Outcome::Cancelled => {

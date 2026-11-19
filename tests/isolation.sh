@@ -254,6 +254,13 @@ out=$(sudo env PATH="$T/evil:$PATH" /usr/local/bin/burner run -- 'echo fine' </d
   && ok "a PATH passed through sudo isn't used for helpers" \
   || bad "PATH" "rc=$rc out=$out pwned=$([ -e "$T/pwned" ] && echo yes)"
 
+# 24 leaving a shell: back at the caller's prompt with no guest kernel line
+( sleep 8; printf 'echo shell-$((6*7))\r'; sleep 2; printf 'exit\r'; sleep 8 ) \
+  | script -qfec "sudo burner shell alpine" "$T/shell.out" >/dev/null 2>&1
+grep -q 'shell-42' "$T/shell.out" && ! grep -q 'reboot:\|BURNER-' "$T/shell.out" \
+  && ok "shell exit shows no kernel reboot line" \
+  || bad "shell exit" "$(tr -d '\r' < "$T/shell.out" | tail -n 4 | tr '\n' ' ')"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]

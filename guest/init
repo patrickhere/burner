@@ -55,6 +55,11 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     printf '\nburner: fresh %s VM. nothing is kept when you exit.\n\n' "$name"
     if command -v setsid >/dev/null 2>&1; then setsid -c "$sh" -l; else "$sh" -l; fi
     dmesg -n 1 2>/dev/null
+    # burner shows nothing past this, so the kernel's reboot line (logged at a
+    # level no loglevel setting hides) doesn't end up on the caller's terminal
+    token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
+    # reopened: the login shell's exit hung up the tty init's own fds point at
+    [ -n "$token" ] && printf 'BURNER-%s-END' "$token" > /dev/ttyS0
     halt
 fi
 

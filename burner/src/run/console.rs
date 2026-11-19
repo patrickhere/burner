@@ -195,7 +195,13 @@ fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
 /// ways. keystrokes go to the VM as they are; what the VM prints goes through a
 /// filter so it can't set titles, the clipboard or anything else on the terminal
-pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
+pub(super) fn relay(
+    child: &mut Child,
+    token: &str,
+    deadline: Deadline,
+    cfg: &Config,
+    id: &str,
+) -> Outcome {
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
         return Outcome::Failed;
     };
@@ -210,6 +216,8 @@ pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &st
     let screen = Out::new_unescaped(Dest::Stdout);
     let mut filter = crate::output::TermFilter::default();
     let mut escape = Escape::default();
+    let mut end = ShellEnd::new(token);
+    let mut held_since: Option<Instant> = None;
     let mut to_vm: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16384];
     let mut next_check = Instant::now();
@@ -234,7 +242,9 @@ pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &st
         if console_open {
             fds.push(vout_fd);
         }
-        let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(200)));
+        // a held possible marker start waits at most 30ms, so typing never lags
+        let wait = if held_since.is_some() { 30 } else { 200 };
+        let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(wait)));
         if ready.contains(&0) {
             match io::stdin().lock().read(&mut buf) {
                 Ok(0) | Err(_) => stdin_open = false,
@@ -262,7 +272,12 @@ pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &st
         }
         if ready.contains(&vout_fd) {
             match vout.read(&mut buf) {
-                Ok(n) if n > 0 => screen.put(&filter.feed(&buf[..n]), None),
+                Ok(n) if n > 0 => {
+                    let show = end.feed(&buf[..n]);
+                    screen.put(&filter.feed(&show), None);
+                    held_since =
+                        (!end.held.is_empty()).then(|| held_since.unwrap_or_else(Instant::now));
+                }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::Interrupted => {}
@@ -271,6 +286,10 @@ pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &st
             }
         } else if matches!(child.try_wait(), Ok(Some(_))) {
             break child_outcome(child);
+        }
+        if held_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(30)) {
+            screen.put(&filter.feed(&end.flush()), None);
+            held_since = None;
         }
     };
     // a kill that landed as the VM was exiting still counts as a kill
@@ -281,6 +300,53 @@ pub(super) fn relay(child: &mut Child, deadline: Deadline, cfg: &Config, id: &st
     screen.put(crate::output::TERM_RESET, None);
     screen.drain(Instant::now() + Duration::from_secs(2));
     outcome
+}
+
+/// watches the shell's console for guest init's end marker. what comes after it
+/// (the guest kernel's reboot line) never reaches the caller's terminal. bytes
+/// that could be the start of the marker wait until it's clear they aren't
+struct ShellEnd {
+    marker: Vec<u8>,
+    held: Vec<u8>,
+    ended: bool,
+}
+
+impl ShellEnd {
+    fn new(token: &str) -> ShellEnd {
+        ShellEnd {
+            marker: format!("BURNER-{token}-END").into_bytes(),
+            held: Vec::new(),
+            ended: false,
+        }
+    }
+
+    /// what can go to the screen now
+    fn feed(&mut self, b: &[u8]) -> Vec<u8> {
+        if self.ended {
+            return Vec::new();
+        }
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(b);
+        if let Some(i) = buf
+            .windows(self.marker.len())
+            .position(|w| w == self.marker)
+        {
+            self.ended = true;
+            buf.truncate(i);
+            return buf;
+        }
+        let keep = (1..self.marker.len().min(buf.len() + 1))
+            .rev()
+            .find(|&k| buf.ends_with(&self.marker[..k]))
+            .unwrap_or(0);
+        self.held = buf.split_off(buf.len() - keep);
+        buf
+    }
+
+    /// nothing more came, so what was held back wasn't the marker
+    fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
 }
 
 /// ssh-style escape for burner shell: `~` right after enter (or at the start)
@@ -421,6 +487,31 @@ fn deliver_from(f: &mut File, out: &Out, until: Instant) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_end_marker() {
+        let all = b"burner:~# exit\r\nBURNER-abc-END[ 10.66] reboot: Restarting system\r\n";
+        let want = b"burner:~# exit\r\n".to_vec();
+        for i in 0..=all.len() {
+            let mut e = ShellEnd::new("abc");
+            let mut got = e.feed(&all[..i]);
+            got.extend(e.feed(&all[i..]));
+            assert_eq!(got, want, "split at {i}");
+            assert!(e.ended);
+        }
+        // a held "BUR" that turns out not to be the marker still shows
+        let mut e = ShellEnd::new("abc");
+        assert_eq!(e.feed(b"echo BUR"), b"echo ".to_vec());
+        assert_eq!(e.flush(), b"BUR".to_vec());
+        assert_eq!(e.feed(b"NING\r\n"), b"NING\r\n".to_vec());
+        // another token's marker is just output
+        let mut e = ShellEnd::new("abc");
+        assert_eq!(
+            e.feed(b"BURNER-xyz-END\r\n"),
+            b"BURNER-xyz-END\r\n".to_vec()
+        );
+        assert!(!e.ended);
+    }
 
     #[test]
     fn shell_escape() {
