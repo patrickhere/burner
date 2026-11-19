@@ -11,6 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -63,12 +64,28 @@ pub fn main(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     // curl or gzip with it
     crate::run::interrupted();
     match setup(cfg, a) {
+        Err(e) if SWAPPING.load(Ordering::SeqCst) => Err(e.context(
+            "setup stopped while it swapped in the new files, the kernel and image may not \
+             match now: run it again",
+        )),
         Err(_) if crate::run::is_interrupted() => {
             eprintln!("burner: setup interrupted, nothing was changed");
             Ok(ExitCode::from(crate::run::EXIT_INTERRUPTED))
         }
         r => r,
     }
+}
+
+/// set once the first installed file is replaced: past that, a failure has
+/// changed something
+static SWAPPING: AtomicBool = AtomicBool::new(false);
+
+/// between the slow steps: ctrl-c only sets a flag, nothing stops on its own
+fn go_on() -> Result<()> {
+    if crate::run::is_interrupted() {
+        bail!("interrupted");
+    }
+    Ok(())
 }
 
 fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
@@ -81,6 +98,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let src = source(&a)?;
     // checked again before the swap, this only saves a pointless download
     drop(idle(cfg)?);
+    go_on()?;
 
     let root = &cfg.paths.root;
     fs::DirBuilder::new()
@@ -103,6 +121,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
             for name in [KERNEL, IMAGE] {
                 let from = dir.join(name);
                 config::trusted_file(&from)?;
+                go_on()?;
                 fs::copy(&from, stage.0.join(name))
                     .with_context(|| format!("copying {}", from.display()))?;
             }
@@ -145,12 +164,11 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
         fs::set_permissions(f, fs::Permissions::from_mode(0o644))?;
     }
 
-    if crate::run::is_interrupted() {
-        bail!("interrupted");
-    }
+    go_on()?;
     // a VM opens the kernel and image by path while it starts, and holding the
     // ledger lock keeps new ones from starting while they're swapped
     let ledger = idle(cfg)?;
+    go_on()?;
     let kdir = root.join("kernel");
     let idir = root.join("images/alpine");
     for d in [&kdir, &idir] {
@@ -159,6 +177,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
             .mode(0o755)
             .create(d)?;
     }
+    SWAPPING.store(true, Ordering::SeqCst);
     fs::rename(&kernel, kdir.join("vmlinux"))?;
     fs::rename(&rootfs, idir.join("rootfs.ext4"))?;
     fs::rename(&defaults, idir.join("defaults.toml"))?;
@@ -173,6 +192,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
 /// the ledger, locked, when no VM is in it
 fn idle(cfg: &Config) -> Result<Ledger> {
     let _ = crate::run::reap(cfg);
+    go_on()?;
     let ledger = Ledger::open(&cfg.paths.state)?;
     if !ledger.all().is_empty() || !ledger.unreadable().is_empty() {
         bail!(
