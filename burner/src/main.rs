@@ -2,6 +2,8 @@
 mod cgroup;
 mod config;
 mod doctor;
+#[cfg(target_os = "macos")]
+mod krun;
 mod ledger;
 mod net;
 mod output;
@@ -56,6 +58,10 @@ enum Cmd {
     Reap,
     #[command(name = "__parse-result", hide = true)]
     ParseResult { emit: String },
+    /// the VMM for one VM, started by burner run
+    #[cfg(target_os = "macos")]
+    #[command(name = "vmm-krun", hide = true)]
+    VmmKrun(krun::VmmArgs),
 }
 
 fn main() -> ExitCode {
@@ -68,6 +74,10 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Cmd::ParseResult { emit } = &cli.cmd {
         return result::child_main(emit == "1");
+    }
+    #[cfg(target_os = "macos")]
+    if let Cmd::VmmKrun(a) = cli.cmd {
+        return krun::main(a);
     }
     match run(cli) {
         Ok(code) => code,
@@ -123,5 +133,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Cmd::Reap => run::reap(&cfg),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
+        #[cfg(target_os = "macos")]
+        Cmd::VmmKrun(_) => unreachable!("handled before the config loads"),
     }
 }
