@@ -1,7 +1,8 @@
 # a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
 # and what it needs, and publishes them with SHA256SUMS and build provenance as a
 # github release. for burner on apple silicon, which builds its own binary, the
-# release also carries the arm guest kernel and a ready alpine image
+# release also carries the arm guest kernel, a ready alpine image and the list
+# of packages in that image
 name: release
 
 on:
@@ -90,6 +91,13 @@ jobs:
           [ "$(uname -m)" = aarch64 ]
           tools/build-image alpine
           gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > out/alpine-aarch64.ext4.gz
+          # apk installs whatever the mirror has today, so this is the record of
+          # what went into the image: every package and its version
+          debugfs -R 'cat /lib/apk/db/installed' "$BURNER_ROOT/images/alpine/rootfs.ext4" 2>/dev/null \
+            | awk '/^P:/ { p = substr($0, 3) } /^V:/ { print p, substr($0, 3) }' \
+            | LC_ALL=C sort > out/alpine-aarch64.packages
+          grep -q '^apk-tools ' out/alpine-aarch64.packages || { echo "no package list from the image" >&2; exit 1; }
+          cat out/alpine-aarch64.packages
           ls -l out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -97,6 +105,7 @@ jobs:
           path: |
             out/vmlinux-aarch64
             out/alpine-aarch64.ext4.gz
+            out/alpine-aarch64.packages
           if-no-files-found: error
 
   release:
@@ -122,7 +131,7 @@ jobs:
           cd out
           tarballs=(burner-*.tar.gz)
           [ "${#tarballs[@]}" = 2 ] || { echo "expected 2 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
-          sha256sum burner-*.tar.gz vmlinux-aarch64 alpine-aarch64.ext4.gz > SHA256SUMS
+          sha256sum burner-*.tar.gz vmlinux-aarch64 alpine-aarch64.ext4.gz alpine-aarch64.packages > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -130,6 +139,7 @@ jobs:
             out/burner-*.tar.gz
             out/vmlinux-aarch64
             out/alpine-aarch64.ext4.gz
+            out/alpine-aarch64.packages
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -138,7 +148,8 @@ jobs:
         run: |
           # the CHANGELOG.md section for this version, empty if there is none
           awk -v h="## ${TAG#v}" '$0 == h { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notes.md 2>/dev/null || true
-          gh release create "$TAG" out/burner-*.tar.gz out/vmlinux-aarch64 out/alpine-aarch64.ext4.gz out/SHA256SUMS \
+          gh release create "$TAG" out/burner-*.tar.gz out/vmlinux-aarch64 out/alpine-aarch64.ext4.gz \
+            out/alpine-aarch64.packages out/SHA256SUMS \
             --verify-tag --title "$TAG" --notes-file notes.md
 
   # the crates are burnervm and burnervm-tui (burner was taken on crates.io), the
