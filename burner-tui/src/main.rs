@@ -49,10 +49,53 @@ extern "C" fn on_winch(_: libc::c_int) {
     // pipe already has a wakeup in it, and its EAGAIN mustn't reach the call
     // this signal interrupted, which looks at errno next
     unsafe {
-        let errno = *libc::__errno_location();
+        let errno = *errno_ptr();
         libc::write(fd, [0u8].as_ptr().cast(), 1);
-        *libc::__errno_location() = errno;
+        *errno_ptr() = errno;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_ptr() -> *mut libc::c_int {
+    // SAFETY: returns this thread's errno, always valid
+    unsafe { libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+fn errno_ptr() -> *mut libc::c_int {
+    // SAFETY: returns this thread's errno, always valid
+    unsafe { libc::__error() }
+}
+
+/// a nonblocking close-on-exec pipe
+#[cfg(target_os = "linux")]
+fn pipe() -> io::Result<[i32; 2]> {
+    let mut p = [0; 2];
+    // SAFETY: a valid array for the two fds
+    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(p)
+}
+
+/// macOS has no pipe2, so the flags go on after
+#[cfg(target_os = "macos")]
+fn pipe() -> io::Result<[i32; 2]> {
+    let mut p = [0; 2];
+    // SAFETY: a valid array for the two fds, then fcntl on fds we own
+    unsafe {
+        if libc::pipe(p.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in p {
+            if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0
+                || libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(p)
 }
 
 fn handle(sig: libc::c_int, f: extern "C" fn(libc::c_int)) {
@@ -82,11 +125,7 @@ enum Tty {
 
 impl Input {
     fn new() -> io::Result<Input> {
-        let mut p = [0; 2];
-        // SAFETY: a valid array for the two fds
-        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let p = pipe()?;
         WINCH.store(p[1], Ordering::Relaxed);
         handle(libc::SIGWINCH, on_winch);
         Ok(Input {
