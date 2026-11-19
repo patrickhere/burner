@@ -221,6 +221,7 @@ pub struct TermFilter {
     st: FState,
     seq: Vec<u8>,
     utf8: Vec<u8>,
+    str_len: usize,
     /// the terminal isn't utf-8: non-ascii chars go out as ?
     ascii: bool,
 }
@@ -237,6 +238,9 @@ enum FState {
 }
 
 const SEQ_MAX: usize = 64;
+/// an OSC/DCS/APC/PM/SOS string longer than this is given up on, so one that
+/// never ends doesn't hide the rest of the session
+const STR_MAX: usize = 16 << 10;
 
 /// undoes every mode the filter lets through, sent when the shell ends. leaving
 /// the alt screen and resetting the scroll region both move the cursor home, so
@@ -277,7 +281,10 @@ impl TermFilter {
                 self.seq.push(b);
                 match b {
                     b'[' => self.st = FState::Csi,
-                    b']' | b'P' | b'_' | b'^' | b'X' => self.st = FState::Str,
+                    b']' | b'P' | b'_' | b'^' | b'X' => {
+                        self.str_len = 0;
+                        self.st = FState::Str;
+                    }
                     b'(' | b')' => self.st = FState::Charset,
                     0x1b => self.start_esc(),
                     // save/restore cursor, reverse index, keypad modes
@@ -315,16 +322,23 @@ impl TermFilter {
                     self.st = FState::Text;
                 }
             }
+            // a terminal ends a string on BEL, ST, CAN, SUB or any other ESC
             FState::Str => match b {
-                0x07 => self.st = FState::Text,
+                0x07 | 0x18 | 0x1a => self.st = FState::Text,
                 0x1b => self.st = FState::StrEsc,
-                _ => {}
+                _ => {
+                    self.str_len += 1;
+                    if self.str_len > STR_MAX {
+                        self.st = FState::Text;
+                    }
+                }
             },
             FState::StrEsc => {
-                self.st = if b == b'\\' {
-                    FState::Text
+                if b == b'\\' {
+                    self.st = FState::Text;
                 } else {
-                    FState::Str
+                    self.start_esc();
+                    self.byte(b, out);
                 }
             }
         }
@@ -462,6 +476,27 @@ mod tests {
         assert_eq!(f.feed(b"\x1b[1\x1b[31mr"), b"\x1b[31mr".to_vec());
         // a control inside a CSI ends it
         assert_eq!(f.feed(b"\x1b[1\nz"), b"\nz".to_vec());
+    }
+
+    #[test]
+    fn filter_strings_that_never_end() {
+        let mut f = TermFilter::default();
+        // another escape ends the string and starts on its own
+        assert_eq!(f.feed(b"\x1b]0;x\x1b[1mbold"), b"\x1b[1mbold".to_vec());
+        assert_eq!(f.feed(b"\x1b_apc\x1b]0;t\x07ok"), b"ok".to_vec());
+        // CAN and SUB end it too
+        for end in *b"\x18\x1a" {
+            assert_eq!(
+                f.feed(&[&b"\x1bPq"[..], &[end], b"seen"].concat()),
+                b"seen".to_vec()
+            );
+        }
+        // ESC \\ still ends it, split across reads
+        assert_eq!(f.feed(b"\x1b]2;t\x1b"), b"".to_vec());
+        assert_eq!(f.feed(b"\\after"), b"after".to_vec());
+        // and one that runs on is given up on
+        let long = [&b"\x1b]"[..], &vec![b'a'; STR_MAX], b"bcd"].concat();
+        assert_eq!(f.feed(&long), b"cd".to_vec());
     }
 
     #[test]
