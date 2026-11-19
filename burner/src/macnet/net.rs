@@ -20,7 +20,7 @@ use smoltcp::wire::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 
-use super::policy::Policy;
+use super::policy::{Mode, Policy};
 use super::{Link, SOCK_RCVBUF, SOCK_SNDBUF, setopt};
 
 /// ethernet header plus a 1500 mtu. libkrun gets no offload features, so the
@@ -163,8 +163,8 @@ struct Gw<'a> {
     conns: HashMap<Key, Conn>,
     pending: HashMap<Key, Pending>,
     dns: Vec<Dns>,
-    // the linux table's meters: 20 new web connections a second, burst 40,
-    // and 20 dns packets a second, burst 50
+    // the linux table's meters: new connections at 20 a second, burst 40 in
+    // web mode and 50, burst 100 in open mode, and 20 dns packets a second, burst 50
     new_conns: Bucket,
     dns_rate: Bucket,
     tx_blocked: bool,
@@ -190,7 +190,6 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
     }
     setopt(vm, libc::SO_RCVBUF, SOCK_RCVBUF)?;
     setopt(vm, libc::SO_SNDBUF, SOCK_SNDBUF)?;
-    #[cfg(target_os = "macos")]
     setopt(vm, libc::SO_NOSIGPIPE, 1)?;
     unsafe {
         let fl = libc::fcntl(vm, libc::F_GETFL);
@@ -220,6 +219,10 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
     u.bind(53).map_err(|e| io::Error::other(format!("{e:?}")))?;
     let udp53 = sockets.add(u);
 
+    let new_conns = match pol.mode {
+        Mode::Web => Bucket::new(20.0, 40.0),
+        Mode::Open => Bucket::new(50.0, 100.0),
+    };
     let mut gw = Gw {
         args,
         pol,
@@ -231,7 +234,7 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         conns: HashMap::new(),
         pending: HashMap::new(),
         dns: Vec::new(),
-        new_conns: Bucket::new(20.0, 40.0),
+        new_conns,
         dns_rate: Bucket::new(20.0, 50.0),
         tx_blocked: false,
     };
@@ -749,7 +752,6 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket) {
 fn connect(dst: Ipv4Addr, port: u16) -> io::Result<Socket> {
     let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     s.set_nonblocking(true)?;
-    #[cfg(target_os = "macos")]
     setopt(s.as_raw_fd(), libc::SO_NOSIGPIPE, 1)?;
     match s.connect(&SocketAddrV4::new(dst, port).into()) {
         Ok(()) => Ok(s),

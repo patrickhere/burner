@@ -8,16 +8,21 @@ use std::net::Ipv4Addr;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Web,
+    Open,
 }
 
 impl Mode {
     pub fn parse(s: &str) -> Option<Mode> {
         match s {
             "web" => Some(Mode::Web),
+            "open" => Some(Mode::Open),
             _ => None,
         }
     }
 }
+
+/// smtp, smtps and submission stay shut in open mode, as on linux
+const MAIL: [u16; 3] = [25, 465, 587];
 
 /// always blocked, kept in step with SPECIAL in burner/src/net.rs
 const SPECIAL: &[(Ipv4Addr, u8)] = &[
@@ -91,6 +96,8 @@ impl Policy {
         match self.mode {
             Mode::Web if port == 80 || port == 443 => Ok(()),
             Mode::Web => Err("port closed in web mode"),
+            Mode::Open if MAIL.contains(&port) => Err("mail port closed in open mode"),
+            Mode::Open => Ok(()),
         }
     }
 
@@ -181,6 +188,25 @@ mod tests {
         for port in [22, 25, 53, 8080, 0] {
             assert!(p.tcp(gh, port).is_err(), "{port}");
         }
+    }
+
+    #[test]
+    fn open_ports() {
+        let p = Policy::new(
+            Mode::Open,
+            vec![Ipv4Addr::new(9, 9, 9, 9)],
+            &[],
+            (Ipv4Addr::new(172, 29, 217, 0), 30),
+        );
+        let gh = Ipv4Addr::new(140, 82, 112, 3);
+        for port in [22, 80, 443, 8080, 1] {
+            assert!(p.tcp(gh, port).is_ok(), "{port}");
+        }
+        for port in [25, 465, 587, 53] {
+            assert!(p.tcp(gh, port).is_err(), "{port}");
+        }
+        assert!(p.tcp(Ipv4Addr::new(9, 9, 9, 9), 53).is_ok());
+        assert!(p.tcp(Ipv4Addr::new(10, 1, 0, 63), 22).is_err());
     }
 
     #[test]
