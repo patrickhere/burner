@@ -412,6 +412,24 @@ pub fn restore_saved_tty() {
     restore_tty(SAVED_TTY.get());
 }
 
+/// burner shell's hold on fd 0: saved (for the panic hook too) and in boot
+/// mode while it lives, put back when it drops
+pub struct ShellTty;
+
+impl ShellTty {
+    pub fn take(reset: &'static [u8]) -> ShellTty {
+        restore_tty_on_panic(reset);
+        let _ = set_boot_mode(0);
+        ShellTty
+    }
+}
+
+impl Drop for ShellTty {
+    fn drop(&mut self) {
+        restore_saved_tty();
+    }
+}
+
 /// release builds abort on panic, which skips every cleanup path. the hook
 /// still runs first: put the terminal back and undo any screen modes
 pub fn restore_tty_on_panic(reset: &'static [u8]) {

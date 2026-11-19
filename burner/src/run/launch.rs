@@ -60,12 +60,6 @@ fn set_status(outcome: &'static str, rc: Option<i32>) {
 
 pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     interrupted();
-    if a.shell {
-        // saved for every way out, a panic included, then in boot mode from
-        // the start: keys typed during setup wait for the VM, ctrl-c works
-        sys::restore_tty_on_panic(crate::output::TERM_RESET);
-        let _ = sys::set_boot_mode(0);
-    }
     if let Some(fd) = a.status_fd {
         // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
         // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
@@ -76,6 +70,11 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     }
+    // boot mode from the start: keys typed during setup wait for the VM and
+    // ctrl-c works. the terminal comes back however main returns
+    let _tty = a
+        .shell
+        .then(|| sys::ShellTty::take(crate::output::TERM_RESET));
     let t0 = Instant::now();
     let code = match run(cfg, &a) {
         Ok(code) => code,
