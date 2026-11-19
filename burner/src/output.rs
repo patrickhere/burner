@@ -231,8 +231,12 @@ enum FState {
     #[default]
     Text,
     Esc,
+    /// ESC with intermediate bytes: dropped up to its final byte
+    EscInter,
     Charset,
     Csi,
+    /// a CSI over SEQ_MAX: dropped up to its final byte
+    CsiSkip,
     Str,
     StrEsc,
 }
@@ -278,6 +282,11 @@ impl TermFilter {
         match self.st {
             FState::Text => self.text(b, out),
             FState::Esc => {
+                if b < 0x20 && b != 0x1b {
+                    // a control inside a sequence: drop the sequence, act on the control
+                    self.st = FState::Text;
+                    return self.text(b, out);
+                }
                 self.seq.push(b);
                 match b {
                     b'[' => self.st = FState::Csi,
@@ -292,16 +301,36 @@ impl TermFilter {
                         out.extend_from_slice(&self.seq);
                         self.st = FState::Text;
                     }
+                    0x20..=0x2f => self.st = FState::EscInter,
                     _ => self.st = FState::Text,
                 }
             }
-            FState::Charset => {
-                self.seq.push(b);
-                // only ascii and line drawing
-                if b == b'B' || b == b'0' {
-                    out.extend_from_slice(&self.seq);
+            FState::EscInter | FState::CsiSkip => match b {
+                0x1b => self.start_esc(),
+                0x00..=0x1f => {
+                    self.st = FState::Text;
+                    self.text(b, out);
                 }
-                self.st = FState::Text;
+                0x30..=0x7e if self.st == FState::EscInter => self.st = FState::Text,
+                0x40..=0x7e => self.st = FState::Text,
+                _ => {}
+            },
+            FState::Charset => {
+                if b < 0x20 && b != 0x1b {
+                    self.st = FState::Text;
+                    return self.text(b, out);
+                }
+                self.seq.push(b);
+                match b {
+                    0x1b => self.start_esc(),
+                    0x20..=0x2f => self.st = FState::EscInter,
+                    // only ascii and line drawing
+                    b'B' | b'0' => {
+                        out.extend_from_slice(&self.seq);
+                        self.st = FState::Text;
+                    }
+                    _ => self.st = FState::Text,
+                }
             }
             FState::Csi => {
                 if b == 0x1b {
@@ -319,7 +348,7 @@ impl TermFilter {
                     }
                     self.st = FState::Text;
                 } else if self.seq.len() > SEQ_MAX {
-                    self.st = FState::Text;
+                    self.st = FState::CsiSkip;
                 }
             }
             // a terminal ends a string on BEL, ST, CAN, SUB or any other ESC
@@ -473,7 +502,7 @@ mod tests {
             b"\x1b[2J\x1b[1;1H\x1b[K".to_vec()
         );
         // unknown escapes and a second ESC mid-sequence
-        assert_eq!(f.feed(b"\x1bc\x1b#8x"), b"8x".to_vec());
+        assert_eq!(f.feed(b"\x1bc\x1b#8x"), b"x".to_vec());
         assert_eq!(f.feed(b"\x1b[1\x1b[31mr"), b"\x1b[31mr".to_vec());
         // a control inside a CSI ends it
         assert_eq!(f.feed(b"\x1b[1\nz"), b"\nz".to_vec());
@@ -498,6 +527,27 @@ mod tests {
         // and one that runs on is given up on
         let long = [&b"\x1b]"[..], &vec![b'a'; STR_MAX], b"bcd"].concat();
         assert_eq!(f.feed(&long), b"cd".to_vec());
+    }
+
+    #[test]
+    fn filter_drops_long_sequences_whole() {
+        let mut f = TermFilter::default();
+        let params = (1..=40)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        let csi = format!("L1\x1b[{params}mL2");
+        assert_eq!(f.feed(csi.as_bytes()), b"L1L2".to_vec());
+        let long = format!("Q1\x1b[{}1CQ2", "0".repeat(99));
+        assert_eq!(f.feed(long.as_bytes()), b"Q1Q2".to_vec());
+        // one byte under the cap still goes out
+        let fits = format!("\x1b[{}1C", "0".repeat(SEQ_MAX - 4));
+        assert_eq!(f.feed(fits.as_bytes()), fits.as_bytes().to_vec());
+        // ESC with intermediates: DECALN, charset designations it doesn't allow
+        assert_eq!(f.feed(b"P1\x1b#8P2\x1b%GP3\x1b(%6P4"), b"P1P2P3P4".to_vec());
+        assert_eq!(f.feed(b"\x1b(0q\x1b(B"), b"\x1b(0q\x1b(B".to_vec());
+        // a control inside one ends it and still acts
+        assert_eq!(f.feed(b"\x1b#\r\x1b\nz"), b"\r\nz".to_vec());
     }
 
     #[test]
