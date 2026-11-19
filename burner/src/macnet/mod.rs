@@ -133,13 +133,15 @@ impl Drop for Proc {
 }
 
 /// start macnet on its end of the pair, in the VMM's process group: whatever
-/// stops the VM (teardown, burner kill, the reaper) signals that group
+/// stops the VM (teardown, burner kill, the reaper) signals that group. what it
+/// says goes to `log`, the VM's log, never the caller's terminal
 pub fn spawn(
     cfg: &Config,
     mode: crate::net::Mode,
     s: &crate::net::Slot,
     fd: OwnedFd,
     group: u32,
+    log: std::fs::File,
 ) -> io::Result<Proc> {
     let raw = fd.as_raw_fd();
     let mut cmd = Command::new(sys::self_exe());
@@ -160,13 +162,18 @@ pub fn spawn(
         cmd.args(["--block", &format!("{ip}/32")]);
     }
     cmd.process_group(group as libc::pid_t);
-    // SAFETY: inherit only calls fcntl
+    let fds = sys::open_fds();
+    // SAFETY: close_strays and inherit only call fcntl and close
     unsafe {
-        cmd.pre_exec(move || inherit(raw));
+        cmd.pre_exec(move || {
+            sys::close_strays(&fds, Some(raw));
+            inherit(raw)
+        });
     }
     let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
+        .stderr(log)
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir("/")
@@ -187,9 +194,13 @@ pub fn probe() -> Result<(), String> {
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir("/");
-    // SAFETY: inherit only calls fcntl
+    let fds = sys::open_fds();
+    // SAFETY: close_strays and inherit only call fcntl and close
     unsafe {
-        cmd.pre_exec(move || inherit(raw));
+        cmd.pre_exec(move || {
+            sys::close_strays(&fds, Some(raw));
+            inherit(raw)
+        });
     }
     let out = sys::run_timeout(&mut cmd, None, std::time::Duration::from_secs(10))
         .map_err(|e| e.to_string())?;

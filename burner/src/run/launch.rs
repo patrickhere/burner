@@ -693,13 +693,17 @@ fn launch(
     vmm.process_group(0);
     let me = std::process::id() as libc::pid_t;
     let vm_fd = net.as_ref().map(|(_, v, _)| v.as_raw_fd());
-    // SAFETY: join_from_child only calls getppid, inherit only fcntl
+    let fds = sys::open_fds();
+    // SAFETY: join_from_child only calls getppid, close_strays and inherit
+    // only fcntl and close
     unsafe {
         vmm.pre_exec(move || {
             cgroup::join_from_child(&procs, me)?;
+            sys::close_strays(&fds, vm_fd);
             vm_fd.map_or(Ok(()), crate::macnet::inherit)
         });
     }
+    let net_log = vlog.try_clone()?;
     let mut child = vmm
         .arg("vmm-krun")
         .arg("--kernel")
@@ -745,7 +749,7 @@ fn launch(
             // the VMM holds its end now. ours has to go, or macnet would never
             // see it close when the VM stops
             drop(vm_end);
-            let started = crate::macnet::spawn(cfg, p.net, &s, net_end, child.id())
+            let started = crate::macnet::spawn(cfg, p.net, &s, net_end, child.id(), net_log)
                 .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
             match started {
                 Ok(n) => Some(n),

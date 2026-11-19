@@ -555,6 +555,37 @@ pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
     who.alive() && unsafe { libc::kill(who.pid as libc::pid_t, sig) } == 0
 }
 
+/// the fds open in this process, for a child to close between fork and exec,
+/// where it can't list them itself
+#[cfg(target_os = "macos")]
+pub fn open_fds() -> Vec<libc::c_int> {
+    fs::read_dir("/dev/fd")
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect()
+}
+
+/// in a forked child: close what of `fds` would survive exec, except stdio and
+/// `keep`. no jailer on macOS to close what the caller left open without
+/// close-on-exec, and a sandbox only limits what gets opened later
+#[cfg(target_os = "macos")]
+pub fn close_strays(fds: &[libc::c_int], keep: Option<libc::c_int>) {
+    for &fd in fds {
+        if fd <= 2 || Some(fd) == keep {
+            continue;
+        }
+        // SAFETY: fcntl and close are async-signal-safe and only touch the
+        // child's fd table
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFD);
+            if fl >= 0 && fl & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 /// the mount a file descriptor lives on, from /proc/self/fdinfo
 #[cfg(target_os = "linux")]
 fn mnt_id(fd: libc::c_int) -> Option<u64> {
