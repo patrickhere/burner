@@ -1,10 +1,19 @@
 [package]
-name = "burner"
+name = "burnervm"
 version = "0.1.0"
+description = "throwaway linux VMs on your own hardware: firecracker microVMs you get a shell in or run a command in, deleted when you're done"
+readme = "../README.md"
+keywords = ["firecracker", "microvm", "sandbox", "kvm", "vm"]
+categories = ["command-line-utilities", "virtualization"]
+homepage = "https://burnervm.dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[[bin]]
+name = "burner"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"

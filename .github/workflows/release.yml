@@ -101,3 +101,30 @@ jobs:
           awk -v h="## ${TAG#v}" '$0 == h { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notes.md 2>/dev/null || true
           gh release create "$TAG" out/burner-*.tar.gz out/SHA256SUMS \
             --verify-tag --title "$TAG" --notes-file notes.md
+
+  # the crates are burnervm and burnervm-tui (burner was taken on crates.io), the
+  # commands they install are still burner and burner-tui
+  crates:
+    needs: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: versions match the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for c in burner burner-tui; do
+            v=$(sed -n 's/^version = "\(.*\)"/\1/p' "$c/Cargo.toml" | head -n 1)
+            [ "v$v" = "$TAG" ] || { echo "$c/Cargo.toml says $v, the tag is $TAG" >&2; exit 1; }
+          done
+      - name: publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --locked -p burnervm
+          cargo publish --locked -p burnervm-tui

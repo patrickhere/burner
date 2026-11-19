@@ -1,10 +1,19 @@
 [package]
-name = "burner-tui"
+name = "burnervm-tui"
 version = "0.1.0"
+description = "a terminal UI for burner: pick an image and settings, start a shell or run, watch and kill running VMs"
+readme = "../README.md"
+keywords = ["firecracker", "microvm", "sandbox", "tui"]
+categories = ["command-line-utilities", "virtualization"]
+homepage = "https://burnervm.dev"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[[bin]]
+name = "burner-tui"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.29.0"
