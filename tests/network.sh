@@ -135,7 +135,7 @@ after=$(sudo burner run --net web -- 'nslookup github.com >/dev/null 2>&1 && ech
 # spoofing: a VM that takes another address gets nothing through. nc has to
 # get out from the real address first and the new address has to take, so a
 # missing tool or a VM with no network can't read as held
-out=$(sudo burner run --net open -- 'for t in ip nc; do command -v $t >/dev/null || { echo "MISSING $t"; exit 0; }; done; nc -z -w 4 1.1.1.1 443 || { echo "NO BASELINE"; exit 0; }; ip addr flush dev eth0 && ip addr add 172.29.217.6/30 dev eth0 || { echo "SPOOF FAILED"; exit 0; }; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
+out=$(sudo burner run --net open -- 'for t in ip nc; do command -v $t >/dev/null || { echo "MISSING $t"; exit 0; }; done; nc -z -w 4 1.1.1.1 443 || { echo "NO BASELINE"; exit 0; }; ip addr flush dev eth0 && ip addr add 172.29.217.6/30 dev eth0 || { echo "SPOOF FAILED"; exit 0; }; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; ip route show default | grep -q . || { echo "NO ROUTE"; exit 0; }; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
 [ "$out" = HELD ] && ok "spoofed source address dropped" || bad "spoofing" "$out"
 
 # none: no network interface at all
