@@ -84,6 +84,15 @@ i run it on a box that's only reachable over a VPN. yours might sit on a home LA
 
 what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel and burner's pinned firecracker updated), side channels between VMs on the same cpu, and anything you pipe in yourself.
 
+native on a mac (coming with the next release, see [install](#install)) it's weaker than on linux, and here's how:
+
+- each VM is libkrun on apple's hypervisor.framework. those two and the macOS kernel are the security boundary, where on linux it's firecracker, the jailer and kvm
+- the VMM runs as you. there's no uid per VM, no jailer and no chroot, so a guest that breaks out of libkrun can do anything you can, including reading other VMs' disks. the guest gets the cpus and memory you asked for, but nothing caps the VMM's own overhead the way a cgroup does on linux, and disk io isn't capped
+- there's no packet filter. each VM's network is its own `burner macnet` process, a tcp/ip stack in user space (smoltcp) that only opens the connections the policy allows: the same blocks for the LAN, the host, other VMs and anything off the default route, no mail ports in open mode, `net.block_public_ip` and `net.rate`. it runs under a seatbelt sandbox that allows outbound sockets and route lookups and nothing else, so a bug in it gets the guest no more than the network it already has
+- no ping and no udp but dns yet, in any mode
+- the result tar is still parsed in a separate process with rlimits, but as you, and without a memory cap (macOS won't set one)
+- there's no reaper timer. the VMM stops itself when burner exits or its time is up, and the next `burner run` or `burner ls` cleans up what's left
+
 ## install
 
 linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image:
@@ -114,7 +123,17 @@ burner setup                     # makes the VM and installs burner in it, once
 burner run -- 'uname -a'         # every burner command runs in the VM, no sudo needed
 ```
 
-on an M1 or M2 there's no kvm inside the VM, so no burner. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
+on an M1 or M2 there's no kvm inside the VM, so no burner through lima. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
+
+native on a mac is coming with the next release: no linux VM in between, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. it'll be a homebrew formula that builds burner, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs, and then:
+
+```
+burner setup                     # the guest kernel and alpine image from the release, checked against SHA256SUMS
+burner doctor
+burner run -- 'uname -m'         # no sudo, VMs run as you
+```
+
+the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` doesn't know about the mac yet.
 
 or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
 
