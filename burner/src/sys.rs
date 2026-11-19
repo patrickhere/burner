@@ -299,6 +299,7 @@ pub fn poll_read(fds: &[i32], timeout: Duration) -> Vec<i32> {
 }
 
 /// fire-and-forget to the system log. never blocks, so it's safe under a lock
+#[cfg(target_os = "linux")]
 pub fn syslog(msg: &str) {
     use std::os::unix::net::UnixDatagram;
     if let Ok(s) = UnixDatagram::unbound() {
@@ -306,6 +307,23 @@ pub fn syslog(msg: &str) {
         // facility daemon (3), severity info (6)
         let _ = s.send_to(format!("<30>burner: {msg}").as_bytes(), "/dev/log");
     }
+}
+
+/// syslog(3) on macOS goes to the unified log (log show --predicate
+/// 'process == "burner"'). notice, since info isn't kept on disk there
+#[cfg(target_os = "macos")]
+pub fn syslog(msg: &str) {
+    let Ok(m) = std::ffi::CString::new(msg.replace('\0', "?")) else {
+        return;
+    };
+    // SAFETY: a constant format string and one NUL-terminated argument
+    unsafe {
+        libc::syslog(
+            libc::LOG_NOTICE | libc::LOG_DAEMON,
+            c"%s".as_ptr(),
+            m.as_ptr(),
+        )
+    };
 }
 
 /// bytes free for root on the filesystem holding `path`
@@ -465,6 +483,26 @@ pub fn which(cmd: &str) -> bool {
         || ["/usr/sbin", "/sbin"]
             .iter()
             .any(|d| std::path::Path::new(d).join(cmd).is_file())
+}
+
+/// this burner binary, for the helpers it runs as itself. on linux the running
+/// file itself: an upgrade while VMs run replaces the path, never that
+#[cfg(target_os = "linux")]
+pub fn self_exe() -> std::path::PathBuf {
+    "/proc/self/exe".into()
+}
+
+/// macOS has no /proc/self/exe. resolved on first use (main does that right
+/// away), so a homebrew upgrade that moves the link later doesn't switch binaries
+#[cfg(target_os = "macos")]
+pub fn self_exe() -> std::path::PathBuf {
+    static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .unwrap_or_default()
+    })
+    .clone()
 }
 
 static SAVED_TTY: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();

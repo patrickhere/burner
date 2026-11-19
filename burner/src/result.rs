@@ -23,6 +23,7 @@ const MEMBERS: u32 = 20_000;
 const PARSE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PARSE_ARG: &str = "__parse-result";
 /// the parser's own account, so a parser bug can't touch what the VM's user owns
+#[cfg(target_os = "linux")]
 pub const PARSE_USER: &str = "burner-parse";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -65,6 +66,13 @@ impl<R: Read> Read for Exact<R> {
     }
 }
 
+#[cfg(target_os = "linux")]
+const MEM_LIMIT: &[(sys::Resource, u64)] = &[(libc::RLIMIT_AS, 512 << 20)];
+/// macOS refuses (EINVAL) any RLIMIT_AS or RLIMIT_DATA below what every process
+/// already has reserved, so there the parser runs without a memory cap
+#[cfg(target_os = "macos")]
+const MEM_LIMIT: &[(sys::Resource, u64)] = &[];
+
 /// parent side: parse the already-open result disk in a limited child, write the
 /// log and (optionally) a clean tar
 pub fn parse(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> Meta {
@@ -79,6 +87,7 @@ pub fn parse(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> Met
 }
 
 fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> io::Result<Meta> {
+    #[cfg(target_os = "linux")]
     let (uid, gid) = sys::user_ids(PARSE_USER)
         .ok_or_else(|| io::Error::other(format!("no {PARSE_USER} user, rerun install.sh")))?;
     if raw.metadata()?.len() > RESULT_SIZE {
@@ -106,23 +115,25 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     let (l, t) = (log_fd.as_raw_fd(), tar_fd.as_raw_fd());
     // the running binary itself, not its path: an upgrade while VMs run replaces
     // the file, and the old path would then point at nothing
-    let mut cmd = Command::new("/proc/self/exe");
+    let mut cmd = Command::new(sys::self_exe());
     cmd.arg(PARSE_ARG)
         .arg(if tar_out.is_some() { "1" } else { "0" })
         .stdin(Stdio::from(raw))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .env_clear()
-        .current_dir("/")
-        .uid(uid)
-        .gid(gid);
+        .current_dir("/");
+    // on macOS burner runs as you and has no other user to switch to: the
+    // parser is still its own process under the same rlimits
+    #[cfg(target_os = "linux")]
+    cmd.uid(uid).gid(gid);
     // SAFETY: dup2 and setrlimit only, both async-signal-safe on linux
     unsafe {
         cmd.pre_exec(move || {
             sys::dup_to(l, 3)?;
             sys::dup_to(t, 4)?;
+            sys::limit_child(MEM_LIMIT)?;
             sys::limit_child(&[
-                (libc::RLIMIT_AS, 512 << 20),
                 (libc::RLIMIT_CPU, 30),
                 (libc::RLIMIT_FSIZE, RESULT_SIZE + (8 << 20)),
                 (libc::RLIMIT_CORE, 0),

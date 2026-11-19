@@ -271,6 +271,13 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         }
         net = ceiling;
     }
+    #[cfg(target_os = "macos")]
+    if net != net::Mode::None {
+        if !a.net_default {
+            return Err(usage("VMs on macOS have no network yet, only --net none"));
+        }
+        net = net::Mode::None;
+    }
     if net != net::Mode::None {
         reaper_alive(cfg)?;
         if cfg.net.block_public_ip && net::public_ip(cfg).is_none() {

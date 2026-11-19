@@ -1,6 +1,7 @@
 #[cfg_attr(target_os = "macos", path = "cgroup_macos.rs")]
 mod cgroup;
 mod config;
+#[cfg_attr(target_os = "macos", path = "doctor_macos.rs")]
 mod doctor;
 #[cfg(target_os = "macos")]
 mod krun;
@@ -23,7 +24,7 @@ use config::Config;
 #[command(version, about)]
 struct Cli {
     /// config file
-    #[arg(long, global = true, default_value = config::DEFAULT_PATH)]
+    #[arg(long, global = true, default_value_os_t = config::default_path())]
     config: PathBuf,
     #[command(subcommand)]
     cmd: Cmd,
@@ -65,6 +66,8 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "macos")]
+    sys::self_exe();
     // as root, helpers (ip, nft, mkfs.ext4, curl) never come from the caller's
     // PATH: sudo doesn't always reset it
     // SAFETY: first thing in main, before any thread exists
@@ -104,6 +107,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }),
         Cmd::Run(a) => Ok(run::main(&cfg, a)),
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
+        #[cfg(target_os = "macos")]
+        Cmd::Net { .. } => {
+            anyhow::bail!("VMs on macOS have no network yet, so there's nothing to set up")
+        }
+        #[cfg(target_os = "linux")]
         Cmd::Net { action } => match action.as_str() {
             "show" => {
                 print!("{}", net::ruleset(&cfg)?);

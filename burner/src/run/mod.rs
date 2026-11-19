@@ -19,8 +19,14 @@ mod console;
 mod launch;
 mod plan;
 
-pub use admin::{kill, ls, reap, reaper_age};
-pub use launch::{VMM_OVERHEAD_MIB, main};
+#[cfg(target_os = "linux")]
+pub use admin::reaper_age;
+pub use admin::{kill, ls, reap};
+#[cfg(target_os = "linux")]
+pub use launch::VMM_OVERHEAD_MIB;
+pub use launch::main;
+#[cfg(target_os = "macos")]
+pub use launch::mkfs_bin;
 pub use plan::{RunArgs, ShellArgs, images, shell_main};
 
 pub const EXIT_USAGE: u8 = 2;

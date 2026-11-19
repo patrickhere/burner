@@ -6,7 +6,75 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
 pub const DEFAULT_PATH: &str = "/etc/burner/config.toml";
+
+#[cfg(target_os = "linux")]
+pub fn default_path() -> PathBuf {
+    DEFAULT_PATH.into()
+}
+
+/// on macOS burner runs as you, so everything it keeps is yours: the config,
+/// kernel and images in ~/Library/Application Support/burner
+#[cfg(target_os = "macos")]
+pub fn default_path() -> PathBuf {
+    support_dir().join("config.toml")
+}
+
+#[cfg(target_os = "macos")]
+fn support_dir() -> PathBuf {
+    home().join("Library/Application Support/burner")
+}
+
+/// from the user database, not $HOME, so it's the same dir however burner is started
+#[cfg(target_os = "macos")]
+fn home() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: getpwuid_r fills a passwd whose strings point into buf, which
+    // outlives the read of pw_dir
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut out = std::ptr::null_mut();
+        let mut buf = vec![0 as libc::c_char; 4096];
+        if libc::getpwuid_r(
+            libc::getuid(),
+            &mut pw,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut out,
+        ) == 0
+            && !out.is_null()
+            && !pw.pw_dir.is_null()
+        {
+            let dir = std::ffi::CStr::from_ptr(pw.pw_dir);
+            return PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+        }
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
+/// the per-user temp dir launchd hands out (what $TMPDIR is set to), only
+/// you can enter it. it doesn't depend on the environment burner got
+#[cfg(target_os = "macos")]
+fn user_temp() -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 1024];
+    // SAFETY: confstr writes at most buf.len() bytes, NUL included
+    let n = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if n == 0 || n > buf.len() {
+        return std::env::temp_dir();
+    }
+    buf.truncate(n - 1);
+    PathBuf::from(std::ffi::OsStr::from_bytes(&buf))
+}
 /// how many uids from jail.uid_base belong to VMs. also the most VMs at once
 pub const VM_UIDS: u32 = 1024;
 
@@ -80,11 +148,22 @@ impl Default for Jail {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Default for Paths {
     fn default() -> Self {
         Paths {
             root: "/var/lib/burner".into(),
             state: "/run/burner".into(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Default for Paths {
+    fn default() -> Self {
+        Paths {
+            root: support_dir(),
+            state: user_temp().join("burner"),
         }
     }
 }
@@ -102,6 +181,13 @@ impl Default for Net {
     }
 }
 
+// open (any port but mail) is something you opt into
+#[cfg(target_os = "linux")]
+const DEFAULT_NET: &str = "web";
+// VMs on macOS have no network yet
+#[cfg(target_os = "macos")]
+const DEFAULT_NET: &str = "none";
+
 impl Default for Limits {
     fn default() -> Self {
         Limits {
@@ -112,8 +198,7 @@ impl Default for Limits {
             ttl_shell_secs: 3600,
             max_vms: 2,
             total_mem_mib: 3072,
-            // open (any port but mail) is something you opt into
-            net: "web".into(),
+            net: DEFAULT_NET.into(),
             stdin_idle_secs: 60,
         }
     }
@@ -125,9 +210,12 @@ impl Config {
         // as root, a config decides what burner runs as root (paths.root holds
         // the jailer). only one that nobody but root could have written counts
         let via_sudo = std::env::var_os("SUDO_UID").is_some();
+        #[cfg(target_os = "linux")]
         if crate::sys::is_root() {
             trusted(path, via_sudo)?;
         }
+        #[cfg(target_os = "macos")]
+        trusted_mac(path)?;
         let cfg = match fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text).map_err(|e| {
                 // someone running burner through sudo doesn't get to read root's
@@ -232,6 +320,7 @@ pub fn mask(prefix: u8) -> u32 {
     }
 }
 
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
     let m = mask(a.1.min(b.1));
     u32::from(a.0) & m == u32::from(b.0) & m
@@ -252,6 +341,7 @@ fn default_route_iface() -> Option<String> {
 /// nobody else. a path other than the default has to exist, and through sudo it
 /// has to be in /etc/burner, so a sudo rule for burner can't be used to load
 /// some other root-owned file as a config
+#[cfg(target_os = "linux")]
 fn trusted(path: &Path, via_sudo: bool) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let real = match fs::canonicalize(path) {
@@ -276,7 +366,40 @@ fn trusted(path: &Path, via_sudo: bool) -> Result<()> {
     Ok(())
 }
 
+/// on macOS burner runs as you and only spends your own resources, so a config
+/// you could have written yourself is fine. one someone else could have written
+/// or swapped isn't: it picks the kernel and image your VMs boot, and with them
+/// what happens to anything you pipe in
+#[cfg(target_os = "macos")]
+fn trusted_mac(path: &Path) -> Result<()> {
+    match fs::canonicalize(path) {
+        Ok(real) => trusted_file(&real),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && path == default_path() => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("config {}", path.display())),
+    }
+}
+
+/// a file and every directory above it owned by you or root and writable by
+/// nobody else
+#[cfg(target_os = "macos")]
+pub fn trusted_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid can't fail
+    let me = unsafe { libc::getuid() };
+    for p in path.ancestors() {
+        let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
+        if (m.uid() != me && m.uid() != 0) || m.mode() & 0o022 != 0 {
+            bail!(
+                "{} is owned or writable by someone other than you or root, so burner won't use it",
+                p.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// ipv4 addresses on an interface, from `ip -j`
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn iface_addrs(iface: &str) -> Result<Vec<Ipv4Addr>> {
     let out = crate::sys::run_timeout(
         Command::new("ip").args(["-j", "-4", "addr", "show", "dev", iface]),

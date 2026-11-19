@@ -1,15 +1,19 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, chown};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::chown;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::json;
 
+#[cfg(target_os = "macos")]
+use super::admin::VM_DIRS;
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
 use super::console::{deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
@@ -29,6 +33,10 @@ const STDIN_CAP: u64 = 512 << 20;
 const STDIN_TOTAL: Duration = Duration::from_secs(600);
 const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(target_os = "linux")]
+const VMM: &str = "firecracker";
+#[cfg(target_os = "macos")]
+const VMM: &str = "libkrun";
 /// the guest init protocol this burner speaks (guest/init has the same number)
 const GUEST_PROTO: u32 = 1;
 
@@ -40,9 +48,11 @@ fn guest_limit(ttl: u32) -> u32 {
 
 /// what the VM's cgroup may use on top of guest RAM: firecracker itself, plus
 /// host page cache from writes to its disks, which is charged to the same cgroup
+#[cfg(target_os = "linux")]
 pub const VMM_OVERHEAD_MIB: u64 = 256;
 /// past this much over guest RAM the kernel starts flushing and throttling the
 /// VM's writes, long before the hard limit would kill firecracker
+#[cfg(target_os = "linux")]
 const VMM_SOFT_MIB: u64 = 64;
 /// setup (disks, tap) has this long before the reaper stops the wrapper
 const PREP_SECS: u32 = 180;
@@ -104,19 +114,30 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
+    #[cfg(target_os = "linux")]
     if !sys::is_root() {
         return Err(usage("burner run needs root (sudo burner run ...)"));
     }
+    #[cfg(target_os = "macos")]
+    if sys::is_root() {
+        return Err(usage("on macOS burner runs as you, without sudo"));
+    }
     let p = plan(cfg, a)?;
     // the parser reads what a VM wrote, so it must never share an id with one
-    let (pu, pg) = sys::user_ids(result::PARSE_USER)
-        .with_context(|| format!("no {} user, see burner doctor", result::PARSE_USER))?;
-    if cfg.vm_uids().contains(&pu) || cfg.vm_uids().contains(&pg) {
-        anyhow::bail!(
-            "{} has a uid or gid in the VM range (jail.uid_base), see burner doctor",
-            result::PARSE_USER
-        );
+    #[cfg(target_os = "linux")]
+    {
+        let (pu, pg) = sys::user_ids(result::PARSE_USER)
+            .with_context(|| format!("no {} user, see burner doctor", result::PARSE_USER))?;
+        if cfg.vm_uids().contains(&pu) || cfg.vm_uids().contains(&pg) {
+            anyhow::bail!(
+                "{} has a uid or gid in the VM range (jail.uid_base), see burner doctor",
+                result::PARSE_USER
+            );
+        }
     }
+    // no reaper timer on macOS: each run first cleans up after dead ones
+    #[cfg(target_os = "macos")]
+    let _ = super::admin::reap(cfg);
     let runs = cfg.paths.root.join("run");
     fs::create_dir_all(&runs)?;
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
@@ -181,207 +202,22 @@ fn run_vm(
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     *held = Some(());
 
-    let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
-    let root = jail.join("root");
-    fs::create_dir_all(jail.parent().context("jail path")?)?;
-    // only root walks these: firecracker sees nothing above its chroot. the job
-    // tar and the VM config sit in here before the jailer locks the root down,
-    // and other users on the host must not read them meanwhile
-    for d in [
-        cfg.paths.root.join("jail"),
-        cfg.paths.root.join("jail/firecracker"),
-    ] {
-        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
-    }
-    // fresh dirs only: a jail left over from anything else is never reused
-    fs::create_dir(&jail).context("creating the jail (left over from an earlier run?)")?;
-    fs::create_dir(&root)?;
-    for d in [&jail, &root] {
-        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
-    }
-    // hard links, not copies: instant, and the jailer can't follow a symlink out.
-    // that needs the kernel, images and jail on one filesystem under paths.root
-    let same_fs = "the kernel, images and jail dirs have to be on one filesystem (paths.root)";
-    fs::hard_link(
-        fs::canonicalize(cfg.paths.root.join("kernel/vmlinux"))?,
-        root.join("vmlinux"),
-    )
-    .context(same_fs)?;
-    fs::hard_link(
-        cfg.paths
-            .root
-            .join("images")
-            .join(&p.img)
-            .join("rootfs.ext4"),
-        root.join("rootfs.ext4"),
-    )
-    .context(same_fs)?;
-    fs::rename(&job, root.join("job.tar"))?;
-    chown(root.join("job.tar"), Some(uid), Some(uid))?;
-    let scratch = root.join("scratch.ext4");
-    reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
-    prep_ok(cfg, id)?;
-    mkfs(&scratch, cfg, id)?;
-    let raw = root.join("result.raw");
-    reserve(cfg, &raw, result::RESULT_SIZE)?;
-    // opened now, before anything runs as the VM's uid, and read through this fd
-    // later: the path inside the jail can't be swapped for something else
-    let raw_fd = File::open(&raw)?;
-    for f in [&scratch, &raw] {
-        chown(f, Some(uid), Some(uid))?;
-        fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
-    }
-
-    prep_ok(cfg, id)?;
-    let token = sys::random_hex(8)?;
-    let mut boot = format!(
-        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token} burner.proto={GUEST_PROTO}"
-    );
-    if !p.shell {
-        boot += &format!(" burner.limit={}", guest_limit(p.ttl));
-    }
-    let mut ifaces = Vec::new();
-    if let Some(i) = net_slot {
-        let s = net::tap_up(cfg, i, p.net, uid)?;
-        let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
-        ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
-                           "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
-        let dns: Vec<String> = cfg.net.resolvers.iter().map(|r| r.to_string()).collect();
-        boot += &format!(
-            " ip={}::{}:255.255.255.252:burner:eth0:off burner.dns={}",
-            s.guest,
-            s.host,
-            dns.join(",")
-        );
-    }
     let saved_tty = p.shell.then(sys::save_tty).flatten();
-    if p.shell {
-        let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
-        let term = std::env::var("TERM").ok().filter(|t| {
-            !t.is_empty()
-                && t.len() <= 32
-                && t.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
-        });
-        boot += &format!(
-            " burner.shell=1 burner.tty={}x{} burner.term={}",
-            rows.min(500),
-            cols.min(1000),
-            term.as_deref().unwrap_or("xterm")
-        );
-    }
-    let drive = |id: &str, path: &str, ro: bool, mbps: u64, ops: u64| {
-        json!({"drive_id": id, "path_on_host": path, "is_root_device": id == "rootfs", "is_read_only": ro,
-               "rate_limiter": {"bandwidth": {"size": mbps << 20, "refill_time": 1000},
-                                "ops": {"size": ops, "refill_time": 1000}}})
-    };
-    let vmcfg = json!({
-        "boot-source": {"kernel_image_path": "vmlinux", "boot_args": boot},
-        "drives": [drive("rootfs", "rootfs.ext4", true, 200, 5000), drive("scratch", "scratch.ext4", false, 100, 3000),
-                   drive("job", "job.tar", true, 200, 3000), drive("result", "result.raw", false, 100, 3000)],
-        "machine-config": {"vcpu_count": p.vcpus, "mem_size_mib": p.mem_mib},
-        "network-interfaces": ifaces,
-    });
-    fs::write(root.join("vm.json"), serde_json::to_vec(&vmcfg)?)?;
-    fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o600))?;
-    chown(root.join("vm.json"), Some(uid), Some(uid))?;
-
-    let deadline = Deadline::in_secs(p.ttl);
-    let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
-    {
-        let led = Ledger::open(&cfg.paths.state)?;
-        let cur = led.get(id).context("ledger entry vanished")?;
-        if cur.cancel {
-            return Err(Exit(EXIT_INTERRUPTED, "cancelled before start".into()).into());
-        }
-        if cur.deadline_boot.is_some_and(|d| sys::boottime() > d) {
-            return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
-        }
-        led.update(id, |v| {
-            v.status = Status::Running;
-            v.deadline_boot = Some(deadline.0);
-        })?;
-    }
-    if is_interrupted() {
-        return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
-    }
-    let fclog = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(jail.join("firecracker.log"))?;
-    // bin is a symlink the installer switches in one rename; resolve it once so
-    // this launch uses a jailer and a firecracker from the same release
-    let bin = fs::canonicalize(cfg.paths.root.join("bin")).context("no firecracker installed")?;
-    let mut jailer = Command::new(bin.join("jailer"));
-    // own process group so a ctrl-c meant for burner doesn't hit the VM first.
-    // firecracker never sees the caller's terminal, even for a shell: burner relays it
-    jailer.process_group(0);
-    let me = std::process::id() as libc::pid_t;
-    // SAFETY: join_from_child only makes plain syscalls (prctl, getppid, open, write, close)
-    unsafe {
-        jailer.pre_exec(move || cgroup::join_from_child(&procs, me));
-    }
-    // no --new-pid-ns: with it the jailer exits right after cloning firecracker,
-    // and burner watches this child's exit and status as the VM's
-    let mut child = jailer
-        .args(["--id", id, "--exec-file"])
-        .arg(bin.join("firecracker"))
-        .args([
-            "--uid",
-            &uid.to_string(),
-            "--gid",
-            &uid.to_string(),
-            "--chroot-base-dir",
-        ])
-        .arg(cfg.paths.root.join("jail"))
-        .args(["--cgroup-version", "2", "--parent-cgroup", cgroup::PARENT])
-        .args([
-            "--cgroup",
-            &format!("cpu.max={} 100000", u64::from(p.vcpus) * 100_000),
-        ])
-        .args([
-            "--cgroup",
-            &format!(
-                "memory.high={}",
-                (u64::from(p.mem_mib) + VMM_SOFT_MIB) << 20
-            ),
-        ])
-        .args([
-            "--cgroup",
-            &format!(
-                "memory.max={}",
-                (u64::from(p.mem_mib) + VMM_OVERHEAD_MIB) << 20
-            ),
-        ])
-        .args(["--cgroup", "pids.max=128"])
-        .args([
-            "--",
-            "--no-api",
-            "--config-file",
-            "vm.json",
-            "--level",
-            "Error",
-        ])
-        .stdin(if p.shell {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(fclog)
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .spawn()
-        .context("starting the jailer")?;
+    let Vmm {
+        mut child,
+        log: vmm_log,
+        raw: raw_fd,
+        token,
+        deadline,
+    } = launch(cfg, p, id, &job, net_slot, uid)?;
     if p.shell {
         let outcome = relay(&mut child, &token, deadline, cfg, id);
         sys::restore_tty(saved_tty.as_ref());
         if matches!(outcome, Outcome::Failed) {
-            // the jail and its firecracker.log are gone after teardown
-            let tail = tail_of(&jail.join("firecracker.log"), 1500);
+            // the VM's dir and its log are gone after teardown
+            let tail = tail_of(&vmm_log, 1500);
             log_line(&format!(
-                "{id}: firecracker failed: {}",
+                "{id}: {VMM} failed: {}",
                 String::from_utf8_lossy(&escape_controls(&tail)).trim()
             ));
         }
@@ -480,7 +316,7 @@ fn run_vm(
                 &cfg.paths.state,
             );
             let fc_tail = if meta.rc.is_none() {
-                tail_of(&jail.join("firecracker.log"), 1500)
+                tail_of(&vmm_log, 1500)
             } else {
                 Vec::new()
             };
@@ -498,7 +334,7 @@ fn run_vm(
                 diag.put(format!("burner: {pr}\n").as_bytes(), None);
             }
             if !fc_tail.iter().all(u8::is_ascii_whitespace) {
-                diag.put(b"burner: firecracker: ", None);
+                diag.put(format!("burner: {VMM}: ").as_bytes(), None);
                 diag.put(&escape_controls(&fc_tail), None);
                 diag.put(b"\n", None);
             }
@@ -563,6 +399,370 @@ fn run_vm(
         t0.elapsed().as_secs_f64()
     ));
     Ok(code)
+}
+
+/// a started VM: its VMM process, that VMM's log, the result disk (opened
+/// before the VM could touch it) and what the console markers are keyed on
+struct Vmm {
+    child: Child,
+    log: PathBuf,
+    raw: File,
+    token: String,
+    deadline: Deadline,
+}
+
+/// set up the jail and start firecracker under the jailer
+#[cfg(target_os = "linux")]
+fn launch(
+    cfg: &Config,
+    p: &Plan,
+    id: &str,
+    job: &Path,
+    net_slot: Option<u32>,
+    uid: u32,
+) -> Result<Vmm> {
+    let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
+    let root = jail.join("root");
+    fs::create_dir_all(jail.parent().context("jail path")?)?;
+    // only root walks these: firecracker sees nothing above its chroot. the job
+    // tar and the VM config sit in here before the jailer locks the root down,
+    // and other users on the host must not read them meanwhile
+    for d in [
+        cfg.paths.root.join("jail"),
+        cfg.paths.root.join("jail/firecracker"),
+    ] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
+    }
+    // fresh dirs only: a jail left over from anything else is never reused
+    fs::create_dir(&jail).context("creating the jail (left over from an earlier run?)")?;
+    fs::create_dir(&root)?;
+    for d in [&jail, &root] {
+        fs::set_permissions(d, fs::Permissions::from_mode(0o700))?;
+    }
+    // hard links, not copies: instant, and the jailer can't follow a symlink out.
+    // that needs the kernel, images and jail on one filesystem under paths.root
+    let same_fs = "the kernel, images and jail dirs have to be on one filesystem (paths.root)";
+    fs::hard_link(
+        fs::canonicalize(cfg.paths.root.join("kernel/vmlinux"))?,
+        root.join("vmlinux"),
+    )
+    .context(same_fs)?;
+    fs::hard_link(
+        cfg.paths
+            .root
+            .join("images")
+            .join(&p.img)
+            .join("rootfs.ext4"),
+        root.join("rootfs.ext4"),
+    )
+    .context(same_fs)?;
+    fs::rename(job, root.join("job.tar"))?;
+    chown(root.join("job.tar"), Some(uid), Some(uid))?;
+    let scratch = root.join("scratch.ext4");
+    reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
+    prep_ok(cfg, id)?;
+    mkfs(&scratch, cfg, id)?;
+    let raw = root.join("result.raw");
+    reserve(cfg, &raw, result::RESULT_SIZE)?;
+    // opened now, before anything runs as the VM's uid, and read through this fd
+    // later: the path inside the jail can't be swapped for something else
+    let raw_fd = File::open(&raw)?;
+    for f in [&scratch, &raw] {
+        chown(f, Some(uid), Some(uid))?;
+        fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
+    }
+
+    prep_ok(cfg, id)?;
+    let token = sys::random_hex(8)?;
+    let mut boot = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off quiet loglevel=1 init=/sbin/burner-init burner.token={token} burner.proto={GUEST_PROTO}"
+    );
+    if !p.shell {
+        boot += &format!(" burner.limit={}", guest_limit(p.ttl));
+    }
+    let mut ifaces = Vec::new();
+    if let Some(i) = net_slot {
+        let s = net::tap_up(cfg, i, p.net, uid)?;
+        let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
+        ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
+                           "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
+        let dns: Vec<String> = cfg.net.resolvers.iter().map(|r| r.to_string()).collect();
+        boot += &format!(
+            " ip={}::{}:255.255.255.252:burner:eth0:off burner.dns={}",
+            s.guest,
+            s.host,
+            dns.join(",")
+        );
+    }
+    if p.shell {
+        boot += &shell_args();
+    }
+    let drive = |id: &str, path: &str, ro: bool, mbps: u64, ops: u64| {
+        json!({"drive_id": id, "path_on_host": path, "is_root_device": id == "rootfs", "is_read_only": ro,
+               "rate_limiter": {"bandwidth": {"size": mbps << 20, "refill_time": 1000},
+                                "ops": {"size": ops, "refill_time": 1000}}})
+    };
+    let vmcfg = json!({
+        "boot-source": {"kernel_image_path": "vmlinux", "boot_args": boot},
+        "drives": [drive("rootfs", "rootfs.ext4", true, 200, 5000), drive("scratch", "scratch.ext4", false, 100, 3000),
+                   drive("job", "job.tar", true, 200, 3000), drive("result", "result.raw", false, 100, 3000)],
+        "machine-config": {"vcpu_count": p.vcpus, "mem_size_mib": p.mem_mib},
+        "network-interfaces": ifaces,
+    });
+    fs::write(root.join("vm.json"), serde_json::to_vec(&vmcfg)?)?;
+    fs::set_permissions(root.join("vm.json"), fs::Permissions::from_mode(0o600))?;
+    chown(root.join("vm.json"), Some(uid), Some(uid))?;
+
+    let deadline = Deadline::in_secs(p.ttl);
+    let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
+    go_live(cfg, id, deadline)?;
+    let fclog = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(jail.join("firecracker.log"))?;
+    // bin is a symlink the installer switches in one rename; resolve it once so
+    // this launch uses a jailer and a firecracker from the same release
+    let bin = fs::canonicalize(cfg.paths.root.join("bin")).context("no firecracker installed")?;
+    let mut jailer = Command::new(bin.join("jailer"));
+    // own process group so a ctrl-c meant for burner doesn't hit the VM first.
+    // firecracker never sees the caller's terminal, even for a shell: burner relays it
+    jailer.process_group(0);
+    let me = std::process::id() as libc::pid_t;
+    // SAFETY: join_from_child only makes plain syscalls (prctl, getppid, open, write, close)
+    unsafe {
+        jailer.pre_exec(move || cgroup::join_from_child(&procs, me));
+    }
+    // no --new-pid-ns: with it the jailer exits right after cloning firecracker,
+    // and burner watches this child's exit and status as the VM's
+    let child = jailer
+        .args(["--id", id, "--exec-file"])
+        .arg(bin.join("firecracker"))
+        .args([
+            "--uid",
+            &uid.to_string(),
+            "--gid",
+            &uid.to_string(),
+            "--chroot-base-dir",
+        ])
+        .arg(cfg.paths.root.join("jail"))
+        .args(["--cgroup-version", "2", "--parent-cgroup", cgroup::PARENT])
+        .args([
+            "--cgroup",
+            &format!("cpu.max={} 100000", u64::from(p.vcpus) * 100_000),
+        ])
+        .args([
+            "--cgroup",
+            &format!(
+                "memory.high={}",
+                (u64::from(p.mem_mib) + VMM_SOFT_MIB) << 20
+            ),
+        ])
+        .args([
+            "--cgroup",
+            &format!(
+                "memory.max={}",
+                (u64::from(p.mem_mib) + VMM_OVERHEAD_MIB) << 20
+            ),
+        ])
+        .args(["--cgroup", "pids.max=128"])
+        .args([
+            "--",
+            "--no-api",
+            "--config-file",
+            "vm.json",
+            "--level",
+            "Error",
+        ])
+        .stdin(if p.shell {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(fclog)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .spawn()
+        .context("starting the jailer")?;
+    Ok(Vmm {
+        child,
+        log: jail.join("firecracker.log"),
+        raw: raw_fd,
+        token,
+        deadline,
+    })
+}
+
+/// macOS: no jailer, no chroot, no uid of its own. the VM's dir holds its
+/// disks, libkrun opens the kernel and image where they are, and the VMM is
+/// this binary again (vmm-krun) in its own process group
+#[cfg(target_os = "macos")]
+fn launch(
+    cfg: &Config,
+    p: &Plan,
+    id: &str,
+    job: &Path,
+    _net_slot: Option<u32>,
+    _uid: u32,
+) -> Result<Vmm> {
+    let vms = cfg.paths.root.join(VM_DIRS);
+    let dir = vms.join(id);
+    sys::private_dir(&vms)?;
+    // fresh dirs only: a VM dir left over from anything else is never reused
+    fs::create_dir(&dir).context("creating the VM's dir (left over from an earlier run?)")?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let kernel = fs::canonicalize(cfg.paths.root.join("kernel/vmlinux")).with_context(|| {
+        format!(
+            "no kernel at {}",
+            cfg.paths.root.join("kernel/vmlinux").display()
+        )
+    })?;
+    let rootfs = fs::canonicalize(
+        cfg.paths
+            .root
+            .join("images")
+            .join(&p.img)
+            .join("rootfs.ext4"),
+    )?;
+    for f in [&kernel, &rootfs] {
+        config::trusted_file(f)?;
+    }
+    let job_disk = dir.join("job.tar");
+    fs::rename(job, &job_disk)?;
+    let scratch = dir.join("scratch.ext4");
+    reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
+    prep_ok(cfg, id)?;
+    mkfs(&scratch, cfg, id)?;
+    let raw = dir.join("result.raw");
+    reserve(cfg, &raw, result::RESULT_SIZE)?;
+    let raw_fd = File::open(&raw)?;
+    for f in [&scratch, &raw] {
+        fs::set_permissions(f, fs::Permissions::from_mode(0o600))?;
+    }
+
+    prep_ok(cfg, id)?;
+    let token = sys::random_hex(8)?;
+    // guest init runs a shell on ttyS0, firecracker's serial port. this kernel
+    // has no driver for libkrun's, so a shell boots through sh first, which
+    // makes ttyS0 the virtio console (hvc0, 229:0) in devtmpfs, the same
+    // devtmpfs guest init mounts again later
+    let init = if p.shell {
+        "/bin/sh"
+    } else {
+        "/sbin/burner-init"
+    };
+    let mut boot = format!(
+        "console=hvc0 reboot=k panic=1 pci=off quiet loglevel=1 root=/dev/vda ro init={init} burner.token={token} burner.proto={GUEST_PROTO}"
+    );
+    if !p.shell {
+        boot += &format!(" burner.limit={}", guest_limit(p.ttl));
+    }
+    if p.shell {
+        boot += &shell_args();
+        boot +=
+            " -- -c \"rm -f /dev/ttyS0; mknod -m 600 /dev/ttyS0 c 229 0; exec /sbin/burner-init\"";
+    }
+
+    let deadline = Deadline::in_secs(p.ttl);
+    let procs = cgroup::prepare(id).context("creating the VM's record dir")?;
+    go_live(cfg, id, deadline)?;
+    let log = dir.join("vmm.log");
+    let vlog = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&log)?;
+    let mut vmm = Command::new(sys::self_exe());
+    // own process group so a ctrl-c meant for burner doesn't hit the VM first,
+    // and so kill takes the group
+    vmm.process_group(0);
+    let me = std::process::id() as libc::pid_t;
+    // SAFETY: join_from_child only calls getppid
+    unsafe {
+        vmm.pre_exec(move || cgroup::join_from_child(&procs, me));
+    }
+    let mut child = vmm
+        .arg("vmm-krun")
+        .arg("--kernel")
+        .arg(&kernel)
+        .arg("--rootfs")
+        .arg(&rootfs)
+        .arg("--scratch")
+        .arg(&scratch)
+        .arg("--job")
+        .arg(&job_disk)
+        .arg("--result")
+        .arg(&raw)
+        .args(["--cpus", &p.vcpus.min(255).to_string()])
+        .args(["--mem", &p.mem_mib.to_string()])
+        .args(["--cmdline", &boot])
+        // the VMM's own backstop, when the reaper would have stopped it on linux
+        .args(["--until", &format!("{:.1}", deadline.0 + 5.0)])
+        .args(p.shell.then_some("--stdin"))
+        .stdin(if p.shell {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(vlog)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .current_dir("/")
+        .spawn()
+        .context("starting the VMM")?;
+    if let Err(e) = cgroup::record(id, child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e).context("recording the VMM");
+    }
+    Ok(Vmm {
+        child,
+        log,
+        raw: raw_fd,
+        token,
+        deadline,
+    })
+}
+
+/// what guest init needs to run a shell on the caller's terminal
+fn shell_args() -> String {
+    let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
+    let term = std::env::var("TERM").ok().filter(|t| {
+        !t.is_empty()
+            && t.len() <= 32
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
+    });
+    format!(
+        " burner.shell=1 burner.tty={}x{} burner.term={}",
+        rows.min(500),
+        cols.min(1000),
+        term.as_deref().unwrap_or("xterm")
+    )
+}
+
+/// the last check before the VM starts, and the switch to running with its deadline
+fn go_live(cfg: &Config, id: &str, deadline: Deadline) -> Result<()> {
+    {
+        let led = Ledger::open(&cfg.paths.state)?;
+        let cur = led.get(id).context("ledger entry vanished")?;
+        if cur.cancel {
+            return Err(Exit(EXIT_INTERRUPTED, "cancelled before start".into()).into());
+        }
+        if cur.deadline_boot.is_some_and(|d| sys::boottime() > d) {
+            return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
+        }
+        led.update(id, |v| {
+            v.status = Status::Running;
+            v.deadline_boot = Some(deadline.0);
+        })?;
+    }
+    if is_interrupted() {
+        return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
+    }
+    Ok(())
 }
 
 /// read the caller's stdin before taking a slot, with idle and total deadlines
@@ -806,7 +1006,7 @@ fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
 }
 
 fn mkfs(path: &Path, cfg: &Config, id: &str) -> Result<()> {
-    let mut c = Command::new("mkfs.ext4")
+    let mut c = Command::new(mkfs_bin())
         .args([
             "-q",
             "-F",
@@ -836,6 +1036,28 @@ fn mkfs(path: &Path, cfg: &Config, id: &str) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[cfg(target_os = "linux")]
+fn mkfs_bin() -> PathBuf {
+    "mkfs.ext4".into()
+}
+
+/// homebrew's e2fsprogs is keg-only, so mkfs.ext4 is usually not on PATH
+#[cfg(target_os = "macos")]
+pub fn mkfs_bin() -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(
+            [
+                "/opt/homebrew/opt/e2fsprogs/sbin",
+                "/usr/local/opt/e2fsprogs/sbin",
+            ]
+            .map(PathBuf::from),
+        )
+        .map(|d| d.join("mkfs.ext4"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| "mkfs.ext4".into())
 }
 
 fn tail_of(path: &Path, n: u64) -> Vec<u8> {

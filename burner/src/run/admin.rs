@@ -183,6 +183,9 @@ pub fn log_line(msg: &str) {
 // ---- ls, kill, reap ----
 
 pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
+    // no reaper timer on macOS: don't list VMs whose wrapper is long gone
+    #[cfg(target_os = "macos")]
+    let _ = reap(cfg);
     let now = sys::boottime();
     let mut vms = Ledger::open(&cfg.paths.state)?.all();
     vms.sort_by_key(|v| v.started);
@@ -391,6 +394,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         .into_iter()
         .map(|v| v.id)
         .collect();
+    #[cfg(target_os = "linux")]
     for i in net::reap_orphan_taps(cfg) {
         log_line(&format!("reap orphan tap {i}"));
     }
@@ -426,8 +430,11 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
             remove_tree(&e.path());
         }
     }
-    net::refresh_public_ip(cfg);
-    net::check(cfg);
+    #[cfg(target_os = "linux")]
+    {
+        net::refresh_public_ip(cfg);
+        net::check(cfg);
+    }
     let _ = fs::write(
         cfg.paths.state.join(REAPED),
         format!("{}\n", sys::boottime()),

@@ -12,9 +12,6 @@ use std::sync::OnceLock;
 use crate::ledger::Ident;
 use crate::sys;
 
-/// only the linux jailer takes this, as its parent cgroup
-pub const PARENT: &str = "burner";
-
 static DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// where the records live, under the state dir. set once the config is loaded
@@ -69,6 +66,19 @@ fn live(id: &str) -> io::Result<Option<(Ident, bool)>> {
         .map(|(_, zombie)| (r, zombie)))
 }
 
+/// write down the VMM burner just spawned
+pub fn record(id: &str, pid: u32) -> io::Result<()> {
+    let (start, _) = started(pid).ok_or_else(|| io::Error::from_raw_os_error(libc::ESRCH))?;
+    let r = Ident {
+        pid,
+        start,
+        boot: sys::boot_id(),
+    };
+    let tmp = dir().join(format!("{id}.tmp"));
+    fs::write(&tmp, serde_json::to_vec(&r)?)?;
+    fs::rename(tmp, path(id))
+}
+
 /// a VM has no OOM killer of its own on macOS: hypervisor.framework memory is
 /// the VMM's memory, and the host swaps before it kills
 pub fn oom_kills(_id: &str) -> u64 {
@@ -92,6 +102,8 @@ pub fn kill(id: &str) {
     }
 }
 
+/// only net down takes every VM down at once, and on macOS VMs have no network yet
+#[allow(dead_code)]
 pub fn kill_all() {
     for e in fs::read_dir(dir()).into_iter().flatten().flatten() {
         if let Some(id) = e.file_name().to_str()

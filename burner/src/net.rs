@@ -1,6 +1,8 @@
 //! the VM network: every VM gets a tap and its own /30 out of net.subnet, and
 //! one nft table lets those taps reach the internet through the uplink and
 //! nothing else (not the LAN, not the host, not each other).
+//! VMs on macOS have no network yet, so there it's all unused
+#![cfg_attr(target_os = "macos", allow(dead_code))]
 
 use std::net::Ipv4Addr;
 use std::process::Command;
