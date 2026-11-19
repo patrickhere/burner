@@ -1,5 +1,18 @@
 # changelog
 
+## 0.2.0
+
+- native on apple silicon: any M1 or newer with macOS 15 or later. no linux VM in between, burner boots each VM itself with libkrun on hypervisor.framework and runs as you, no sudo
+- on a mac each VM's network is its own `burner macnet` process: a user-space tcp/ip stack under a seatbelt sandbox, with the same blocks as linux for the LAN, the host, other VMs and anything off the default route. no ping and no udp but dns yet
+- `burner setup` on a mac installs the guest kernel and alpine image homebrew fetched, the kernel checked against the sha256 built into burner. `--version TAG` or `--from DIR` to get them elsewhere
+- homebrew: `brew install burnervm/tap/burner` builds and signs burner and pulls in libkrun and e2fsprogs. the lima setup from 0.1.x is gone, `limactl delete burnervm` cleans it up
+- `get.sh` installs the native version on a mac
+- `burner shell` was reviewed from the outside and 32 problems fixed: guest output can't clear your scrollback, change tab stops or leave modes on, and the terminal reset gets through even when your terminal stalls. resizes reach the guest, `exit 3` comes back as 3, a crash or panic is 125, `poweroff`, `halt` and `reboot` end the session, `~.` works when the VM stops reading, a pasted `~.` stays text, and keys typed during boot wait for the shell
+- `burner kill` makes the run exit 130 every time, not 125 when the VM died between two checks
+- `burner-tui` reads the terminal itself: no held keys after a resize or after the shell, and a killed burner doesn't leave the terminal raw
+- release assets: the aarch64 guest kernel, a gzipped alpine image and its package list with versions, all in SHA256SUMS and the build provenance
+- images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
+
 ## 0.1.1
 
 - a run ends when its command ends, even with something left running in the background
