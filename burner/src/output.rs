@@ -25,7 +25,8 @@ pub struct Out {
 
 enum Chunk {
     Data(Vec<u8>),
-    Last(Vec<u8>),
+    /// the screen's reset, made when the writer gets to it
+    Reset,
 }
 
 pub enum Dest {
@@ -34,44 +35,53 @@ pub enum Dest {
 }
 
 impl Out {
-    /// bytes go out as they are; for the shell relay, which filters on its own
-    pub fn new_unescaped(dest: Dest) -> Out {
-        let mut o = Out::new(dest);
-        o.tty = false;
-        o
-    }
-
     pub fn new(dest: Dest) -> Out {
         let (fd, w): (i32, Box<dyn Write + Send>) = match dest {
             Dest::Stdout => (1, Box::new(std::io::stdout())),
             Dest::Stderr => (2, Box::new(std::io::stderr())),
         };
-        Out::to(w, crate::sys::is_tty(fd))
+        Out::to(w, crate::sys::is_tty(fd), None)
     }
 
-    fn to(mut w: Box<dyn Write + Send>, tty: bool) -> Out {
+    /// stdout for the shell relay: bytes go out as they are (TermFilter has
+    /// done its part), and the writer keeps a Screen of what it really wrote
+    pub fn new_screen() -> Out {
+        Out::to(
+            Box::new(std::io::stdout()),
+            false,
+            Some(Arc::new(Mutex::new(Screen::default()))),
+        )
+    }
+
+    fn to(mut w: Box<dyn Write + Send>, tty: bool, screen: Option<Arc<Mutex<Screen>>>) -> Out {
         let (tx, rx) = mpsc::channel::<Chunk>();
         let queued = Arc::new(AtomicUsize::new(0));
         let broken = Arc::new(AtomicBool::new(false));
         let skip = Arc::new(AtomicBool::new(false));
         let last_done = Arc::new(AtomicBool::new(false));
-        let (q, b, sk, done) = (
+        let (q, b, sk, done, scr) = (
             queued.clone(),
             broken.clone(),
             skip.clone(),
             last_done.clone(),
+            screen,
         );
+        let lock = |s: &Arc<Mutex<Screen>>| s.lock().unwrap_or_else(|e| e.into_inner()).clone();
         std::thread::spawn(move || {
             for c in rx {
                 let (chunk, last) = match c {
                     Chunk::Data(v) => (v, false),
-                    Chunk::Last(v) => (v, true),
+                    Chunk::Reset => (
+                        scr.as_ref().map(|s| lock(s).reset()).unwrap_or_default(),
+                        true,
+                    ),
                 };
-                if !b.load(Ordering::Relaxed)
-                    && (last || !sk.load(Ordering::Relaxed))
-                    && (w.write_all(&chunk).is_err() || w.flush().is_err())
-                {
-                    b.store(true, Ordering::Relaxed);
+                if !b.load(Ordering::Relaxed) && (last || !sk.load(Ordering::Relaxed)) {
+                    if w.write_all(&chunk).is_err() || w.flush().is_err() {
+                        b.store(true, Ordering::Relaxed);
+                    } else if let Some(s) = &scr {
+                        s.lock().unwrap_or_else(|e| e.into_inner()).feed(&chunk);
+                    }
                 }
                 if last {
                     done.store(true, Ordering::Relaxed);
@@ -152,15 +162,16 @@ impl Out {
         }
     }
 
-    /// drops whatever is still queued and writes `last` next, past the queue
-    /// cap. for the shell's terminal reset: a reader that stalled behind a
-    /// pile of guest output still gets it, and gets it last
-    pub fn finish(&self, last: &[u8]) {
+    /// drops whatever is still queued and writes the screen's reset next, past
+    /// the queue cap: a reader that stalled behind a pile of guest output still
+    /// gets it, and gets it last. it's made from what was really written, so
+    /// an alt screen whose way back was dropped still gets left
+    pub fn finish_reset(&self) {
         self.skip.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(Chunk::Last(last.to_vec()));
+        let _ = self.tx.send(Chunk::Reset);
     }
 
-    /// waits until finish's chunk is written, the writer broke, or `give_up`
+    /// waits until finish_reset's chunk is written, the writer broke, or `give_up`
     pub fn wait_last(&self, give_up: impl Fn() -> bool) {
         while !self.last_done.load(Ordering::Relaxed)
             && !self.broken.load(Ordering::Relaxed)
@@ -259,8 +270,9 @@ fn unfinished_tail(b: &[u8]) -> usize {
 /// shell`: text, colors, cursor movement, erasing and a few screen modes. it
 /// drops every query (the terminal would type the answer into the VM), mouse
 /// reporting, OSC/DCS/APC/PM/SOS strings (titles, clipboard, hyperlinks), C1
-/// controls and anything it doesn't know. keeps its state across reads, and
-/// tracks what it let through that has to be undone when the shell ends
+/// controls and anything it doesn't know. keeps its state across reads. the
+/// alt screen modes 47 and 1047 go out as 1049, so there's one way back
+#[derive(Default)]
 pub struct TermFilter {
     st: FState,
     seq: Vec<u8>,
@@ -268,21 +280,48 @@ pub struct TermFilter {
     str_len: usize,
     /// the terminal isn't utf-8: non-ascii chars go out as ?
     ascii: bool,
+}
+
+/// the caller's terminal as the shell left it, kept from the bytes that were
+/// really written to it (TermFilter's output, so only what that lets through):
+/// what reset has to undo
+#[derive(Clone)]
+pub struct Screen {
+    st: SState,
+    seq: Vec<u8>,
     /// the cursor is known to be at the start of a line, and that line is
-    /// known to be empty: what reset needs to tell whether to add a newline
+    /// known to be empty: whether reset has to add a newline
     col0: bool,
     clean: bool,
-    /// the alternate screen mode that's on, and the main screen's two flags
-    alt: Option<u32>,
+    /// the alt screen is on, and the main screen's two flags under it
+    alt: bool,
     main_col0: bool,
     main_clean: bool,
     /// the guest turned cursor blinking on or off
     blink: bool,
 }
 
-impl Default for TermFilter {
-    fn default() -> TermFilter {
-        TermFilter::new(false)
+#[derive(Clone, Copy, PartialEq)]
+enum SState {
+    Text,
+    Esc,
+    Charset,
+    Csi,
+}
+
+impl Default for Screen {
+    fn default() -> Screen {
+        Screen {
+            st: SState::Text,
+            seq: Vec::new(),
+            // the caller pressed enter to start the shell
+            col0: true,
+            clean: true,
+            alt: false,
+            main_col0: true,
+            main_clean: true,
+            blink: false,
+        }
     }
 }
 
@@ -307,7 +346,7 @@ const SEQ_MAX: usize = 64;
 const STR_MAX: usize = 16 << 10;
 
 /// undoes every mode the filter lets through. the panic hook sends this one;
-/// a shell that ends normally gets TermFilter::reset, which knows whether the
+/// a shell that ends normally gets Screen::reset, which knows whether the
 /// alt screen is on. leaving the alt screen and resetting the scroll region
 /// both move the cursor home, so it's saved before them and restored after:
 /// the caller's prompt comes back below the session, not over its first line
@@ -325,30 +364,91 @@ const PRIVATE_MODES: &[u32] = &[1, 7, 12, 25, 47, 1047, 1048, 1049, 2004];
 /// (tab clear): the guest could clear the caller's tab stops for good
 const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefmr";
 
-impl TermFilter {
-    pub fn new(ascii: bool) -> TermFilter {
-        TermFilter {
-            st: FState::Text,
-            seq: Vec::new(),
-            utf8: Vec::new(),
-            str_len: 0,
-            ascii,
-            // the caller pressed enter to start the shell
-            col0: true,
-            clean: true,
-            alt: None,
-            main_col0: true,
-            main_clean: true,
-            blink: false,
+impl Screen {
+    pub fn feed(&mut self, b: &[u8]) {
+        for &b in b {
+            self.byte(b);
         }
     }
 
-    pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(input.len());
-        for &b in input {
-            self.byte(b, &mut out);
+    fn byte(&mut self, b: u8) {
+        match self.st {
+            SState::Text => match b {
+                0x1b => {
+                    self.seq.clear();
+                    self.st = SState::Esc;
+                }
+                b'\r' => self.col0 = true,
+                // line feed, vertical tab and form feed only move down
+                b'\n' | 0x0b | 0x0c => self.clean = true,
+                0x00..=0x1f | 0x7f => {}
+                _ => (self.col0, self.clean) = (false, false),
+            },
+            SState::Esc => {
+                self.st = match b {
+                    b'[' => SState::Csi,
+                    b'(' | b')' => SState::Charset,
+                    _ => {
+                        if b == b'8' || b == b'M' {
+                            self.col0 &= b == b'M';
+                            self.clean = false;
+                        }
+                        SState::Text
+                    }
+                }
+            }
+            SState::Charset => self.st = SState::Text,
+            SState::Csi => {
+                if (0x40..=0x7e).contains(&b) {
+                    let rest = std::mem::take(&mut self.seq);
+                    self.csi(b, &rest);
+                    self.st = SState::Text;
+                } else if self.seq.len() < SEQ_MAX {
+                    self.seq.push(b);
+                }
+            }
         }
-        out
+    }
+
+    /// where the column isn't clear it counts as mid-line: an extra blank line
+    /// beats a message drawn over the guest's last line
+    fn csi(&mut self, fin: u8, rest: &[u8]) {
+        let Some(modes) = rest.strip_prefix(b"?") else {
+            let num = |i: usize| -> u32 {
+                std::str::from_utf8(rest)
+                    .ok()
+                    .and_then(|p| p.split(';').nth(i))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            // a move to another line lands on one that may have text on it
+            match fin {
+                b'H' | b'f' => (self.col0, self.clean) = (num(1) <= 1, false),
+                b'G' | b'`' => self.col0 = num(0) <= 1,
+                b'E' | b'F' | b'r' => (self.col0, self.clean) = (true, false),
+                b'A' | b'B' | b'd' | b'e' => self.clean = false,
+                // erasing, scrolling, colors and insert mode
+                b'J' | b'K' | b'X' | b'P' | b'@' | b'S' | b'T' | b'm' | b'h' | b'l' => {}
+                _ => self.col0 = false,
+            }
+            return;
+        };
+        let on = fin == b'h';
+        for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
+            match m.parse::<u32>() {
+                Ok(12) => self.blink = true,
+                Ok(1048) if !on => (self.col0, self.clean) = (false, false),
+                Ok(1049) if on && !self.alt => {
+                    (self.main_col0, self.main_clean) = (self.col0, self.clean);
+                    self.alt = true;
+                }
+                Ok(1049) if !on && self.alt => {
+                    (self.col0, self.clean) = (self.main_col0, self.main_clean);
+                    self.alt = false;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// what puts the caller's terminal back when the shell ends. leaving the
@@ -361,17 +461,9 @@ impl TermFilter {
     pub fn reset(&self) -> Vec<u8> {
         let mut r = Vec::new();
         let mut fresh = self.col0 && self.clean;
-        match self.alt {
-            Some(1049) => {
-                r.extend_from_slice(b"\x1b[?1049l");
-                fresh = self.main_col0 && self.main_clean;
-            }
-            // these never saved the main screen's cursor, it stays where it was
-            Some(m) => {
-                r.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
-                fresh = false;
-            }
-            None => {}
+        if self.alt {
+            r.extend_from_slice(b"\x1b[?1049l");
+            fresh = self.main_col0 && self.main_clean;
         }
         r.extend_from_slice(b"\x1b7\x1b[r\x1b8");
         r.extend_from_slice(MODES_RESET);
@@ -383,6 +475,23 @@ impl TermFilter {
             r.extend_from_slice(b"\r\n");
         }
         r
+    }
+}
+
+impl TermFilter {
+    pub fn new(ascii: bool) -> TermFilter {
+        TermFilter {
+            ascii,
+            ..TermFilter::default()
+        }
+    }
+
+    pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        for &b in input {
+            self.byte(b, &mut out);
+        }
+        out
     }
 
     fn byte(&mut self, b: u8, out: &mut Vec<u8>) {
@@ -406,10 +515,6 @@ impl TermFilter {
                     // save/restore cursor, reverse index, keypad modes
                     b'7' | b'8' | b'M' | b'=' | b'>' => {
                         out.extend_from_slice(&self.seq);
-                        if b == b'8' || b == b'M' {
-                            self.col0 &= b == b'M';
-                            self.clean = false;
-                        }
                         self.st = FState::Text;
                     }
                     0x20..=0x2f => self.st = FState::EscInter,
@@ -455,9 +560,11 @@ impl TermFilter {
                 self.seq.push(b);
                 if (0x40..=0x7e).contains(&b) {
                     if csi_allowed(&self.seq[2..]) {
-                        out.extend_from_slice(&self.seq);
-                        let body = self.seq[2..].to_vec();
-                        self.track_csi(&body);
+                        if self.seq[2] == b'?' {
+                            out.extend_from_slice(&alt_as_1049(&self.seq));
+                        } else {
+                            out.extend_from_slice(&self.seq);
+                        }
                     }
                     self.st = FState::Text;
                 } else if self.seq.len() > SEQ_MAX {
@@ -486,53 +593,6 @@ impl TermFilter {
         }
     }
 
-    /// keeps the state reset() needs in step with a CSI that went out. where
-    /// the column isn't clear it counts as mid-line: an extra blank line beats
-    /// a message drawn over the guest's last line
-    fn track_csi(&mut self, body: &[u8]) {
-        let (&fin, rest) = body.split_last().expect("csi has a final byte");
-        let Some(modes) = rest.strip_prefix(b"?") else {
-            let num = |i: usize| -> u32 {
-                std::str::from_utf8(rest)
-                    .ok()
-                    .and_then(|p| p.split(';').nth(i))
-                    .and_then(|n| n.parse().ok())
-                    .unwrap_or(0)
-            };
-            // a move to another line lands on one that may have text on it
-            match fin {
-                b'H' | b'f' => (self.col0, self.clean) = (num(1) <= 1, false),
-                b'G' | b'`' => self.col0 = num(0) <= 1,
-                b'E' | b'F' | b'r' => (self.col0, self.clean) = (true, false),
-                b'A' | b'B' | b'd' | b'e' => self.clean = false,
-                // erasing, scrolling, colors and insert mode
-                b'J' | b'K' | b'X' | b'P' | b'@' | b'S' | b'T' | b'm' | b'h' | b'l' => {}
-                _ => self.col0 = false,
-            }
-            return;
-        };
-        let on = fin == b'h';
-        for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
-            match m.parse::<u32>() {
-                Ok(12) => self.blink = true,
-                Ok(1048) if !on => (self.col0, self.clean) = (false, false),
-                Ok(n @ (47 | 1047 | 1049)) if on && self.alt.is_none() => {
-                    (self.main_col0, self.main_clean) = (self.col0, self.clean);
-                    self.alt = Some(n);
-                }
-                // any of them going off is back on the main screen; only
-                // 1049 brings its cursor back
-                Ok(n @ (47 | 1047 | 1049)) if !on && self.alt.is_some() => {
-                    let back = n == 1049 && self.alt == Some(1049);
-                    self.col0 = back && self.main_col0;
-                    self.clean = back && self.main_clean;
-                    self.alt = None;
-                }
-                _ => {}
-            }
-        }
-    }
-
     fn start_esc(&mut self) {
         self.utf8.clear();
         self.seq.clear();
@@ -545,20 +605,9 @@ impl TermFilter {
             self.utf8.clear(); // a cut-off multibyte char is dropped
             match b {
                 0x1b => self.start_esc(),
-                b'\r' => {
-                    out.push(b);
-                    self.col0 = true;
-                }
                 // vertical tab and form feed move down a line, like line feed
-                b'\n' | 0x0b | 0x0c => {
-                    out.push(b);
-                    self.clean = true;
-                }
-                0x07 => out.push(b),
-                b'\t' | 0x08 | 0x20..=0x7e => {
-                    out.push(b);
-                    (self.col0, self.clean) = (false, false);
-                }
+                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x08 | 0x07 => out.push(b),
+                0x20..=0x7e => out.push(b),
                 _ => {}
             }
             return;
@@ -573,7 +622,6 @@ impl TermFilter {
                     } else {
                         out.extend_from_slice(&self.utf8);
                     }
-                    (self.col0, self.clean) = (false, false);
                 }
                 self.utf8.clear();
             }
@@ -581,6 +629,20 @@ impl TermFilter {
             Err(_) => self.utf8.clear(),
         }
     }
+}
+
+/// a private mode sequence with 47 and 1047 (alt screens that don't save the
+/// cursor) as 1049: one alt screen mode, so the reset has one way back
+fn alt_as_1049(seq: &[u8]) -> Vec<u8> {
+    let (&fin, body) = seq.split_last().expect("csi has a final byte");
+    let mut modes: Vec<&str> = Vec::new();
+    for m in std::str::from_utf8(&body[3..]).unwrap_or("").split(';') {
+        let m = if m == "47" || m == "1047" { "1049" } else { m };
+        if !modes.contains(&m) {
+            modes.push(m);
+        }
+    }
+    format!("\x1b[?{}{}", modes.join(";"), fin as char).into_bytes()
 }
 
 /// `body` is everything after ESC [, final byte included
@@ -687,19 +749,49 @@ mod tests {
     fn finish_goes_out_past_a_stalled_backlog() {
         let (go, wait) = mpsc::channel();
         let got = Arc::new(Mutex::new(Vec::new()));
-        let o = Out::to(Box::new(Stalled(wait, got.clone())), false);
-        o.put(b"first", None);
-        // the writer is stuck on "first"; the rest piles up behind it
+        let o = Out::to(
+            Box::new(Stalled(wait, got.clone())),
+            false,
+            Some(Arc::new(Mutex::new(Screen::default()))),
+        );
+        o.put(b"first\r\n", None);
+        // the writer is stuck on "first"; the rest piles up behind it, the alt
+        // screen's way back included
         std::thread::sleep(Duration::from_millis(50));
+        o.put(b"\x1b[?1049h", None);
         for _ in 0..100 {
             o.put(b"guest", None);
         }
-        o.finish(b"RESET");
+        o.put(b"\x1b[?1049l", None);
+        o.finish_reset();
         for _ in 0..3 {
             go.send(()).unwrap();
         }
         o.wait_last(|| false);
-        assert_eq!(*got.lock().unwrap(), b"firstRESET".to_vec());
+        let want = [&b"first\r\n"[..], &Screen::default().reset()].concat();
+        assert_eq!(*got.lock().unwrap(), want);
+    }
+
+    #[test]
+    fn reset_follows_what_was_written() {
+        // the alt screen went on, and the guest's way back never got written
+        let (go, wait) = mpsc::channel();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let o = Out::to(
+            Box::new(Stalled(wait, got.clone())),
+            false,
+            Some(Arc::new(Mutex::new(Screen::default()))),
+        );
+        o.put(b"\x1b[?1049h", None);
+        std::thread::sleep(Duration::from_millis(50));
+        o.finish_reset();
+        for _ in 0..2 {
+            go.send(()).unwrap();
+        }
+        o.wait_last(|| false);
+        let want = [&b"\x1b[?1049h"[..], &shown(b"\x1b[?1049h").reset()].concat();
+        assert_eq!(*got.lock().unwrap(), want);
+        assert!(want.ends_with(&[&b"\x1b[?1049l"[..], &Screen::default().reset()].concat()));
     }
 
     #[test]
@@ -717,32 +809,45 @@ mod tests {
         );
     }
 
+    /// the guest's output through the filter and onto a Screen
+    fn shown(out: &[u8]) -> Screen {
+        let mut s = Screen::default();
+        s.feed(&TermFilter::default().feed(out));
+        s
+    }
+
     #[test]
     fn reset_leaves_the_alt_screen_first() {
-        let mut f = TermFilter::default();
-        let r = f.reset();
+        let r = Screen::default().reset();
         assert!(
             r.starts_with(b"\x1b7\x1b[r\x1b8"),
             "no ?1049l off the alt screen"
         );
         assert!(r.ends_with(MODES_RESET));
-        f.feed(b"\x1b[?1049h\x1b[3;1Hx");
-        assert!(f.reset().starts_with(b"\x1b[?1049l\x1b7\x1b[r\x1b8"));
-        f.feed(b"\x1b[?1049l");
-        assert_eq!(f.reset(), r);
-        f.feed(b"\x1b[?47h");
-        assert!(f.reset().starts_with(b"\x1b[?47l\x1b7"));
-        f.feed(b"\x1b[?1049h\x1b[?1047l");
-        assert!(f.reset().starts_with(b"\x1b7\x1b[r\x1b8"));
+        assert!(
+            shown(b"\x1b[?1049h\x1b[3;1Hx")
+                .reset()
+                .starts_with(b"\x1b[?1049l\x1b7\x1b[r\x1b8")
+        );
+        assert_eq!(shown(b"\x1b[?1049h\x1b[?1049l").reset(), r);
+        // 47 and 1047 are 1049 by the time they reach the terminal, in any mix
+        assert!(shown(b"\x1b[?47h").reset().starts_with(b"\x1b[?1049l\x1b7"));
+        assert_eq!(shown(b"\x1b[?1049h\x1b[?1047l").reset(), r);
+        assert_eq!(shown(b"\x1b[?47h\x1b[?1049l").reset(), r);
+    }
+
+    #[test]
+    fn filter_normalizes_alt_screens() {
+        let mut f = TermFilter::default();
+        assert_eq!(f.feed(b"\x1b[?47h"), b"\x1b[?1049h".to_vec());
+        assert_eq!(f.feed(b"\x1b[?1047l"), b"\x1b[?1049l".to_vec());
+        assert_eq!(f.feed(b"\x1b[?1047;1049;25h"), b"\x1b[?1049;25h".to_vec());
+        assert_eq!(f.feed(b"\x1b[?1;25l"), b"\x1b[?1;25l".to_vec());
     }
 
     #[test]
     fn reset_ends_on_a_fresh_line() {
-        let fresh = |out: &[u8]| {
-            let mut f = TermFilter::default();
-            f.feed(out);
-            f.reset().ends_with(b"\r\n")
-        };
+        let fresh = |out: &[u8]| shown(out).reset().ends_with(b"\r\n");
         assert!(!fresh(b""));
         assert!(!fresh(b"burner:~# exit\r\n"));
         assert!(fresh(b"burner:~# "));
@@ -759,15 +864,22 @@ mod tests {
         assert!(!fresh(b"vi f\r\n\x1b[?1049h\x1b[12;12Htext"));
         assert!(fresh(b"$ \x1b[?1049h\x1b[H"));
         assert!(!fresh(b"x\r\n\x1b[?1049h\x1b[2;2Hy\x1b[?1049l"));
-        assert!(fresh(b"\r\x1b[?47hx\x1b[?47l"));
+        assert!(!fresh(b"\r\n\x1b[?47hx\x1b[?47l"));
     }
 
     #[test]
     fn reset_undoes_blinking() {
-        let mut f = TermFilter::default();
-        assert!(!f.reset().windows(6).any(|w| w == b"\x1b[?12l"));
-        assert_eq!(f.feed(b"\x1b[?12;25h"), b"\x1b[?12;25h".to_vec());
-        assert!(f.reset().ends_with(b"\x1b[?12l"));
+        assert!(
+            !Screen::default()
+                .reset()
+                .windows(6)
+                .any(|w| w == b"\x1b[?12l")
+        );
+        assert_eq!(
+            TermFilter::default().feed(b"\x1b[?12;25h"),
+            b"\x1b[?12;25h".to_vec()
+        );
+        assert!(shown(b"\x1b[?12;25h").reset().ends_with(b"\x1b[?12l"));
         assert!(TERM_RESET.ends_with(b"\x1b[?12l"));
     }
 

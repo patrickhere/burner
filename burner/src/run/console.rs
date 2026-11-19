@@ -9,7 +9,7 @@ use super::{Deadline, Outcome, is_interrupted};
 use crate::cgroup;
 use crate::config::Config;
 use crate::ledger;
-use crate::output::{Dest, Out, escape_controls};
+use crate::output::{Out, escape_controls};
 use crate::result;
 use crate::sys;
 
@@ -237,7 +237,7 @@ pub(super) fn relay(
     legacy: bool,
     tty_rec: Option<File>,
 ) -> Shell {
-    let screen = Out::new_unescaped(Dest::Stdout);
+    let screen = Out::new_screen();
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
         return Shell {
             outcome: Outcome::Failed,
@@ -434,7 +434,7 @@ pub(super) fn relay(
     // output still queued goes out if the terminal takes it soon; a terminal
     // that has stopped reading would leave the reset stuck behind it
     screen.drain(Instant::now() + Duration::from_secs(2));
-    screen.finish(&filter.reset());
+    screen.finish_reset();
     let end = if halted {
         Some(Ended {
             rc: 0,
