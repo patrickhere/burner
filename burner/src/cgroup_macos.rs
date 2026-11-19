@@ -1,8 +1,8 @@
-//! macOS has no cgroups. a VM is its VMM process and that process's group,
-//! which macnet joins: burner records the VMM's pid and start time in
+//! macOS has no cgroups. a VM is its VMM process and macnet, which joins the
+//! VMM's process group: burner records the VMM's pid and start time in
 //! state/vmm/ID when it spawns it, and macnet's once that's up. the VM is gone
-//! once neither is left and nothing else runs in the group. libkrun runs the
-//! whole VM inside the VMM, nothing forks from it or from macnet
+//! once neither of those two is left. libkrun runs the whole VM inside the
+//! VMM, nothing forks from it or from macnet
 
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -30,7 +30,9 @@ fn path(id: &str) -> PathBuf {
     dir().join(id)
 }
 
-fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
+/// the start time of pid, zombies included: a VMM that exited but wasn't
+/// waited for yet still holds its pid, and with it its group
+fn started(pid: u32) -> Option<u64> {
     // SAFETY: zeroed proc_bsdinfo is a valid out-parameter of the size passed
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
@@ -43,35 +45,7 @@ fn bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
             size,
         )
     };
-    (n == size).then_some(info)
-}
-
-/// the start time of pid, zombies included: a VMM that exited but wasn't
-/// waited for yet still holds its pid, and with it its group
-fn started(pid: u32) -> Option<u64> {
-    bsdinfo(pid).map(|i| i.pbi_start_tvsec * 1_000_000 + i.pbi_start_tvusec)
-}
-
-/// whether anything in process group pgid still runs. zombies don't count:
-/// macnet that exited but wasn't waited for yet holds nothing anymore
-fn group_runs(pgid: libc::pid_t) -> bool {
-    const SZOMB: u32 = 5;
-    let mut pids = [0 as libc::pid_t; 64];
-    // SAFETY: a buffer of exactly the size passed; unused slots stay 0
-    let n = unsafe {
-        libc::proc_listpgrppids(
-            pgid,
-            pids.as_mut_ptr().cast(),
-            std::mem::size_of_val(&pids) as libc::c_int,
-        )
-    };
-    // can't tell: count it as running, so its slot stays taken
-    if n < 0 {
-        return true;
-    }
-    pids.iter().filter(|&&p| p > 0).any(|&p| {
-        bsdinfo(p as u32).is_some_and(|i| i.pbi_status != SZOMB && i.pbi_pgid == pgid as u32)
-    })
+    (n == size).then(|| info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,40 +67,10 @@ fn write(id: &str, r: &Record) -> io::Result<()> {
     fs::rename(tmp, path(id))
 }
 
-enum Group {
-    /// the recorded VMM is still there, maybe as a zombie
-    Leader,
-    /// the VMM is gone and reaped, but something in its group still runs
-    Orphans,
-    Empty,
-    /// the pid belongs to another process now, and so may the group id
-    Reused,
-}
-
-/// what's left of the VMM's process group. its id is the VMM's pid, and macOS
-/// hands out no pid that is still in use as a group id: with no process at
-/// that pid, a group by that id is still this VM's
-fn group(r: &Record) -> Group {
-    if r.vmm.boot != sys::boot_id() {
-        return Group::Empty;
-    }
-    let pid = r.vmm.pid as libc::pid_t;
-    match started(r.vmm.pid) {
-        Some(start) if start == r.vmm.start => return Group::Leader,
-        Some(_) => return Group::Reused,
-        None => {}
-    }
-    // SAFETY: signal 0 only checks, kill(2) is a plain syscall
-    if unsafe { libc::kill(pid, 0) } == 0
-        || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    {
-        return Group::Reused;
-    }
-    if group_runs(pid) {
-        Group::Orphans
-    } else {
-        Group::Empty
-    }
+/// the recorded VMM is still that process, maybe as a zombie. while it is,
+/// its pid and so its group id can't belong to anything else
+fn leader(r: &Record) -> bool {
+    r.vmm.boot == sys::boot_id() && started(r.vmm.pid) == Some(r.vmm.start)
 }
 
 /// the recorded macnet, if it's still that same process
@@ -163,21 +107,23 @@ pub fn oom_kills(_id: &str) -> u64 {
     0
 }
 
-/// true while the VMM, macnet or anything else in the VMM's group is left. a
-/// record that can't be read counts as busy, so its slot stays taken
+/// true while the recorded VMM or macnet is left. nothing else in the group is
+/// counted or signalled: once both are gone the group id is free, and a stale
+/// record must never reach whatever takes it next. a record that can't be read
+/// counts as busy, so its slot stays taken
 pub fn populated(id: &str) -> bool {
     match read(id) {
-        Ok(r) => matches!(group(&r), Group::Leader | Group::Orphans) || net(&r).is_some(),
+        Ok(r) => leader(&r) || net(&r).is_some(),
         Err(e) => e.kind() != io::ErrorKind::NotFound,
     }
 }
 
 pub fn kill(id: &str) {
     let Ok(r) = read(id) else { return };
-    // SAFETY: plain kill(2). group() and the start time checks are what keep a
-    // reused pid out of it; without pidfds that's as close as macOS gets
+    // SAFETY: plain kill(2). the start time checks are what keep a reused pid
+    // out of it; without pidfds that's as close as macOS gets
     unsafe {
-        if matches!(group(&r), Group::Leader | Group::Orphans) {
+        if leader(&r) {
             libc::killpg(r.vmm.pid as libc::pid_t, libc::SIGKILL);
         }
         if let Some(n) = net(&r) {
