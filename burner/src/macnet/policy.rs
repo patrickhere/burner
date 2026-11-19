@@ -67,6 +67,7 @@ pub struct Policy {
     pub mode: Mode,
     pub resolvers: Vec<Ipv4Addr>,
     blocked: Vec<(Ipv4Addr, u8)>,
+    route: fn(Ipv4Addr) -> Result<(), &'static str>,
 }
 
 impl Policy {
@@ -84,6 +85,7 @@ impl Policy {
             mode,
             resolvers,
             blocked,
+            route: super::route::check,
         }
     }
 
@@ -124,7 +126,7 @@ impl Policy {
         if self.blocked.iter().any(|&(n, p)| inside(dst, n, p)) {
             return Err("blocked range");
         }
-        Ok(())
+        (self.route)(dst)
     }
 }
 
@@ -170,13 +172,19 @@ fn sockaddr_v4(sa: *const libc::sockaddr) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    /// the ranges alone, whatever the routes of the machine running the tests
+    fn any_route(mut p: Policy) -> Policy {
+        p.route = |_| Ok(());
+        p
+    }
+
     fn web() -> Policy {
-        Policy::new(
+        any_route(Policy::new(
             Mode::Web,
             vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)],
             &[(Ipv4Addr::new(140, 82, 121, 0), 24)],
             (Ipv4Addr::new(172, 29, 217, 0), 30),
-        )
+        ))
     }
 
     #[test]
@@ -192,12 +200,12 @@ mod tests {
 
     #[test]
     fn open_ports() {
-        let p = Policy::new(
+        let p = any_route(Policy::new(
             Mode::Open,
             vec![Ipv4Addr::new(9, 9, 9, 9)],
             &[],
             (Ipv4Addr::new(172, 29, 217, 0), 30),
-        );
+        ));
         let gh = Ipv4Addr::new(140, 82, 112, 3);
         for port in [22, 80, 443, 8080, 1] {
             assert!(p.tcp(gh, port).is_ok(), "{port}");
@@ -256,6 +264,14 @@ mod tests {
         for (ip, _) in host_nets().unwrap() {
             assert!(p.tcp(ip, 443).is_err(), "{ip}");
         }
+    }
+
+    #[test]
+    fn a_route_that_isnt_the_default_is_refused() {
+        let mut p = web();
+        p.route = |_| Err("not routed through the default route");
+        assert!(p.tcp(Ipv4Addr::new(140, 82, 112, 3), 443).is_err());
+        assert!(p.dns(Ipv4Addr::new(9, 9, 9, 9)).is_err());
     }
 
     #[test]
