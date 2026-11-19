@@ -217,7 +217,6 @@ fn unfinished_tail(b: &[u8]) -> usize {
 /// reporting, OSC/DCS/APC/PM/SOS strings (titles, clipboard, hyperlinks), C1
 /// controls and anything it doesn't know. keeps its state across reads, and
 /// tracks what it let through that has to be undone when the shell ends
-#[derive(Default)]
 pub struct TermFilter {
     st: FState,
     seq: Vec<u8>,
@@ -225,10 +224,22 @@ pub struct TermFilter {
     str_len: usize,
     /// the terminal isn't utf-8: non-ascii chars go out as ?
     ascii: bool,
-    /// the alternate screen mode that's on
+    /// the cursor is known to be at the start of a line, and that line is
+    /// known to be empty: what reset needs to tell whether to add a newline
+    col0: bool,
+    clean: bool,
+    /// the alternate screen mode that's on, and the main screen's two flags
     alt: Option<u32>,
+    main_col0: bool,
+    main_clean: bool,
     /// the guest turned cursor blinking on or off
     blink: bool,
+}
+
+impl Default for TermFilter {
+    fn default() -> TermFilter {
+        TermFilter::new(false)
+    }
 }
 
 #[derive(Default, PartialEq)]
@@ -273,8 +284,18 @@ const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefmr";
 impl TermFilter {
     pub fn new(ascii: bool) -> TermFilter {
         TermFilter {
+            st: FState::Text,
+            seq: Vec::new(),
+            utf8: Vec::new(),
+            str_len: 0,
             ascii,
-            ..TermFilter::default()
+            // the caller pressed enter to start the shell
+            col0: true,
+            clean: true,
+            alt: None,
+            main_col0: true,
+            main_clean: true,
+            blink: false,
         }
     }
 
@@ -290,17 +311,32 @@ impl TermFilter {
     /// alt screen comes first: it puts the cursor back where it was on the
     /// main screen, and a terminal with one saved cursor for both screens
     /// (tmux) would otherwise restore the alt screen's spot after it. off the
-    /// alt screen, ?1049l would restore a stale saved cursor, so it isn't sent
+    /// alt screen, ?1049l would restore a stale saved cursor, so it isn't sent.
+    /// it ends on a fresh line, so what comes next doesn't start mid-line or
+    /// on top of the guest's last line
     pub fn reset(&self) -> Vec<u8> {
         let mut r = Vec::new();
-        if let Some(m) = self.alt {
-            r.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+        let mut fresh = self.col0 && self.clean;
+        match self.alt {
+            Some(1049) => {
+                r.extend_from_slice(b"\x1b[?1049l");
+                fresh = self.main_col0 && self.main_clean;
+            }
+            // these never saved the main screen's cursor, it stays where it was
+            Some(m) => {
+                r.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+                fresh = false;
+            }
+            None => {}
         }
         r.extend_from_slice(b"\x1b7\x1b[r\x1b8");
         r.extend_from_slice(MODES_RESET);
         // only when the guest touched it: some terminals blink by default
         if self.blink {
             r.extend_from_slice(b"\x1b[?12l");
+        }
+        if !fresh {
+            r.extend_from_slice(b"\r\n");
         }
         r
     }
@@ -326,6 +362,10 @@ impl TermFilter {
                     // save/restore cursor, reverse index, keypad modes
                     b'7' | b'8' | b'M' | b'=' | b'>' => {
                         out.extend_from_slice(&self.seq);
+                        if b == b'8' || b == b'M' {
+                            self.col0 &= b == b'M';
+                            self.clean = false;
+                        }
                         self.st = FState::Text;
                     }
                     0x20..=0x2f => self.st = FState::EscInter,
@@ -402,19 +442,48 @@ impl TermFilter {
         }
     }
 
-    /// keeps the state reset() needs in step with a CSI that went out
+    /// keeps the state reset() needs in step with a CSI that went out. where
+    /// the column isn't clear it counts as mid-line: an extra blank line beats
+    /// a message drawn over the guest's last line
     fn track_csi(&mut self, body: &[u8]) {
         let (&fin, rest) = body.split_last().expect("csi has a final byte");
         let Some(modes) = rest.strip_prefix(b"?") else {
+            let num = |i: usize| -> u32 {
+                std::str::from_utf8(rest)
+                    .ok()
+                    .and_then(|p| p.split(';').nth(i))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            // a move to another line lands on one that may have text on it
+            match fin {
+                b'H' | b'f' => (self.col0, self.clean) = (num(1) <= 1, false),
+                b'G' | b'`' => self.col0 = num(0) <= 1,
+                b'E' | b'F' | b'r' => (self.col0, self.clean) = (true, false),
+                b'A' | b'B' | b'd' | b'e' => self.clean = false,
+                // erasing, scrolling, colors and insert mode
+                b'J' | b'K' | b'X' | b'P' | b'@' | b'S' | b'T' | b'm' | b'h' | b'l' => {}
+                _ => self.col0 = false,
+            }
             return;
         };
         let on = fin == b'h';
         for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
             match m.parse::<u32>() {
                 Ok(12) => self.blink = true,
-                Ok(n @ (47 | 1047 | 1049)) if on && self.alt.is_none() => self.alt = Some(n),
-                // any of them going off is back on the main screen
-                Ok(47 | 1047 | 1049) if !on => self.alt = None,
+                Ok(1048) if !on => (self.col0, self.clean) = (false, false),
+                Ok(n @ (47 | 1047 | 1049)) if on && self.alt.is_none() => {
+                    (self.main_col0, self.main_clean) = (self.col0, self.clean);
+                    self.alt = Some(n);
+                }
+                // any of them going off is back on the main screen; only
+                // 1049 brings its cursor back
+                Ok(n @ (47 | 1047 | 1049)) if !on && self.alt.is_some() => {
+                    let back = n == 1049 && self.alt == Some(1049);
+                    self.col0 = back && self.main_col0;
+                    self.clean = back && self.main_clean;
+                    self.alt = None;
+                }
                 _ => {}
             }
         }
@@ -432,9 +501,20 @@ impl TermFilter {
             self.utf8.clear(); // a cut-off multibyte char is dropped
             match b {
                 0x1b => self.start_esc(),
+                b'\r' => {
+                    out.push(b);
+                    self.col0 = true;
+                }
                 // vertical tab and form feed move down a line, like line feed
-                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x08 | 0x07 => out.push(b),
-                0x20..=0x7e => out.push(b),
+                b'\n' | 0x0b | 0x0c => {
+                    out.push(b);
+                    self.clean = true;
+                }
+                0x07 => out.push(b),
+                b'\t' | 0x08 | 0x20..=0x7e => {
+                    out.push(b);
+                    (self.col0, self.clean) = (false, false);
+                }
                 _ => {}
             }
             return;
@@ -449,6 +529,7 @@ impl TermFilter {
                     } else {
                         out.extend_from_slice(&self.utf8);
                     }
+                    (self.col0, self.clean) = (false, false);
                 }
                 self.utf8.clear();
             }
@@ -522,7 +603,33 @@ mod tests {
         f.feed(b"\x1b[?47h");
         assert!(f.reset().starts_with(b"\x1b[?47l\x1b7"));
         f.feed(b"\x1b[?1049h\x1b[?1047l");
-        assert_eq!(f.reset(), r);
+        assert!(f.reset().starts_with(b"\x1b7\x1b[r\x1b8"));
+    }
+
+    #[test]
+    fn reset_ends_on_a_fresh_line() {
+        let fresh = |out: &[u8]| {
+            let mut f = TermFilter::default();
+            f.feed(out);
+            f.reset().ends_with(b"\r\n")
+        };
+        assert!(!fresh(b""));
+        assert!(!fresh(b"burner:~# exit\r\n"));
+        assert!(fresh(b"burner:~# "));
+        assert!(fresh(b"partial"));
+        assert!(fresh("\u{2713}".as_bytes()));
+        // a line the cursor moved to may have text on it, top's last one say
+        assert!(fresh(b"x\x1b[1;1H"));
+        assert!(fresh(b"top\r\n\x1b[H row 1\r\n row 2\r"));
+        assert!(fresh(b"\x1b[5;7H"));
+        assert!(fresh(b"\r\x1b[3C"));
+        assert!(!fresh(b"\r\n\x1b[G\x1b[K\x1b[0m"));
+        assert!(fresh(b"\x1b8"));
+        // the alt screen: what counts is the main screen under it
+        assert!(!fresh(b"vi f\r\n\x1b[?1049h\x1b[12;12Htext"));
+        assert!(fresh(b"$ \x1b[?1049h\x1b[H"));
+        assert!(!fresh(b"x\r\n\x1b[?1049h\x1b[2;2Hy\x1b[?1049l"));
+        assert!(fresh(b"\r\x1b[?47hx\x1b[?47l"));
     }
 
     #[test]
