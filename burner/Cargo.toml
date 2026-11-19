@@ -26,7 +26,8 @@ tar = "0.4.46"
 toml = "1.2.1"
 
 # the per-VM network process on macOS (burner macnet): a tcp/ip stack for the
-# guest's side, and nonblocking connects for the host's
+# guest's side, and nonblocking connects for the host's. smoltcp 0.13 and up need
+# rust 1.91, 0.12 is the newest that builds on rust-version
 [target.'cfg(target_os = "macos")'.dependencies]
-smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 socket2 = "0.6.5"

@@ -262,8 +262,14 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         let _ = a.push(IpCidr::new(IpAddress::Ipv4(args.gateway), args.prefix));
     });
     // every destination the guest names is answered here, the policy decides
-    // which of them get a real connection behind them
+    // which of them get a real connection behind them. smoltcp 0.12 only takes
+    // a packet for an address that isn't its own when a route to it points at one
+    // that is, hence the default route through ourselves
     iface.set_any_ip(true);
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(args.gateway)
+        .map_err(|_| io::Error::other("smoltcp's route table is full"))?;
     let mut sockets = SocketSet::new(Vec::new());
     let udp_buf =
         || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 64 << 10]);
@@ -495,7 +501,12 @@ impl Gw<'_> {
         let Ok(ip) = Ipv4Packet::new_checked(eth.payload()) else {
             return Verdict::Drop;
         };
-        if ip.src_addr() != self.args.guest || ip.more_frags() || ip.frag_offset() != 0 {
+        // smoltcp 0.12 doesn't refuse a header length under 20 itself
+        if ip.header_len() < 20
+            || ip.src_addr() != self.args.guest
+            || ip.more_frags()
+            || ip.frag_offset() != 0
+        {
             return Verdict::Drop;
         }
         match ip.next_header() {
