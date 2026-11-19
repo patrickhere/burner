@@ -45,9 +45,9 @@ die() {
 # run a step with a spinner, its output into the log. on failure, the end of
 # the log and where to find the rest
 run() {
-    label=$1
+    step=$1
     shift
-    printf '\n== %s\n' "$label" >>"$LOG"
+    printf '\n== %s\n' "$step" >>"$LOG"
     rc=0
     if [ -n "$TTY" ]; then
         "$@" >>"$LOG" 2>&1 &
@@ -56,7 +56,7 @@ run() {
             # first frame shown, then rotated to the back
             frame=${FRAMES%% *}
             FRAMES="${FRAMES#* } $frame"
-            printf '\r  %s%s%s %s' "$F" "$frame" "$R" "$label"
+            printf '\r  %s%s%s %s' "$F" "$frame" "$R" "$step"
             sleep 0.1
         done
         wait "$pid" || rc=$?
@@ -65,7 +65,7 @@ run() {
         "$@" >>"$LOG" 2>&1 || rc=$?
     fi
     if [ "$rc" != 0 ]; then
-        printf '  %sx%s %s\n\n' "$E" "$R" "$label" >&2
+        printf '  %sx%s %s\n\n' "$E" "$R" "$step" >&2
         tail -n 15 "$LOG" | sed 's/^/    /' >&2
         KEEP_LOG=1
         die "that step failed, the whole log is in $LOG"
@@ -212,9 +212,17 @@ main() {
         ok "alpine image" "already there"
     fi
 
-    as_root /usr/local/bin/burner doctor 2>/dev/null | sed -n 's/^warn *[a-z]* *//p' | while read -r w; do
-        warn "$w"
-    done
+    # the first sentence of each doctor warning, doctor itself has the rest
+    warns=$(as_root /usr/local/bin/burner doctor 2>/dev/null | sed -n 's/^warn *[a-z]* *//p')
+    if [ -n "$warns" ]; then
+        printf '\n'
+        printf '%s\n' "$warns" | while read -r w; do
+            w=${w%%. *}
+            [ "${#w}" -le 90 ] || w="$(printf '%.87s' "$w")..."
+            warn "$w"
+        done
+        printf '    %ssudo burner doctor says more%s\n' "$D" "$R"
+    fi
 
     took=$(($(date +%s) - start))
     printf '\n  %sburner %s is ready%s %s(%ss)%s\n\n' "$B" "${version#v}" "$R" "$D" "$took" "$R"
