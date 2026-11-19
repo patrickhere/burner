@@ -128,6 +128,8 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     name=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
     printf '\nburner: fresh %s VM. nothing is kept when you exit.\n\n' "$name"
     token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
+    # which records follow, so burner reads the end one right
+    [ -n "$token" ] && printf 'BURNER-%s-SHELL2;' "$token"
     # burner holds the caller's keys until the shell says it's ready, so none
     # reach a console that isn't set up yet, and ctrl-c until then stops the VM
     st=/run/burner-shell
