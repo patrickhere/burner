@@ -51,11 +51,17 @@ arp_target=$(ip -4 -o addr show scope global | awk '{split($4, x, "/"); print x[
 [ -n "$arp_target" ] && probes+="p arp-host-$arp_target \"arping -c 2 -w 3 -I eth0 $arp_target\""$'\n' && blocked+=("arp-host-$arp_target")
 echo "      ${#blocked[@]} host-side targets the host can reach"
 
-# probes run inside the VM; each prints OPEN or BLOCKED
+# probes run inside the VM; each prints OPEN or BLOCKED, or MISSING when the
+# image lacks its tool and BROKEN when the tool refused its arguments, so a
+# probe that couldn't run never reads as blocked
 # all probes at once: most of them are blocked and would each wait out their timeout
 PROBES='
 n=0
-p() { n=$((n + 1)); ( if timeout 6 sh -c "$2" >/dev/null 2>&1; then echo "OPEN $1"; else echo "BLOCKED $1"; fi ) > /tmp/probe.$n & }
+p() { n=$((n + 1)); (
+    if ! command -v timeout >/dev/null || ! command -v grep >/dev/null || ! command -v "${2%% *}" >/dev/null; then echo "MISSING $1"
+    elif timeout 6 sh -c "$2" >/tmp/probe-out.$n 2>&1; then echo "OPEN $1"
+    elif grep -qiE "usage:|invalid option|unrecognized option|illegal option|applet not found" /tmp/probe-out.$n; then echo "BROKEN $1"
+    else echo "BLOCKED $1"; fi ) > /tmp/probe.$n & }
 '"$probes"'
 p tap-host-side      "nc -z -w 4 172.29.217.1 22"
 p metadata           "nc -z -w 4 169.254.169.254 80"
@@ -126,8 +132,10 @@ after=$(sudo burner run --net web -- 'nslookup github.com >/dev/null 2>&1 && ech
   && ok "failed refresh: open connection cut, network back after the next good pass" \
   || bad "fail closed" "emptied=$emptied grew=$grew flat=$flat after=$after samples=$(tr '\n' ' ' < "$T/fc.txt")"
 
-# spoofing: a VM that takes another address gets nothing through
-out=$(sudo burner run --net open -- 'ip addr flush dev eth0; ip addr add 172.29.217.6/30 dev eth0; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
+# spoofing: a VM that takes another address gets nothing through. nc has to
+# get out from the real address first and the new address has to take, so a
+# missing tool or a VM with no network can't read as held
+out=$(sudo burner run --net open -- 'for t in ip nc; do command -v $t >/dev/null || { echo "MISSING $t"; exit 0; }; done; nc -z -w 4 1.1.1.1 443 || { echo "NO BASELINE"; exit 0; }; ip addr flush dev eth0 && ip addr add 172.29.217.6/30 dev eth0 || { echo "SPOOF FAILED"; exit 0; }; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
 [ "$out" = HELD ] && ok "spoofed source address dropped" || bad "spoofing" "$out"
 
 # none: no network interface at all
