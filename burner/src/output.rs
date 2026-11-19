@@ -214,9 +214,12 @@ enum FState {
 
 const SEQ_MAX: usize = 64;
 
-/// undoes every mode the filter lets through, sent when the shell ends
+/// undoes every mode the filter lets through, sent when the shell ends. leaving
+/// the alt screen and resetting the scroll region both move the cursor home, so
+/// it's saved before them and restored after: the caller's prompt comes back
+/// below the session, not over its first line
 pub const TERM_RESET: &[u8] =
-    b"\x1b[?1049l\x1b[r\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
+    b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
 
 /// private modes (CSI ? n h/l) a shell or editor needs that make the terminal
 /// send nothing back: cursor keys, autowrap, blink, cursor shown, alt screen,
@@ -358,6 +361,21 @@ fn csi_allowed(body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_reset_keeps_the_cursor() {
+        let r = TERM_RESET;
+        assert!(r.starts_with(b"\x1b7"), "cursor saved first");
+        let at = |pat: &[u8]| r.windows(pat.len()).position(|w| w == pat).unwrap();
+        assert!(
+            at(b"\x1b8") > at(b"\x1b[r"),
+            "restored after the scroll region reset"
+        );
+        assert!(
+            at(b"\x1b8") > at(b"\x1b[?1049l"),
+            "and after leaving the alt screen"
+        );
+    }
 
     #[test]
     fn filter() {
