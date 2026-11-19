@@ -22,11 +22,14 @@ console_dev() {
 
 # burner shell: runs login shell $1 and waits for it. the shell runs under a
 # small sh in a session of its own, which owns it: that sh checks it got the
-# console as its controlling tty, says the shell is ready (token $3), runs it
-# and puts its exit code in $2/rc, or why it couldn't in $2/fail. the shell's
-# processes see this function's shell as pid 1, so poweroff, halt and reboot
-# without -f signal it (busybox sends USR2, USR1 and TERM), which ends the
-# wait with p or r in $2/how. a wrapper gone with none of those is lost
+# console as its controlling tty and that the shell runs at all, says the
+# shell is ready (token $3), runs it and puts its exit code in $2/rc, or why
+# it couldn't in $2/fail. the check is a run of its own because the exit code
+# can't tell a shell that never started (126, 127) from one whose last
+# command gave that. the shell's processes see this function's shell as pid
+# 1, so poweroff, halt and reboot without -f signal it (busybox sends USR2,
+# USR1 and TERM), which ends the wait with p or r in $2/how. a wrapper gone
+# with none of those is lost
 run_shell() {
     trap 'echo p > "$2/how"' USR1 USR2
     trap 'echo r > "$2/how"' TERM
@@ -37,6 +40,7 @@ run_shell() {
     if ! setsid setsid -c /bin/sh -c '
         echo $$ > "$2/pid"
         if ! { : < /dev/tty; } 2>/dev/null; then echo "no controlling tty" > "$2/fail"; exit 1; fi
+        if ! "$1" -c : < /dev/null > /dev/null 2>&1; then echo "$1 does not run" > "$2/fail"; exit 1; fi
         [ -n "$3" ] && printf "BURNER-%s-READY" "$3"
         "$1" -l
         echo $? > "$2/rc"' sh "$1" "$2" "$3"; then
@@ -137,8 +141,12 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     if ! command -v setsid >/dev/null 2>&1; then
         # nothing here can give the shell a controlling tty
         echo "burner: this image has no setsid, so the shell gets no job control and ctrl-c can't stop what runs in it. ~. after enter still leaves"
-        [ -n "$token" ] && printf 'BURNER-%s-READY' "$token"
-        "$sh" -l; echo $? > "$st/rc"
+        if "$sh" -c : < /dev/null > /dev/null 2>&1; then
+            [ -n "$token" ] && printf 'BURNER-%s-READY' "$token"
+            "$sh" -l; echo $? > "$st/rc"
+        else
+            echo "$sh does not run" > "$st/fail"
+        fi
     elif unshare -m -p -f --mount-proc true 2>/dev/null; then
         unshare -m -p -f --mount-proc /bin/sh /sbin/burner-init shellns "$sh" "$st" "$token"
         case $? in 129) echo r > "$st/how" ;; 130) echo p > "$st/how" ;; esac
