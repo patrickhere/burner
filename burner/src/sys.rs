@@ -11,6 +11,7 @@ pub fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+#[cfg(target_os = "linux")]
 pub fn boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap_or_default()
@@ -18,7 +19,40 @@ pub fn boot_id() -> String {
         .to_string()
 }
 
+/// changes on every boot, so a pid recorded before a reboot never matches
+#[cfg(target_os = "macos")]
+pub fn boot_id() -> String {
+    sysctl_string(c"kern.bootsessionuuid").unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
+    let mut buf = [0u8; 128];
+    let mut len = buf.len();
+    // SAFETY: valid name, a buffer of len bytes, no new value
+    let r = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    let s = &buf[..len.min(buf.len())];
+    Some(
+        String::from_utf8_lossy(s)
+            .trim_end_matches('\0')
+            .trim()
+            .to_string(),
+    )
+}
+
 /// seconds since boot, including suspend. survives wall clock changes
+#[cfg(target_os = "linux")]
 pub fn boottime() -> f64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
@@ -29,8 +63,22 @@ pub fn boottime() -> f64 {
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
+/// on macOS CLOCK_MONOTONIC keeps counting while the machine sleeps, like
+/// CLOCK_BOOTTIME on linux
+#[cfg(target_os = "macos")]
+pub fn boottime() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid pointer to a timespec
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}
+
 /// a process's start time in clock ticks since boot, field 22 of /proc/pid/stat.
 /// with the boot id it tells a process apart from a later one that reused its pid
+#[cfg(target_os = "linux")]
 pub fn proc_start(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 2..];
@@ -41,6 +89,28 @@ pub fn proc_start(pid: u32) -> Option<u64> {
         return None;
     }
     f.nth(18)?.parse().ok()
+}
+
+/// a process's start time in microseconds since the epoch, None for a zombie
+#[cfg(target_os = "macos")]
+pub fn proc_start(pid: u32) -> Option<u64> {
+    const SZOMB: u32 = 5;
+    // SAFETY: zeroed proc_bsdinfo is a valid out-parameter of the size passed
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if n != size || info.pbi_status == SZOMB {
+        return None;
+    }
+    Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
 }
 
 pub fn random_hex(bytes: usize) -> io::Result<String> {
@@ -251,12 +321,29 @@ pub fn free_bytes(path: &std::path::Path) -> io::Result<u64> {
 }
 
 /// reserve the full size on disk now, so a guest filling its disk can't fill the host's
+#[cfg(target_os = "linux")]
 pub fn preallocate(f: &File, size: u64) -> io::Result<()> {
     // SAFETY: valid fd, offset 0, mode 0 allocates blocks and extends the file
     if unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn preallocate(f: &File, size: u64) -> io::Result<()> {
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: size as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: valid fd and a valid fstore_t
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_PREALLOCATE, &mut store) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    f.set_len(size)
 }
 
 /// a close-on-exec copy of fd numbered at least `min`
@@ -399,6 +486,7 @@ pub fn restore_tty_on_panic(reset: &'static [u8]) {
 
 /// signal a process only if it's still the one `who` names. the pidfd pins the
 /// process, so a pid reused after the check can't get the signal
+#[cfg(target_os = "linux")]
 pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
     // SAFETY: pidfd_open and pidfd_send_signal are plain syscalls; the fd is
     // closed on every path
@@ -418,6 +506,15 @@ pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
         libc::close(fd);
         ok
     }
+}
+
+/// macOS has no pidfd: the start time check and the signal are two steps, so a
+/// pid reused in between could get it. pids wrap slowly enough that this is
+/// the same tradeoff every mac process manager makes
+#[cfg(target_os = "macos")]
+pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
+    // SAFETY: kill is a plain syscall
+    who.alive() && unsafe { libc::kill(who.pid as libc::pid_t, sig) } == 0
 }
 
 /// the mount a file descriptor lives on, from /proc/self/fdinfo
