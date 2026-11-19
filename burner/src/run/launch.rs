@@ -854,7 +854,10 @@ fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
 }
 
 fn mkfs(path: &Path, cfg: &Config, id: &str) -> Result<()> {
+    // its own process group: a ctrl-c is burner's to handle (prep_ok stops
+    // mkfs), not a mkfs failure
     let mut c = Command::new("mkfs.ext4")
+        .process_group(0)
         .args([
             "-q",
             "-F",
