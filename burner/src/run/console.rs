@@ -215,7 +215,7 @@ pub(super) fn relay(
     sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
     let _ = sys::set_raw(0);
     let screen = Out::new_unescaped(Dest::Stdout);
-    let mut filter = crate::output::TermFilter::default();
+    let mut filter = crate::output::TermFilter::new(!crate::output::term_utf8());
     let mut escape = Escape::default();
     let mut end = ShellEnd::new(token);
     let mut held_since: Option<Instant> = None;

@@ -127,10 +127,32 @@ impl Out {
     }
 }
 
+/// whether the caller's terminal takes utf-8, going by the locale. with no
+/// locale set at all it's assumed to. on a terminal that doesn't, the second
+/// byte of a utf-8 char can be a C1 control (0x9b is CSI), so non-ascii text
+/// is escaped or shown as ? there
+pub fn term_utf8() -> bool {
+    let var = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|s| !s.is_empty()));
+    var.is_none_or(|v| locale_utf8(&v))
+}
+
+fn locale_utf8(v: &str) -> bool {
+    let v = v.to_ascii_lowercase();
+    v.contains("utf-8") || v.contains("utf8")
+}
+
 /// guest bytes must not drive the caller's terminal: control characters become
 /// \xNN. tab and newline stay; a carriage return only when it starts a \r\n.
-/// C1 controls count too when they come as utf-8 code points
+/// C1 controls count too when they come as utf-8 code points, and on a terminal
+/// that isn't utf-8 so does everything else past ascii
 pub fn escape_controls(b: &[u8]) -> Vec<u8> {
+    static ASCII: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    escape_for(b, *ASCII.get_or_init(|| !term_utf8()))
+}
+
+fn escape_for(b: &[u8], ascii: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let esc = |out: &mut Vec<u8>, c: u8| out.extend_from_slice(format!("\\x{c:02x}").as_bytes());
     for chunk in b.utf8_chunks() {
@@ -142,7 +164,7 @@ pub fn escape_controls(b: &[u8]) -> Vec<u8> {
                 '\t' | '\n' => out.push(c as u8),
                 '\r' if bytes.get(i + 1) == Some(&b'\n') => out.push(b'\r'),
                 _ if c < 0x20 || c == 0x7f => esc(&mut out, c as u8),
-                _ if (0x80..=0x9f).contains(&c) => {
+                _ if (0x80..=0x9f).contains(&c) || (ascii && c >= 0x80) => {
                     out.extend_from_slice(format!("\\u{{{c:x}}}").as_bytes())
                 }
                 _ => out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes()),
@@ -199,6 +221,8 @@ pub struct TermFilter {
     st: FState,
     seq: Vec<u8>,
     utf8: Vec<u8>,
+    /// the terminal isn't utf-8: non-ascii chars go out as ?
+    ascii: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -231,6 +255,13 @@ const PRIVATE_MODES: &[u32] = &[1, 7, 12, 25, 47, 1047, 1048, 1049, 2004];
 const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefmr";
 
 impl TermFilter {
+    pub fn new(ascii: bool) -> TermFilter {
+        TermFilter {
+            ascii,
+            ..TermFilter::default()
+        }
+    }
+
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(input.len());
         for &b in input {
@@ -322,7 +353,11 @@ impl TermFilter {
             Ok(s) => {
                 // C1 controls (U+0080..U+009F) act like ESC sequences on some terminals
                 if !s.chars().all(|c| ('\u{80}'..='\u{9f}').contains(&c)) {
-                    out.extend_from_slice(&self.utf8);
+                    if self.ascii {
+                        out.push(b'?');
+                    } else {
+                        out.extend_from_slice(&self.utf8);
+                    }
                 }
                 self.utf8.clear();
             }
@@ -462,6 +497,34 @@ mod tests {
         assert_eq!(f.feed(&v[1..]), v.to_vec());
         assert_eq!(f.feed(b"\xff\xfeok"), b"ok".to_vec());
         assert_eq!(f.feed(b"\x00\x0e\x7fok"), b"ok".to_vec());
+    }
+
+    #[test]
+    fn filter_on_a_terminal_that_isnt_utf8() {
+        // U+011B is c4 9b: on a latin-1 terminal 0x9b is CSI, and 6n a query
+        let mut f = TermFilter::new(true);
+        assert_eq!(
+            f.feed("a\u{11b}6n \u{2713}b".as_bytes()),
+            b"a?6n ?b".to_vec()
+        );
+        assert_eq!(f.feed("\u{9d}x".as_bytes()), b"x".to_vec());
+        assert_eq!(
+            escape_for("a\u{11b}b".as_bytes(), true),
+            b"a\\u{11b}b".to_vec()
+        );
+        assert_eq!(
+            escape_for("a\u{11b}b".as_bytes(), false),
+            "a\u{11b}b".as_bytes().to_vec()
+        );
+        for (v, utf8) in [
+            ("C.UTF-8", true),
+            ("en_US.utf8", true),
+            ("C", false),
+            ("POSIX", false),
+            ("de_DE.ISO-8859-1", false),
+        ] {
+            assert_eq!(locale_utf8(v), utf8, "{v}");
+        }
     }
 
     #[test]
