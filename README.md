@@ -20,6 +20,16 @@ sudo burner run -- 'uname -a; exit 3'      # run one thing, get its output and e
 
 ![burner running commands in fresh VMs: a kernel and alpine version, an exit code coming back, https working, and the LAN blocked](docs/media/demo.gif)
 
+## install
+
+```
+curl -fsSL https://get.burnervm.dev | sh
+```
+
+![the installer on a fresh aarch64 machine: packages, a checksummed download, firecracker and the units, the alpine image, then a first VM](docs/media/install.gif)
+
+that's linux with kvm (x86_64 or arm), or a mac with an M3 or newer, where it sets burner up in a linux VM through homebrew. run it again later to upgrade. [install details](#install-details) has what it does step by step, the manual way, macs, building from source and making more images.
+
 ## what it does
 
 - `burner shell [image]` -> a login shell on the VM's console, your terminal size passed in. 60 min by default. `~.` after enter leaves and stops the VM, like ssh
@@ -35,7 +45,7 @@ tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d
 
 exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
-the image is plain alpine with git and curl, so the first example installs node itself. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install](#install).
+the image is plain alpine with git and curl, so the first example installs node itself. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
 
 defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml`). an image's `defaults.toml` can change the defaults:
 
@@ -102,17 +112,11 @@ i run it on a box that's only reachable over a VPN. yours might sit on a home LA
 
 what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel and burner's pinned firecracker updated), side channels between VMs on the same cpu, and anything you pipe in yourself.
 
-## install
+## install details
 
-linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image:
+burner needs linux on x86_64 or aarch64 with kvm and cgroup v2. the one-liner from [install](#install) downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image.
 
-```
-curl -fsSL https://get.burnervm.dev | sh
-```
-
-![the installer on a fresh aarch64 machine: packages, a checksummed download, firecracker and the units, the alpine image, then a first VM](docs/media/install.gif)
-
-piping a script to `sh` means trusting it, so read it first if you'd rather: `curl -fsSL https://get.burnervm.dev | less`, or it's `get.sh` in this repo. run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
+piping a script to `sh` means trusting it, so read it first if you'd rather: `curl -fsSL https://get.burnervm.dev | less`, or it's `get.sh` in this repo. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
 ```
 sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
