@@ -60,6 +60,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck install.sh guest/init tools/build-image
+      - run: shellcheck install.sh get.sh guest/init tools/build-image
       # the suites run as a user with sudo and redirect on purpose
       - run: shellcheck -S warning -e SC2024 tests/*.sh
