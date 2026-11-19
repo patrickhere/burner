@@ -1,6 +1,13 @@
-# burner
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/svg/lockup-on-dark.svg">
+    <img alt="burner" src="brand/svg/lockup-on-light.svg" width="300">
+  </picture>
+</p>
 
-[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml)
+[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml) [![crates.io](https://img.shields.io/crates/v/burnervm)](https://crates.io/crates/burnervm)
+
+[x](https://x.com/burnervm) · [bluesky](https://bsky.app/profile/burnervm.dev)
 
 throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or run a command in it, and it's deleted when you're done. each one is a firecracker microVM with its own kernel, and it can reach the internet but not your LAN.
 
@@ -12,6 +19,8 @@ status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's ru
 sudo burner shell                          # root shell in a fresh VM, gone when you exit
 sudo burner run -- 'uname -a; exit 3'      # run one thing, get its output and exit code back
 ```
+
+![burner running commands in fresh VMs: a kernel and alpine version, an exit code coming back, https working, and the LAN blocked](docs/media/demo.gif)
 
 ## what it does
 
@@ -28,7 +37,7 @@ tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d
 
 exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
-the image is plain alpine with git and curl, so the first example installs node itself. build your own with a Dockerfile in `images/NAME/` and `tools/build-image NAME`.
+the image is plain alpine with git and curl, so the first example installs node itself. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install](#install).
 
 defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml`). an image's `defaults.toml` can change the defaults:
 
@@ -92,7 +101,9 @@ linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it down
 curl -fsSL https://get.burnervm.dev | sh
 ```
 
-run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
+![the installer on a fresh aarch64 machine: packages, a checksummed download, firecracker and the units, the alpine image, then a first VM](docs/media/install.gif)
+
+piping a script to `sh` means trusting it, so read it first if you'd rather: `curl -fsSL https://get.burnervm.dev | less`, or it's `get.sh` in this repo. run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
 ```
 sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
@@ -116,7 +127,7 @@ burner run -- 'uname -a'         # every burner command runs in the VM, no sudo 
 
 on an M1 or M2 there's no kvm inside the VM, so no burner. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
 
-or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
+or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on. the crates are on crates.io as `burnervm` and `burnervm-tui` (the commands are still `burner` and `burner-tui`), but `cargo install` alone isn't enough: burner also needs the firecracker, jailer, guest kernel and units that `install.sh` sets up.
 
 an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
 
@@ -180,3 +191,5 @@ both VM suites run on github's kvm runners on every push to main, and on a dedic
 ## license
 
 MIT or Apache-2.0, your pick. see `LICENSE-MIT` and `LICENSE-APACHE`. security reports: `SECURITY.md`.
+
+the logo and the rest of `brand/` (the `>]` mark, favicons, social images) have their own terms in `brand/README.md`.
