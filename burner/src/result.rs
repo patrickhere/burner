@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path};
 use std::process::{Command, ExitCode, Stdio};
@@ -127,11 +127,16 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     // parser is still its own process under the same rlimits
     #[cfg(target_os = "linux")]
     cmd.uid(uid).gid(gid);
-    // SAFETY: dup2 and setrlimit only, both async-signal-safe on linux
+    // the sandbox only holds the parser to the fds it has, so it gets no others
+    #[cfg(target_os = "macos")]
+    let fds = sys::open_fds()?;
+    // SAFETY: dup2, fcntl, close and setrlimit only, all async-signal-safe
     unsafe {
         cmd.pre_exec(move || {
             sys::dup_to(l, 3)?;
             sys::dup_to(t, 4)?;
+            #[cfg(target_os = "macos")]
+            sys::close_strays(&fds, &[3, 4]);
             sys::limit_child(MEM_LIMIT)?;
             sys::limit_child(&[
                 (libc::RLIMIT_CPU, 30),
@@ -190,19 +195,31 @@ pub fn child_main(emit: bool) -> ExitCode {
         eprintln!("burner: {PARSE_ARG} is internal and never runs as root");
         return ExitCode::from(2);
     }
-    let fd_ok = |fd: i32, devnull_ok: bool| -> bool {
+    // the file type of an fd: regular or char device, None for anything else
+    let kind = |fd: i32| -> Option<(libc::mode_t, u64)> {
         // SAFETY: zeroed stat is a valid out-parameter; fstat on any int is safe
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
-            return false;
+            return None;
         }
-        let kind = st.st_mode & libc::S_IFMT;
-        kind == libc::S_IFREG || (devnull_ok && kind == libc::S_IFCHR)
+        let k = st.st_mode & libc::S_IFMT;
+        (k == libc::S_IFREG || k == libc::S_IFCHR).then_some((k, st.st_size as u64))
     };
-    if !(fd_ok(0, false) && fd_ok(3, false) && fd_ok(4, true)) {
-        eprintln!("burner: {PARSE_ARG} is internal, run by burner run");
+    let (src_kind, tar_kind) = (kind(0), kind(4));
+    let src_len = match (src_kind, kind(3), tar_kind) {
+        (Some((libc::S_IFREG, len)), Some((libc::S_IFREG, _)), Some(_)) => len,
+        _ => {
+            eprintln!("burner: {PARSE_ARG} is internal, run by burner run");
+            return ExitCode::from(2);
+        }
+    };
+    let tar_is_null = tar_kind.is_some_and(|(k, _)| k == libc::S_IFCHR);
+    if tar_is_null && emit {
         return ExitCode::from(2);
     }
+    // everything that needs more than the fds themselves happens before the
+    // sandbox goes on: the checks above, and the keys every HashSet is seeded from
+    let _ = std::collections::hash_map::RandomState::new();
     // no user of its own to run as on macOS, so a sandbox with no rights past
     // the fds it was handed keeps a parser bug away from your files and the net
     #[cfg(target_os = "macos")]
@@ -219,13 +236,6 @@ pub fn child_main(emit: bool) -> ExitCode {
         )
     };
     let tarf = File::from(tarf);
-    if tarf
-        .metadata()
-        .is_ok_and(|m| m.file_type().is_char_device())
-        && emit
-    {
-        return ExitCode::from(2);
-    }
     let mut meta = Meta::default();
     let mut out = emit.then(|| {
         tar::Builder::new(Capped {
@@ -235,7 +245,9 @@ pub fn child_main(emit: bool) -> ExitCode {
         })
     });
     let mut src = src;
-    if let Err(e) = prescan(&mut src).and_then(|()| walk(src, logf, out.as_mut(), &mut meta)) {
+    if let Err(e) =
+        prescan(&mut src, src_len).and_then(|()| walk(src, logf, out.as_mut(), &mut meta))
+    {
         meta.problem = Some(e.to_string());
         meta.fatal = true;
     }
@@ -258,9 +270,9 @@ fn fatal(msg: &str) -> io::Error {
 /// entry types busybox tar writes, small long-name and pax records, a bounded
 /// number of headers, and every size in range. the crate would otherwise load
 /// extension records and sparse maps before any of burner's limits apply
-fn prescan(src: &mut File) -> io::Result<()> {
+fn prescan(src: &mut File, len: u64) -> io::Result<()> {
     use std::io::{Seek, SeekFrom};
-    let len = src.metadata()?.len().min(RESULT_SIZE);
+    let len = len.min(RESULT_SIZE);
     let (mut off, mut headers) = (0u64, 0u32);
     let mut h = [0u8; 512];
     while off + 512 <= len {
@@ -530,7 +542,7 @@ mod tests {
         fs::write(dir.join("raw"), bytes)?;
         let mut meta = Meta::default();
         let mut src = File::open(dir.join("raw"))?;
-        let res = prescan(&mut src)
+        let res = prescan(&mut src, bytes.len() as u64)
             .and_then(|()| walk(src, File::create(dir.join("log"))?, None, &mut meta));
         let _ = fs::remove_dir_all(&dir);
         res.map(|()| meta)
