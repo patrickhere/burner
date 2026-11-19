@@ -227,6 +227,8 @@ pub struct TermFilter {
     ascii: bool,
     /// the alternate screen mode that's on
     alt: Option<u32>,
+    /// the guest turned cursor blinking on or off
+    blink: bool,
 }
 
 #[derive(Default, PartialEq)]
@@ -254,8 +256,7 @@ const STR_MAX: usize = 16 << 10;
 /// alt screen is on. leaving the alt screen and resetting the scroll region
 /// both move the cursor home, so it's saved before them and restored after:
 /// the caller's prompt comes back below the session, not over its first line
-pub const TERM_RESET: &[u8] =
-    b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
+pub const TERM_RESET: &[u8] = b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l";
 
 /// the mode resets after the alt screen and scroll region, same as TERM_RESET
 const MODES_RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
@@ -297,6 +298,10 @@ impl TermFilter {
         }
         r.extend_from_slice(b"\x1b7\x1b[r\x1b8");
         r.extend_from_slice(MODES_RESET);
+        // only when the guest touched it: some terminals blink by default
+        if self.blink {
+            r.extend_from_slice(b"\x1b[?12l");
+        }
         r
     }
 
@@ -406,6 +411,7 @@ impl TermFilter {
         let on = fin == b'h';
         for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
             match m.parse::<u32>() {
+                Ok(12) => self.blink = true,
                 Ok(n @ (47 | 1047 | 1049)) if on && self.alt.is_none() => self.alt = Some(n),
                 // any of them going off is back on the main screen
                 Ok(47 | 1047 | 1049) if !on => self.alt = None,
@@ -517,6 +523,15 @@ mod tests {
         assert!(f.reset().starts_with(b"\x1b[?47l\x1b7"));
         f.feed(b"\x1b[?1049h\x1b[?1047l");
         assert_eq!(f.reset(), r);
+    }
+
+    #[test]
+    fn reset_undoes_blinking() {
+        let mut f = TermFilter::default();
+        assert!(!f.reset().windows(6).any(|w| w == b"\x1b[?12l"));
+        assert_eq!(f.feed(b"\x1b[?12;25h"), b"\x1b[?12;25h".to_vec());
+        assert!(f.reset().ends_with(b"\x1b[?12l"));
+        assert!(TERM_RESET.ends_with(b"\x1b[?12l"));
     }
 
     #[test]
