@@ -430,6 +430,7 @@ fn run_vm(
             }
             Outcome::Interrupted => {
                 set_status("interrupted", None);
+                eprintln!("burner: interrupted, VM stopped");
                 EXIT_INTERRUPTED
             }
         });
