@@ -289,10 +289,9 @@ fn run() -> io::Result<()> {
 
 /// the screen modes a guest can leave on through burner shell, off again, for
 /// a burner that died before it could do that itself: burner's TERM_RESET.
-/// burner shell sends every alt screen as 1049, so ?1049l leaves the guest's
-/// before the pause is printed; the cursor is saved around it because off the
-/// alt screen ?1049l restores a stale one
-const MODES_RESET: &[u8] = b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l\r\n";
+/// burner shell sends every alt screen as 1049, so ?1049h ?1049l leaves the
+/// guest's before the pause is printed, with the cursor where it was
+const MODES_RESET: &[u8] = b"\x1b[?1049h\x1b[?1049l\x1b7\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l\r\n";
 
 /// gives the real terminal to burner shell or run and takes it back after
 fn hand_over(

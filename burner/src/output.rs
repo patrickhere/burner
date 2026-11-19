@@ -376,10 +376,13 @@ const STR_IDLE: Duration = Duration::from_secs(1);
 
 /// undoes every mode the filter lets through. the panic hook sends this one;
 /// a shell that ends normally gets Screen::reset, which knows whether the
-/// alt screen is on. leaving the alt screen and resetting the scroll region
-/// both move the cursor home, so it's saved before them and restored after:
-/// the caller's prompt comes back below the session, not over its first line
-pub const TERM_RESET: &[u8] = b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l";
+/// alt screen is on. this doesn't, so it goes onto the alt screen and back:
+/// that leaves the guest's with the cursor where it was on the main screen,
+/// and off it puts the cursor back where it is, where a bare ?1049l would
+/// restore a stale one. resetting the scroll region moves the cursor home, so
+/// it's saved around that, once on the main screen: a cursor saved on the alt
+/// screen would land on the main one in tmux, which keeps one for both
+pub const TERM_RESET: &[u8] = b"\x1b[?1049h\x1b[?1049l\x1b7\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l";
 
 /// the mode resets after the alt screen and scroll region, same as TERM_RESET
 const MODES_RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
@@ -844,15 +847,18 @@ mod tests {
     #[test]
     fn term_reset_keeps_the_cursor() {
         let r = TERM_RESET;
-        assert!(r.starts_with(b"\x1b7"), "cursor saved first");
+        assert!(
+            r.starts_with(b"\x1b[?1049h\x1b[?1049l"),
+            "off the alt screen first"
+        );
         let at = |pat: &[u8]| r.windows(pat.len()).position(|w| w == pat).unwrap();
+        assert!(
+            at(b"\x1b7") > at(b"\x1b[?1049l"),
+            "cursor saved on the main screen"
+        );
         assert!(
             at(b"\x1b8") > at(b"\x1b[r"),
             "restored after the scroll region reset"
-        );
-        assert!(
-            at(b"\x1b8") > at(b"\x1b[?1049l"),
-            "and after leaving the alt screen"
         );
     }
 
