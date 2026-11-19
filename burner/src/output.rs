@@ -682,12 +682,14 @@ impl TermFilter {
 }
 
 /// a private mode sequence with 47 and 1047 (alt screens that don't save the
-/// cursor) as 1049: one alt screen mode, so the reset has one way back
+/// cursor) as 1049: one alt screen mode, so the reset has one way back. the
+/// modes go out as plain numbers, so 0047 is 47 too and Screen sees them all
 fn alt_as_1049(seq: &[u8]) -> Vec<u8> {
     let (&fin, body) = seq.split_last().expect("csi has a final byte");
-    let mut modes: Vec<&str> = Vec::new();
+    let mut modes: Vec<String> = Vec::new();
     for m in std::str::from_utf8(&body[3..]).unwrap_or("").split(';') {
-        let m = if m == "47" || m == "1047" { "1049" } else { m };
+        let Ok(n) = m.parse::<u32>() else { continue };
+        let m = if n == 47 || n == 1047 { 1049 } else { n }.to_string();
         if !modes.contains(&m) {
             modes.push(m);
         }
@@ -895,6 +897,10 @@ mod tests {
         assert_eq!(f.feed(b"\x1b[?47h"), b"\x1b[?1049h".to_vec());
         assert_eq!(f.feed(b"\x1b[?1047l"), b"\x1b[?1049l".to_vec());
         assert_eq!(f.feed(b"\x1b[?1047;1049;25h"), b"\x1b[?1049;25h".to_vec());
+        // a number is a number, however it's written
+        assert_eq!(f.feed(b"\x1b[?0047h"), b"\x1b[?1049h".to_vec());
+        assert_eq!(f.feed(b"\x1b[?01047;025l"), b"\x1b[?1049;25l".to_vec());
+        assert!(shown(b"\x1b[?0047h").reset().starts_with(b"\x1b[?1049l"));
         assert_eq!(f.feed(b"\x1b[?1;25l"), b"\x1b[?1;25l".to_vec());
     }
 
