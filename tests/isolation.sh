@@ -129,10 +129,19 @@ base=$(sudo burner config | awk '$1 == "uid_base" {print $3}')
 sudo burner run --mem 2048 -- 'true' </dev/null >/dev/null 2>"$T/m.err"; wait
 grep -q 'waiting for a slot' "$T/m.err" && ok "3G total memory budget enforced" || bad "memory budget" "$(cat "$T/m.err")"
 
-# 12 sudo burner kill
-( sudo burner run --tag victim -- 'sleep 300' </dev/null >/dev/null 2>&1; echo $? > "$T/k.rc" ) & sleep 5
+# 12 sudo burner kill: the killed run exits 130, whether the kill lands while the
+# job runs or while the VM is still booting (the VM can die before burner's own
+# check of the kill flag comes around)
+( sudo burner run --tag victim -- 'sleep 300' </dev/null >/dev/null 2>"$T/k.err"; echo $? > "$T/k.rc" ) & sleep 5
 vid=$(sudo burner ls | awk '/victim/{print $1}'); sudo burner kill "$vid" >/dev/null; wait
-[ -n "$vid" ] && [ "$(cat "$T/k.rc")" != 0 ] && ok "sudo burner kill stops a running VM" || bad "kill" "vid=$vid rc=$(cat "$T/k.rc")"
+[ -n "$vid" ] && [ "$(cat "$T/k.rc")" = 130 ] && grep -q 'killed by burner kill' "$T/k.err" \
+  && ok "sudo burner kill stops a running VM (rc 130)" || bad "kill" "vid=$vid rc=$(cat "$T/k.rc") err=$(tr '\n' ' ' < "$T/k.err")"
+( sudo burner run --tag victim2 -- 'sleep 300' </dev/null >/dev/null 2>"$T/k2.err"; echo $? > "$T/k2.rc" ) &
+vid=""
+for _ in $(seq 40); do vid=$(sudo burner ls | awk '$2 == "victim2" && /running/ {print $1}'); [ -n "$vid" ] && break; sleep 0.25; done
+[ -n "$vid" ] && sudo burner kill "$vid" >/dev/null; wait
+[ -n "$vid" ] && [ "$(cat "$T/k2.rc")" = 130 ] && grep -q 'killed by burner kill' "$T/k2.err" && ! grep -q 'VM ended before' "$T/k2.err" \
+  && ok "sudo burner kill during boot: rc 130, no console dump" || bad "kill during boot" "vid=$vid rc=$(cat "$T/k2.rc") err=$(tr '\n' ' ' < "$T/k2.err" | head -c 300)"
 
 # 13 argument fuzzing: all must be refused with rc 2 before any VM starts
 fz=0
