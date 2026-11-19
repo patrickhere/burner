@@ -11,7 +11,7 @@ throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or 
 
 it started as a sandbox on my homelab for running code i don't trust (install scripts, other people's repos, things agents want to run) away from the box that has my keys on it. this is the rebuild in rust so other people can install it. the homelab version stays private, so the history here starts with the rebuild.
 
-status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's runners) and debian 13 on x86_64, and ubuntu 24.04 on aarch64 (in a VM on an apple silicon mac). nobody has audited it.
+status: early, with one maintainer. it's tested on ubuntu 24.04 and 26.04 and debian 13 on x86_64, and on arm in a linux VM on a mac. it hasn't had an outside security review yet, so read [what it protects against](#what-it-protects-against) before trusting it with anything that matters.
 
 ```
 sudo burner shell                          # root shell in a fresh VM, gone when you exit
