@@ -24,9 +24,9 @@ pub use admin::reaper_age;
 pub use admin::{kill, ls, reap};
 #[cfg(target_os = "linux")]
 pub use launch::VMM_OVERHEAD_MIB;
-pub use launch::main;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
+pub use launch::{config_failed, main, status_fd_ok};
 pub use plan::{RunArgs, ShellArgs, images, shell_main};
 
 pub const EXIT_USAGE: u8 = 2;

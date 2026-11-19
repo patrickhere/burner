@@ -18,6 +18,7 @@ mod sys;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
@@ -105,7 +106,25 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
-    let cfg = Config::load(&cli.config)?;
+    let t0 = Instant::now();
+    if let Cmd::Run(a) = &cli.cmd
+        && !run::status_fd_ok(a)
+    {
+        return Ok(ExitCode::from(run::EXIT_USAGE));
+    }
+    // run and shell end with 125 when they have no result, a config that
+    // doesn't load included, and run still writes its status line
+    let cfg = match Config::load(&cli.config) {
+        Ok(cfg) => cfg,
+        Err(e) => match &cli.cmd {
+            Cmd::Run(a) => return Ok(run::config_failed(a, &e, t0)),
+            Cmd::Shell(_) => {
+                eprintln!("burner: {e:#}");
+                return Ok(ExitCode::from(run::EXIT_SANDBOX));
+            }
+            _ => return Err(e),
+        },
+    };
     #[cfg(target_os = "macos")]
     cgroup::set_dir(&cfg.paths.state);
     match cli.cmd {

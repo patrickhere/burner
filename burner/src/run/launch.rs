@@ -69,18 +69,50 @@ fn set_status(outcome: &'static str, rc: Option<i32>) {
     }
 }
 
+/// checked before the config loads, so a run that fails that early still
+/// writes its status line
+pub fn status_fd_ok(a: &RunArgs) -> bool {
+    let Some(fd) = a.status_fd else {
+        return true;
+    };
+    // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
+    // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
+    let ok =
+        fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
+    if !ok {
+        eprintln!("burner: --status-fd {fd} isn't an open file descriptor (2, or above 2)");
+    }
+    ok
+}
+
+/// a run whose config didn't load: no result, so 125 like any other sandbox failure
+pub fn config_failed(a: &RunArgs, e: &anyhow::Error, t0: Instant) -> ExitCode {
+    eprintln!("burner: {e:#}");
+    if let Some(fd) = a.status_fd {
+        write_status(fd, ("sandbox_error", None), EXIT_SANDBOX, t0);
+    }
+    ExitCode::from(EXIT_SANDBOX)
+}
+
+fn write_status(fd: i32, (outcome, rc): (&str, Option<i32>), code: u8, t0: Instant) {
+    let line = json!({"outcome": outcome, "rc": rc, "exit": code, "id": RUN_ID.get(),
+                      "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0})
+    .to_string()
+        + "\n";
+    let mut b = line.as_bytes();
+    while !b.is_empty() {
+        // SAFETY: write(2) of a live buffer to an fd checked at start
+        let n = unsafe { libc::write(fd, b.as_ptr().cast(), b.len()) };
+        if n <= 0 {
+            break;
+        }
+        b = &b[n as usize..];
+    }
+}
+
+/// the caller checked a.status_fd with status_fd_ok
 pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     interrupted();
-    if let Some(fd) = a.status_fd {
-        // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
-        // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
-        let ok =
-            fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
-        if !ok {
-            eprintln!("burner: --status-fd {fd} isn't an open file descriptor (2, or above 2)");
-            return ExitCode::from(EXIT_USAGE);
-        }
-    }
     // boot mode from the start: keys typed during setup wait for the VM and
     // ctrl-c works. the terminal comes back however main returns
     let _tty = a
@@ -101,24 +133,12 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
         }
     };
     if let Some(fd) = a.status_fd {
-        let (outcome, rc) = STATUS.lock().ok().and_then(|s| *s).unwrap_or(match code {
+        let status = STATUS.lock().ok().and_then(|s| *s).unwrap_or(match code {
             EXIT_USAGE => ("usage", None),
             EXIT_INTERRUPTED => ("interrupted", None),
             _ => ("sandbox_error", None),
         });
-        let line = json!({"outcome": outcome, "rc": rc, "exit": code, "id": RUN_ID.get(),
-                          "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0})
-        .to_string()
-            + "\n";
-        let mut b = line.as_bytes();
-        while !b.is_empty() {
-            // SAFETY: write(2) of a live buffer to an fd checked at start
-            let n = unsafe { libc::write(fd, b.as_ptr().cast(), b.len()) };
-            if n <= 0 {
-                break;
-            }
-            b = &b[n as usize..];
-        }
+        write_status(fd, status, code, t0);
     }
     ExitCode::from(code)
 }
