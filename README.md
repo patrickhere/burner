@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml) [![crates.io](https://img.shields.io/crates/v/burnervm)](https://crates.io/crates/burnervm) [![x](https://img.shields.io/badge/x-%40burnervm-black?logo=x)](https://x.com/burnervm) [![bluesky](https://img.shields.io/badge/bluesky-%40burnervm.dev-0285FF?logo=bluesky&logoColor=white)](https://bsky.app/profile/burnervm.dev)
+[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml) [![crates.io](https://img.shields.io/crates/v/burnervm)](https://crates.io/crates/burnervm) [![site](https://img.shields.io/badge/site-burnervm.dev-fa794a)](https://burnervm.dev) [![x](https://img.shields.io/badge/x-%40burnervm-black?logo=x)](https://x.com/burnervm) [![bluesky](https://img.shields.io/badge/bluesky-%40burnervm.dev-0285FF?logo=bluesky&logoColor=white)](https://bsky.app/profile/burnervm.dev)
 
 throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or run a command in it, and it's deleted when you're done. each one is a firecracker microVM with its own kernel, and it can reach the internet but not your LAN.
 
