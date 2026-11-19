@@ -21,6 +21,9 @@ use app::{Action, App, Screen};
 use burner::{Burner, Mode};
 
 const REFRESH: Duration = Duration::from_secs(2);
+/// crossterm's poll-based source (use-dev-tty) never looks at the tty for a
+/// zero timeout, buffered keys included, so the shortest real one
+const KEY_POLL: Duration = Duration::from_millis(1);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -206,7 +209,7 @@ fn run() -> io::Result<()> {
             Tty::Input => {}
         }
         // one read can hold several keys, crossterm keeps the rest buffered
-        while event::poll(Duration::ZERO)? {
+        while event::poll(KEY_POLL)? {
             let Event::Key(k) = event::read()? else {
                 continue;
             };
