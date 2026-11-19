@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
-use super::console::{deliver, print_rest, relay, stream, supervise};
+use super::console::{ShellIo, deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
@@ -408,7 +408,12 @@ fn run_vm(
                 None,
             );
         }
-        let sh = relay(&mut child, &token, deadline, cfg, id, legacy, tty_rec);
+        let io = ShellIo {
+            legacy,
+            tty_rec,
+            size,
+        };
+        let sh = relay(&mut child, &token, deadline, cfg, id, io);
         // shutting down from here on: a signal after this point stops any
         // wait on the caller's terminal
         let seen = signals();

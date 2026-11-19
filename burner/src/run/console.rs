@@ -202,6 +202,16 @@ fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<
     None
 }
 
+/// what relay gets besides the VM itself
+pub(super) struct ShellIo {
+    /// an image whose guest init doesn't say when the shell is ready
+    pub(super) legacy: bool,
+    /// the job disk with the terminal size on it, see write_size
+    pub(super) tty_rec: Option<File>,
+    /// the size written there before the VM started
+    pub(super) size: (u16, u16),
+}
+
 /// how a shell session went
 pub(super) struct Shell {
     pub(super) outcome: Outcome,
@@ -226,17 +236,21 @@ pub(super) struct Ended {
 /// its serial port are lost, and before the shell runs nothing in the guest
 /// would act on ctrl-c. the terminal stays in the boot mode burner set (ctrl-c
 /// still interrupts burner) until guest init says the shell is starting, and
-/// the held keys go once the shell has drawn its prompt. `legacy` is an image
-/// whose init doesn't say so: keys go to it right away, as they used to
+/// the held keys go once the shell has drawn its prompt. an image whose init
+/// doesn't say so (legacy) gets keys right away, as it used to
 pub(super) fn relay(
     child: &mut Child,
     token: &str,
     deadline: Deadline,
     cfg: &Config,
     id: &str,
-    legacy: bool,
-    tty_rec: Option<File>,
+    io: ShellIo,
 ) -> Shell {
+    let ShellIo {
+        legacy,
+        tty_rec,
+        size: sent,
+    } = io;
     let screen = Out::new_screen();
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
         return Shell {
@@ -270,10 +284,11 @@ pub(super) fn relay(
     // with the vCPUs' run count then
     let (mut tail, mut halt_seen): (Vec<u8>, Option<(Instant, Option<u64>)>) = (Vec::new(), None);
     let mut halted = false;
-    // a resize goes to the guest through the job disk, see write_size
-    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // a resize goes to the guest through the job disk, see write_size. it
+    // starts out set, for a resize between writing the disk and getting here
+    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, winch.clone());
-    let (mut size, mut size_seq) = (sys::term_size(1), 0u64);
+    let (mut size, mut size_seq) = (sent, 0u64);
     let mut held_since: Option<Instant> = None;
     // when guest init's end marker came: the VM stops right after it
     let mut ended_at: Option<Instant> = None;
@@ -318,11 +333,15 @@ pub(super) fn relay(
         if winch.swap(false, std::sync::atomic::Ordering::Relaxed)
             && let Some(f) = &tty_rec
             && let Some(now) = sys::term_size(1)
-            && size != Some(now)
+            && size != now
         {
-            size = Some(now);
-            size_seq += 1;
-            let _ = write_size(f, size_seq, now);
+            // a failed write is tried again with the next look
+            if write_size(f, size_seq + 1, now).is_ok() {
+                size = now;
+                size_seq += 1;
+            } else {
+                winch.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if !raw && started.elapsed() >= READY_WAIT {
             let _ = sys::set_raw(0);
