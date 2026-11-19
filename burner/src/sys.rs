@@ -571,23 +571,29 @@ pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
 }
 
 /// the fds open in this process, for a child to close between fork and exec,
-/// where it can't list them itself
+/// where it can't list them itself. an error, never an empty list, when they
+/// can't be read: the child would close nothing
 #[cfg(target_os = "macos")]
-pub fn open_fds() -> Vec<libc::c_int> {
-    fs::read_dir("/dev/fd")
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
-        .collect()
+pub fn open_fds() -> io::Result<Vec<libc::c_int>> {
+    let mut fds = Vec::new();
+    for e in fs::read_dir("/dev/fd")? {
+        let name = e?.file_name();
+        let fd = name
+            .to_str()
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| io::Error::other("odd name in /dev/fd"))?;
+        fds.push(fd);
+    }
+    Ok(fds)
 }
 
 /// in a forked child: close what of `fds` would survive exec, except stdio and
 /// `keep`. no jailer on macOS to close what the caller left open without
 /// close-on-exec, and a sandbox only limits what gets opened later
 #[cfg(target_os = "macos")]
-pub fn close_strays(fds: &[libc::c_int], keep: Option<libc::c_int>) {
+pub fn close_strays(fds: &[libc::c_int], keep: &[libc::c_int]) {
     for &fd in fds {
-        if fd <= 2 || Some(fd) == keep {
+        if fd <= 2 || keep.contains(&fd) {
             continue;
         }
         // SAFETY: fcntl and close are async-signal-safe and only touch the

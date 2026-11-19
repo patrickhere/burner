@@ -167,11 +167,11 @@ pub fn spawn(
         cmd.args(["--block", &format!("{ip}/32")]);
     }
     cmd.process_group(group as libc::pid_t);
-    let fds = sys::open_fds();
+    let fds = sys::open_fds()?;
     // SAFETY: close_strays and inherit only call fcntl and close
     unsafe {
         cmd.pre_exec(move || {
-            sys::close_strays(&fds, Some(raw));
+            sys::close_strays(&fds, &[raw]);
             inherit(raw)
         });
     }
@@ -199,11 +199,11 @@ pub fn probe() -> Result<(), String> {
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
         .current_dir("/");
-    let fds = sys::open_fds();
+    let fds = sys::open_fds().map_err(|e| e.to_string())?;
     // SAFETY: close_strays and inherit only call fcntl and close
     unsafe {
         cmd.pre_exec(move || {
-            sys::close_strays(&fds, Some(raw));
+            sys::close_strays(&fds, &[raw]);
             inherit(raw)
         });
     }

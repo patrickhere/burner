@@ -693,13 +693,13 @@ fn launch(
     vmm.process_group(0);
     let me = std::process::id() as libc::pid_t;
     let vm_fd = net.as_ref().map(|(_, v, _)| v.as_raw_fd());
-    let fds = sys::open_fds();
+    let fds = sys::open_fds().context("listing open fds")?;
     // SAFETY: join_from_child only calls getppid, close_strays and inherit
     // only fcntl and close
     unsafe {
         vmm.pre_exec(move || {
             cgroup::join_from_child(&procs, me)?;
-            sys::close_strays(&fds, vm_fd);
+            sys::close_strays(&fds, vm_fd.as_slice());
             vm_fd.map_or(Ok(()), crate::macnet::inherit)
         });
     }
