@@ -505,6 +505,10 @@ pub fn public_ip(cfg: &Config) -> Option<(Ipv4Addr, Duration)> {
         .ok()
         .and_then(|t| SystemTime::now().duration_since(t).ok())
         .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    if age > PUBLIC_IP_MAX_AGE {
+        return None;
+    }
     Some((ip, age))
 }
 
@@ -521,17 +525,92 @@ fn plausible_public(ip: Ipv4Addr) -> bool {
 }
 
 /// on macOS, the network an address was looked up on: the default route's
-/// gateway and interface. a mac moves between networks, and the address found
-/// behind the last router says nothing about the one it's behind now
+/// gateway, its ethernet address, the mac's own address there and the
+/// interface. a mac moves between networks, and the address found behind the
+/// last router says nothing about the one it's behind now. most home routers
+/// are 192.168.1.1, so that alone can't tell them apart. macOS shows the
+/// router's ethernet address only to processes it lets onto the local network
+/// (arp sees no entry otherwise), so the mac's own dhcp address is in the key
+/// too. anything that changes only costs a lookup
 #[cfg(target_os = "macos")]
 fn uplink() -> Option<String> {
     use crate::macnet::route::{Gateway, lookup};
     let r = lookup(Ipv4Addr::UNSPECIFIED, true).ok()?;
+    let me = own_addr(r.index).map_or_else(|| "-".into(), |a| a.to_string());
     Some(match r.gateway {
-        Gateway::Inet(gw) => format!("{gw} {}", r.index),
-        Gateway::Link => format!("link {}", r.index),
+        Gateway::Inet(gw) => {
+            let mac = router_mac(gw).unwrap_or_else(|| "-".into());
+            format!("{gw} {mac} {me} {}", r.index)
+        }
+        Gateway::Link => format!("link {me} {}", r.index),
     })
 }
+
+/// the first ipv4 address on interface index
+#[cfg(target_os = "macos")]
+fn own_addr(index: u16) -> Option<Ipv4Addr> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a list freed below; each entry is only read while
+    // the list lives, and if_nametoindex reads a NUL-terminated name from it
+    unsafe {
+        if libc::getifaddrs(&mut head) != 0 {
+            return None;
+        }
+        let mut found = None;
+        let mut cur = head;
+        while !cur.is_null() && found.is_none() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            let sa = ifa.ifa_addr;
+            if sa.is_null()
+                || i32::from((*sa).sa_family) != libc::AF_INET
+                || libc::if_nametoindex(ifa.ifa_name) != u32::from(index)
+            {
+                continue;
+            }
+            let sin = &*(sa as *const libc::sockaddr_in);
+            found = Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+        }
+        libc::freeifaddrs(head);
+        found
+    }
+}
+
+/// the router's ethernet address, from arp(8): the routing socket and the
+/// sysctl table only hand a process that isn't part of macOS a placeholder
+#[cfg(target_os = "macos")]
+fn router_mac(gw: Ipv4Addr) -> Option<String> {
+    let out = sys::run_timeout(
+        Command::new("/usr/sbin/arp").args(["-n", &gw.to_string()]),
+        None,
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    arp_mac(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// "? (192.168.1.1) at 58:d6:1f:4c:f:e7 on en0 ifscope [ethernet]", with the
+/// leading zeros arp leaves out put back
+#[cfg(target_os = "macos")]
+fn arp_mac(line: &str) -> Option<String> {
+    let mac = line.split(" at ").nth(1)?.split_whitespace().next()?;
+    let parts: Vec<u8> = mac
+        .split(':')
+        .map(|p| u8::from_str_radix(p, 16).ok())
+        .collect::<Option<_>>()?;
+    (parts.len() == 6 && parts != [2, 0, 0, 0, 0, 0]).then(|| {
+        parts
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
+/// on macOS a cached address older than this doesn't count: a failed lookup
+/// there more likely means another network than the same router
+#[cfg(target_os = "macos")]
+const PUBLIC_IP_MAX_AGE: Duration = Duration::from_secs(3600);
 
 /// the address line, if the file was written on the network the mac is on now
 #[cfg(target_os = "macos")]
@@ -932,5 +1011,20 @@ mod tests {
         );
         assert_eq!(same_uplink("203.0.113.9\n192.0.2.1 99\n"), None);
         assert_eq!(same_uplink("203.0.113.9\n"), None, "written before");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn router_macs() {
+        assert_eq!(
+            arp_mac("? (10.1.0.1) at 58:d6:1f:4c:f:e7 on en0 ifscope [ethernet]").as_deref(),
+            Some("58:d6:1f:4c:0f:e7")
+        );
+        assert_eq!(
+            arp_mac("? (10.1.0.1) at (incomplete) on en0 ifscope [ethernet]"),
+            None
+        );
+        assert_eq!(arp_mac("10.1.0.1 (10.1.0.1) -- no entry"), None);
+        assert_eq!(arp_mac("? (10.1.0.1) at 2:0:0:0:0:0 on en0"), None);
     }
 }

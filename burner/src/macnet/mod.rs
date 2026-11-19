@@ -156,8 +156,8 @@ pub fn spawn(
     for b in &cfg.net.block {
         cmd.args(["--block", b]);
     }
-    // a stale answer from this same network still counts, as on linux: the
-    // old address is more likely still the router's than not
+    // a stale answer from this same network still counts for an hour, as on
+    // linux: the old address is more likely still the router's than not
     if cfg.net.block_public_ip {
         let (ip, _) = crate::net::public_ip(cfg).ok_or_else(|| {
             io::Error::other(
