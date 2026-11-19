@@ -15,7 +15,7 @@ halt() {
 # pick: ttyS0 under firecracker, hvc0 (virtio console) under libkrun. a name
 # that isn't a plain device here falls back to ttyS0
 console_dev() {
-    dev=$(sed -n 's/^/ /; s/.* console=\([A-Za-z0-9]*\).*/\1/p' "${1:-/proc/cmdline}")
+    dev=$(sed -n 's/^/ /; s/.* console=\([A-Za-z0-9]*\).*/\1/p' "$1")
     if [ -z "$dev" ] || [ ! -c "/dev/$dev" ]; then dev=ttyS0; fi
     echo "$dev"
 }
@@ -52,7 +52,7 @@ fi
 
 if grep -q 'burner\.shell=1' /proc/cmdline; then
     # interactive: a login shell on the console, the VM ends when it exits
-    con=/dev/$(console_dev)
+    con=/dev/$(console_dev /proc/cmdline)
     # a tty, read and written both ways on purpose
     # shellcheck disable=SC2094
     exec < "$con" > "$con" 2>&1
