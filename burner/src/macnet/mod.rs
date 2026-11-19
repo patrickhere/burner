@@ -140,6 +140,11 @@ pub fn spawn(
     for b in &cfg.net.block {
         cmd.args(["--block", b]);
     }
+    // a stale answer still counts, as on linux: the old address is more
+    // likely still the router's than not
+    if let Some((ip, _)) = crate::net::public_ip(cfg) {
+        cmd.args(["--block", &format!("{ip}/32")]);
+    }
     cmd.process_group(group as libc::pid_t);
     // SAFETY: inherit only calls fcntl
     unsafe {

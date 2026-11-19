@@ -12,7 +12,6 @@ use super::{EXIT_SANDBOX, Exit};
 use crate::cgroup;
 use crate::config::Config;
 use crate::ledger::{self, Ident, Ledger, Status, valid_id};
-#[cfg(target_os = "linux")]
 use crate::net;
 use crate::sys;
 
@@ -445,6 +444,9 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
         net::refresh_public_ip(cfg);
         net::check(cfg);
     }
+    // nothing to check on macOS: macnet reads addresses and routes itself
+    #[cfg(target_os = "macos")]
+    net::refresh_public_ip(cfg);
     let _ = fs::write(
         cfg.paths.state.join(REAPED),
         format!("{}\n", sys::boottime()),
