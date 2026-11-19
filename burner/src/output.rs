@@ -215,7 +215,8 @@ fn unfinished_tail(b: &[u8]) -> usize {
 /// shell`: text, colors, cursor movement, erasing and a few screen modes. it
 /// drops every query (the terminal would type the answer into the VM), mouse
 /// reporting, OSC/DCS/APC/PM/SOS strings (titles, clipboard, hyperlinks), C1
-/// controls and anything it doesn't know. keeps its state across reads
+/// controls and anything it doesn't know. keeps its state across reads, and
+/// tracks what it let through that has to be undone when the shell ends
 #[derive(Default)]
 pub struct TermFilter {
     st: FState,
@@ -224,6 +225,8 @@ pub struct TermFilter {
     str_len: usize,
     /// the terminal isn't utf-8: non-ascii chars go out as ?
     ascii: bool,
+    /// the alternate screen mode that's on
+    alt: Option<u32>,
 }
 
 #[derive(Default, PartialEq)]
@@ -246,12 +249,16 @@ const SEQ_MAX: usize = 64;
 /// never ends doesn't hide the rest of the session
 const STR_MAX: usize = 16 << 10;
 
-/// undoes every mode the filter lets through, sent when the shell ends. leaving
-/// the alt screen and resetting the scroll region both move the cursor home, so
-/// it's saved before them and restored after: the caller's prompt comes back
-/// below the session, not over its first line
+/// undoes every mode the filter lets through. the panic hook sends this one;
+/// a shell that ends normally gets TermFilter::reset, which knows whether the
+/// alt screen is on. leaving the alt screen and resetting the scroll region
+/// both move the cursor home, so it's saved before them and restored after:
+/// the caller's prompt comes back below the session, not over its first line
 pub const TERM_RESET: &[u8] =
     b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
+
+/// the mode resets after the alt screen and scroll region, same as TERM_RESET
+const MODES_RESET: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l";
 
 /// private modes (CSI ? n h/l) a shell or editor needs that make the terminal
 /// send nothing back: cursor keys, autowrap, blink, cursor shown, alt screen,
@@ -276,6 +283,21 @@ impl TermFilter {
             self.byte(b, &mut out);
         }
         out
+    }
+
+    /// what puts the caller's terminal back when the shell ends. leaving the
+    /// alt screen comes first: it puts the cursor back where it was on the
+    /// main screen, and a terminal with one saved cursor for both screens
+    /// (tmux) would otherwise restore the alt screen's spot after it. off the
+    /// alt screen, ?1049l would restore a stale saved cursor, so it isn't sent
+    pub fn reset(&self) -> Vec<u8> {
+        let mut r = Vec::new();
+        if let Some(m) = self.alt {
+            r.extend_from_slice(format!("\x1b[?{m}l").as_bytes());
+        }
+        r.extend_from_slice(b"\x1b7\x1b[r\x1b8");
+        r.extend_from_slice(MODES_RESET);
+        r
     }
 
     fn byte(&mut self, b: u8, out: &mut Vec<u8>) {
@@ -345,6 +367,8 @@ impl TermFilter {
                 if (0x40..=0x7e).contains(&b) {
                     if csi_allowed(&self.seq[2..]) {
                         out.extend_from_slice(&self.seq);
+                        let body = self.seq[2..].to_vec();
+                        self.track_csi(&body);
                     }
                     self.st = FState::Text;
                 } else if self.seq.len() > SEQ_MAX {
@@ -369,6 +393,23 @@ impl TermFilter {
                     self.start_esc();
                     self.byte(b, out);
                 }
+            }
+        }
+    }
+
+    /// keeps the state reset() needs in step with a CSI that went out
+    fn track_csi(&mut self, body: &[u8]) {
+        let (&fin, rest) = body.split_last().expect("csi has a final byte");
+        let Some(modes) = rest.strip_prefix(b"?") else {
+            return;
+        };
+        let on = fin == b'h';
+        for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
+            match m.parse::<u32>() {
+                Ok(n @ (47 | 1047 | 1049)) if on && self.alt.is_none() => self.alt = Some(n),
+                // any of them going off is back on the main screen
+                Ok(47 | 1047 | 1049) if !on => self.alt = None,
+                _ => {}
             }
         }
     }
@@ -457,6 +498,25 @@ mod tests {
             at(b"\x1b8") > at(b"\x1b[?1049l"),
             "and after leaving the alt screen"
         );
+    }
+
+    #[test]
+    fn reset_leaves_the_alt_screen_first() {
+        let mut f = TermFilter::default();
+        let r = f.reset();
+        assert!(
+            r.starts_with(b"\x1b7\x1b[r\x1b8"),
+            "no ?1049l off the alt screen"
+        );
+        assert!(r.ends_with(MODES_RESET));
+        f.feed(b"\x1b[?1049h\x1b[3;1Hx");
+        assert!(f.reset().starts_with(b"\x1b[?1049l\x1b7\x1b[r\x1b8"));
+        f.feed(b"\x1b[?1049l");
+        assert_eq!(f.reset(), r);
+        f.feed(b"\x1b[?47h");
+        assert!(f.reset().starts_with(b"\x1b[?47l\x1b7"));
+        f.feed(b"\x1b[?1049h\x1b[?1047l");
+        assert_eq!(f.reset(), r);
     }
 
     #[test]

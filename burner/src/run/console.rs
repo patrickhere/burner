@@ -298,7 +298,7 @@ pub(super) fn relay(
         Outcome::Done | Outcome::Failed if cancelled(cfg, id) => Outcome::Cancelled,
         o => o,
     };
-    screen.put(crate::output::TERM_RESET, None);
+    screen.put(&filter.reset(), None);
     screen.drain(Instant::now() + Duration::from_secs(2));
     outcome
 }
