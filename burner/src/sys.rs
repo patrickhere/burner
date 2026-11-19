@@ -271,6 +271,13 @@ pub fn set_raw(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// a control char set to this does nothing. 0 on linux; on macOS 0 is the
+/// NUL key (ctrl-space), which would then quit or stop burner
+#[cfg(target_os = "linux")]
+const VDISABLE: libc::cc_t = libc::_POSIX_VDISABLE;
+#[cfg(target_os = "macos")]
+const VDISABLE: libc::cc_t = 0xff;
+
 /// fd 0 while a shell's VM boots: no echo and no line editing, so keys typed
 /// early are read as they come and wait for the guest, but ctrl-c still
 /// interrupts burner and burner's own messages still get \r\n. ctrl-\ and
@@ -284,9 +291,8 @@ pub fn set_boot_mode(fd: i32) -> io::Result<()> {
     }
     t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHONL | libc::IEXTEN);
     t.c_lflag |= libc::ISIG;
-    // 0 is _POSIX_VDISABLE on linux
-    t.c_cc[libc::VQUIT] = 0;
-    t.c_cc[libc::VSUSP] = 0;
+    t.c_cc[libc::VQUIT] = VDISABLE;
+    t.c_cc[libc::VSUSP] = VDISABLE;
     t.c_cc[libc::VMIN] = 1;
     t.c_cc[libc::VTIME] = 0;
     // SAFETY: valid fd and termios pointer
