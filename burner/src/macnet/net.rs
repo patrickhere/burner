@@ -773,19 +773,20 @@ fn connected(s: &Socket) -> Option<io::Result<()>> {
     }
 }
 
-fn dns_socket(dst: Ipv4Addr) -> io::Result<UdpSocket> {
-    let u = UdpSocket::bind("0.0.0.0:0")?;
-    u.connect(SocketAddrV4::new(dst, 53))?;
-    u.set_nonblocking(true)?;
-    Ok(u)
+/// connected without a bind first: the sandbox allows no binds, and connect
+/// picks the local port anyway
+pub fn dns_socket(dst: Ipv4Addr) -> io::Result<UdpSocket> {
+    let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    s.connect(&SocketAddrV4::new(dst, 53).into())?;
+    s.set_nonblocking(true)?;
+    Ok(s.into())
 }
 
+/// getentropy, not /dev/urandom: the sandbox has no files
 fn seed() -> u64 {
     let mut b = [0u8; 8];
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .is_err()
-    {
+    // SAFETY: getentropy fills at most 256 bytes of a buffer we own
+    if unsafe { libc::getentropy(b.as_mut_ptr().cast(), b.len()) } != 0 {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();

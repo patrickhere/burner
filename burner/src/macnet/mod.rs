@@ -8,6 +8,7 @@
 mod net;
 mod policy;
 mod route;
+mod sandbox;
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -85,6 +86,7 @@ fn start(a: MacnetArgs) -> io::Result<()> {
         ));
     }
     let pol = Policy::new(mode, a.resolver, &block, (ip, prefix));
+    sandbox::enter()?;
     let args = Link {
         fd: a.fd,
         guest: ip,
