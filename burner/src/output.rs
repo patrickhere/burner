@@ -13,6 +13,7 @@ const CHUNK_COST: usize = 128;
 
 pub struct Out {
     tx: mpsc::Sender<Chunk>,
+    screen: Option<Arc<Mutex<Screen>>>,
     queued: Arc<AtomicUsize>,
     broken: Arc<AtomicBool>,
     /// set by finish: what's still queued is dropped, only the last chunk goes out
@@ -64,7 +65,7 @@ impl Out {
             broken.clone(),
             skip.clone(),
             last_done.clone(),
-            screen,
+            screen.clone(),
         );
         let lock = |s: &Arc<Mutex<Screen>>| s.lock().unwrap_or_else(|e| e.into_inner()).clone();
         std::thread::spawn(move || {
@@ -92,6 +93,7 @@ impl Out {
         });
         Out {
             tx,
+            screen,
             queued,
             broken,
             skip,
@@ -169,6 +171,12 @@ impl Out {
     pub fn finish_reset(&self) {
         self.skip.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Chunk::Reset);
+    }
+
+    /// the screen as the bytes written so far left it
+    pub fn screen(&self) -> Option<Screen> {
+        let s = self.screen.as_ref()?;
+        Some(s.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     /// waits until everything queued is written, the writer broke, or `give_up`
@@ -300,7 +308,7 @@ pub struct TermFilter {
 
 /// the caller's terminal as the shell left it, kept from the bytes that were
 /// really written to it (TermFilter's output, so only what that lets through):
-/// what reset has to undo
+/// what reset has to undo, and whether bracketed paste is on
 #[derive(Clone)]
 pub struct Screen {
     st: SState,
@@ -315,6 +323,8 @@ pub struct Screen {
     main_clean: bool,
     /// the guest turned cursor blinking on or off
     blink: bool,
+    /// bracketed paste is on, so the terminal brackets what's pasted
+    paste: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -337,6 +347,7 @@ impl Default for Screen {
             main_col0: true,
             main_clean: true,
             blink: false,
+            paste: false,
         }
     }
 }
@@ -387,6 +398,10 @@ impl Screen {
         for &b in b {
             self.byte(b);
         }
+    }
+
+    pub fn paste(&self) -> bool {
+        self.paste
     }
 
     fn byte(&mut self, b: u8) {
@@ -455,6 +470,7 @@ impl Screen {
         for m in std::str::from_utf8(modes).unwrap_or("").split(';') {
             match m.parse::<u32>() {
                 Ok(12) => self.blink = true,
+                Ok(2004) => self.paste = on,
                 Ok(1048) if !on => (self.col0, self.clean) = (false, false),
                 Ok(1049) if on && !self.alt => {
                     (self.main_col0, self.main_clean) = (self.col0, self.clean);
@@ -896,6 +912,13 @@ mod tests {
         assert!(fresh(b"$ \x1b[?1049h\x1b[H"));
         assert!(!fresh(b"x\r\n\x1b[?1049h\x1b[2;2Hy\x1b[?1049l"));
         assert!(!fresh(b"\r\n\x1b[?47hx\x1b[?47l"));
+    }
+
+    #[test]
+    fn screen_knows_bracketed_paste() {
+        assert!(shown(b"\x1b[?2004h").paste());
+        assert!(!shown(b"\x1b[?2004h\x1b[?2004l").paste());
+        assert!(!shown(b"").paste());
     }
 
     #[test]

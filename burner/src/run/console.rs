@@ -371,6 +371,7 @@ pub(super) fn relay(
                 Ok(0) | Err(_) => stdin_open = false,
                 Ok(n) => {
                     let mut keys = Vec::new();
+                    escape.bracketed = screen.screen().is_some_and(|s| s.paste());
                     if escape.feed(&buf[..n], &mut keys) {
                         break Outcome::Detached;
                     }
@@ -665,20 +666,40 @@ impl Markers {
 /// ssh-style escape for burner shell: `~` right after enter (or at the start)
 /// is held, `~.` leaves, `~~` sends one `~`, anything else goes through as is.
 /// a way out when the guest hangs and ctrl-c only reaches the VM. a bracketed
-/// paste (ESC[200~ .. ESC[201~, when the guest asked for them) is pasted text,
-/// not keys, and goes through untouched
+/// paste (ESC[200~ .. ESC[201~, only while the guest has bracketed paste on at
+/// the terminal) is pasted text, not keys, and goes through untouched
 #[derive(Default)]
 struct Escape {
     mid_line: bool,
     tilde: bool,
+    /// the guest has bracketed paste on, as far as the terminal knows
+    bracketed: bool,
     paste: bool,
     /// the last few bytes, to spot the paste brackets across reads
     recent: Vec<u8>,
+    last: Option<Instant>,
 }
+
+/// a paste whose end bracket hasn't come after this long never will: a
+/// terminal sends a paste in one go. the escape works again after it
+const PASTE_IDLE: Duration = Duration::from_secs(1);
 
 impl Escape {
     /// true when the caller asked to leave
     fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+        self.feed_at(input, out, Instant::now())
+    }
+
+    fn feed_at(&mut self, input: &[u8], out: &mut Vec<u8>, now: Instant) -> bool {
+        if self.paste
+            && self
+                .last
+                .is_some_and(|t| now.duration_since(t) >= PASTE_IDLE)
+        {
+            self.paste = false;
+            self.mid_line = true;
+        }
+        self.last = Some(now);
         for &b in input {
             if self.recent.len() == 6 {
                 self.recent.remove(0);
@@ -709,7 +730,7 @@ impl Escape {
             }
             out.push(b);
             self.mid_line = !matches!(b, b'\r' | b'\n');
-            self.paste = self.recent.ends_with(b"\x1b[200~");
+            self.paste = self.bracketed && self.recent.ends_with(b"\x1b[200~");
         }
         false
     }
@@ -981,7 +1002,11 @@ mod tests {
     #[test]
     fn shell_escape_skips_bracketed_paste() {
         let run = |chunks: &[&[u8]]| {
-            let (mut e, mut out) = (Escape::default(), Vec::new());
+            let mut e = Escape {
+                bracketed: true,
+                ..Escape::default()
+            };
+            let mut out = Vec::new();
             let left = chunks.iter().any(|c| e.feed(c, &mut out));
             (left, out)
         };
@@ -994,6 +1019,30 @@ mod tests {
         // typed keys after the paste still get the escape, after enter
         assert!(run(&[paste, b"\r", b"~."]).0);
         assert!(!run(&[paste, b"~."]).0);
+    }
+
+    #[test]
+    fn shell_escape_paste_brackets_only_when_on() {
+        // the terminal wasn't asked for bracketed paste, so these are typed keys
+        let (mut e, mut out) = (Escape::default(), Vec::new());
+        assert!(e.feed(b"\x1b[200~\r~.", &mut out));
+    }
+
+    #[test]
+    fn shell_escape_after_a_paste_that_never_ends() {
+        let t = Instant::now();
+        let mut e = Escape {
+            bracketed: true,
+            ..Escape::default()
+        };
+        let mut out = Vec::new();
+        assert!(!e.feed_at(b"\x1b[200~half a paste\r", &mut out, t));
+        assert!(!e.feed_at(b"~.", &mut out, t + Duration::from_millis(500)));
+        assert!(!e.feed_at(b"\r~.", &mut out, t + Duration::from_millis(900)));
+        // quiet for PASTE_IDLE: the paste is over, enter and ~. leave
+        let later = t + Duration::from_millis(900) + PASTE_IDLE;
+        assert!(!e.feed_at(b"~.", &mut out, later));
+        assert!(e.feed_at(b"\r~.", &mut out, later));
     }
 
     #[test]
