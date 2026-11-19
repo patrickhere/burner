@@ -203,6 +203,13 @@ pub fn child_main(emit: bool) -> ExitCode {
         eprintln!("burner: {PARSE_ARG} is internal, run by burner run");
         return ExitCode::from(2);
     }
+    // no user of its own to run as on macOS, so a sandbox with no rights past
+    // the fds it was handed keeps a parser bug away from your files and the net
+    #[cfg(target_os = "macos")]
+    if let Err(e) = crate::macnet::sandbox::apply(crate::macnet::sandbox::NOTHING) {
+        eprintln!("burner: {e}");
+        return ExitCode::from(2);
+    }
     // SAFETY: checked above that these are open files we were handed
     let (src, logf, tarf) = unsafe {
         (

@@ -8,7 +8,7 @@
 mod net;
 mod policy;
 pub(crate) mod route;
-mod sandbox;
+pub(crate) mod sandbox;
 
 use std::io;
 use std::net::Ipv4Addr;

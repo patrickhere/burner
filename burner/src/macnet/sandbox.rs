@@ -29,9 +29,16 @@ const PROFILE: &str = r#"
 (allow sysctl-read (sysctl-name-prefix "net.routetable"))
 "#;
 
+/// nothing at all past the fds already open, for the result parser
+pub const NOTHING: &str = "(version 1)\n(deny default)\n";
+
 /// from here on this process can only do what PROFILE allows. there's no way back
 pub fn enter() -> io::Result<()> {
-    let p = CString::new(PROFILE).map_err(io::Error::other)?;
+    apply(PROFILE)
+}
+
+pub fn apply(profile: &str) -> io::Result<()> {
+    let p = CString::new(profile).map_err(io::Error::other)?;
     let mut err: *mut c_char = std::ptr::null_mut();
     // SAFETY: a NUL-terminated profile and an out pointer for the error,
     // freed with the function that goes with it
