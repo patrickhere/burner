@@ -612,6 +612,9 @@ impl TermFilter {
                     if csi_allowed(&self.seq[2..]) {
                         if self.seq[2] == b'?' {
                             out.extend_from_slice(&alt_as_1049(&self.seq));
+                        } else if b == b'm' {
+                            let params = &self.seq[2..self.seq.len() - 1];
+                            out.extend_from_slice(&sgr(params).unwrap_or_default());
                         } else {
                             out.extend_from_slice(&self.seq);
                         }
@@ -720,63 +723,89 @@ fn csi_allowed(body: &[u8]) -> bool {
                 b'h' | b'l' => rest == b"4", // insert mode, used by line editors
                 // ED 3 erases the caller's scrollback, outside the session
                 b'J' => matches!(rest, b"" | b"0" | b"1" | b"2"),
-                b'm' => sgr_allowed(rest),
+                b'm' => sgr(rest).is_some(),
                 _ => digits && CSI_FINALS.contains(&fin),
             }
         }
     }
 }
 
-/// SGR parameters that only set attributes and colors. not 10 to 20 (font
-/// selection): on the linux console 11 and 12 switch the charset and make it
-/// print control bytes, and SGR 0 doesn't switch them back. extended colors
-/// (38, 48, 58) only as whole groups
-fn sgr_allowed(params: &[u8]) -> bool {
-    let Ok(p) = std::str::from_utf8(params) else {
-        return false;
-    };
-    let byte = |s: Option<&str>| s.is_some_and(|s| s.parse::<u8>().is_ok());
+/// the linux console keeps 16 SGR parameters and runs the digits of any
+/// past that into the last one
+const SGR_MAX: usize = 16;
+
+/// what goes out for an SGR with these parameters, or None to drop it. only
+/// attributes and colors: not 10 to 20 (font selection), since on the linux
+/// console 11 and 12 switch the charset and make it print control bytes, and
+/// SGR 0 doesn't switch them back. extended colors only as whole groups, and
+/// never 58 (underline color) or 59: the linux console doesn't know them and
+/// reads 58's operands as attributes of their own (58;5;11 is font 11). a
+/// long one goes out as several SGRs of at most SGR_MAX parameters, split
+/// between groups, so the console can't cut a group into attributes
+fn sgr(params: &[u8]) -> Option<Vec<u8>> {
+    let p = std::str::from_utf8(params).ok()?;
+    fn byte(s: Option<&str>) -> Option<&str> {
+        s.filter(|s| s.parse::<u8>().is_ok())
+    }
+    let mut groups: Vec<Vec<&str>> = Vec::new();
     let mut it = p.split(';');
     while let Some(x) = it.next() {
         if x.contains(':') {
             // 4:N underline styles, 38:5:N and 38:2:[space]:R:G:B colors
             let sub: Vec<&str> = x.split(':').collect();
-            let ok = match sub.as_slice() {
-                ["4", n] => n.parse::<u8>().is_ok_and(|n| n <= 5),
-                ["38" | "48" | "58", "5", n] => byte(Some(n)),
-                ["38" | "48" | "58", "2", rgb @ ..] if rgb.len() == 3 || rgb.len() == 4 => {
-                    let rgb = &rgb[rgb.len() - 3..];
-                    rgb.iter().all(|c| byte(Some(c)))
+            let keep = match sub.as_slice() {
+                ["4", n] if n.parse::<u8>().is_ok_and(|n| n <= 5) => true,
+                [c @ ("38" | "48" | "58"), "5", n] if byte(Some(n)).is_some() => *c != "58",
+                [c @ ("38" | "48" | "58"), "2", rgb @ ..]
+                    if (rgb.len() == 3 || rgb.len() == 4)
+                        && rgb[rgb.len() - 3..].iter().all(|v| byte(Some(v)).is_some()) =>
+                {
+                    *c != "58"
                 }
-                _ => false,
+                _ => return None,
             };
-            if !ok {
-                return false;
+            if keep {
+                groups.push(vec![x]);
             }
             continue;
         }
-        let n: u32 = if x.is_empty() {
-            0
-        } else {
-            match x.parse() {
-                Ok(n) => n,
-                Err(_) => return false,
+        let n: u32 = if x.is_empty() { 0 } else { x.parse().ok()? };
+        match n {
+            0..=9 | 21..=25 | 27..=37 | 39..=47 | 49 | 90..=97 | 100..=107 => groups.push(vec![x]),
+            59 => {}
+            38 | 48 | 58 => {
+                let mut g = vec![x];
+                match it.next() {
+                    Some("5") => g.extend(["5", byte(it.next())?]),
+                    Some("2") => {
+                        g.push("2");
+                        for _ in 0..3 {
+                            g.push(byte(it.next())?);
+                        }
+                    }
+                    _ => return None,
+                }
+                if n != 58 {
+                    groups.push(g);
+                }
             }
-        };
-        let ok = match n {
-            0..=9 | 21..=25 | 27..=37 | 39..=47 | 49 | 59 | 90..=97 | 100..=107 => true,
-            38 | 48 | 58 => match it.next() {
-                Some("5") => byte(it.next()),
-                Some("2") => (0..3).all(|_| byte(it.next())),
-                _ => false,
-            },
-            _ => false,
-        };
-        if !ok {
-            return false;
+            _ => return None,
         }
     }
-    true
+    let mut out = Vec::new();
+    let mut seq: Vec<&str> = Vec::new();
+    for g in groups {
+        if seq.len() + g.len() > SGR_MAX {
+            out.extend_from_slice(format!("\x1b[{}m", seq.join(";")).as_bytes());
+            seq.clear();
+        }
+        seq.extend(g);
+    }
+    // nothing left is nothing sent: an empty SGR would reset everything
+    if !seq.is_empty() {
+        out.extend_from_slice(format!("\x1b[{}m", seq.join(";")).as_bytes());
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1073,8 +1102,8 @@ mod tests {
             &b"\x1b[m"[..],
             b"\x1b[0;1;4;7;31;42m",
             b"\x1b[38;5;208;48;2;10;20;30m",
-            b"\x1b[38:2::1:2:3m\x1b[4:3m\x1b[58:5:9m",
-            b"\x1b[22;23;24;27;39;49;59;97;107m",
+            b"\x1b[38:2::1:2:3m\x1b[4:3m\x1b[48:5:9m",
+            b"\x1b[22;23;24;27;39;49;97;107m",
         ] {
             assert_eq!(f.feed(ok), ok.to_vec(), "{ok:?}");
         }
@@ -1095,6 +1124,28 @@ mod tests {
         ] {
             assert_eq!(f.feed(bad), b"".to_vec(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn filter_sgr_for_the_linux_console() {
+        let mut f = TermFilter::default();
+        // underline color is dropped, with its operands, the rest stays
+        assert_eq!(f.feed(b"\x1b[1;58;5;11;31m"), b"\x1b[1;31m".to_vec());
+        assert_eq!(f.feed(b"\x1b[58;2;1;11;12;4m"), b"\x1b[4m".to_vec());
+        assert_eq!(f.feed(b"\x1b[58:5:11;59;7m"), b"\x1b[7m".to_vec());
+        // and an SGR that was nothing else sends nothing, not a reset
+        assert_eq!(f.feed(b"\x1b[58;5;11m\x1b[59m"), b"".to_vec());
+        // past 16 parameters it's split between groups, never inside one
+        let long = b"\x1b[1;2;3;4;5;7;8;9;21;22;23;24;25;27;38;5;11;48;2;1;2;3m";
+        assert_eq!(
+            f.feed(long),
+            b"\x1b[1;2;3;4;5;7;8;9;21;22;23;24;25;27m\x1b[38;5;11;48;2;1;2;3m".to_vec()
+        );
+        let groups = b"\x1b[0;1;38;2;1;2;3;48;2;4;5;6;38;5;9;48;5;10m";
+        assert_eq!(
+            f.feed(groups),
+            b"\x1b[0;1;38;2;1;2;3;48;2;4;5;6;38;5;9m\x1b[48;5;10m".to_vec()
+        );
     }
 
     #[test]
