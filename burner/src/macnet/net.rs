@@ -111,6 +111,8 @@ struct Dns {
     host: UdpSocket,
     guest_port: u16,
     resolver: Ipv4Addr,
+    /// the interface host is bound to
+    index: u16,
     last: StdInstant,
 }
 
@@ -735,11 +737,18 @@ impl Gw<'_> {
                 continue;
             }
             let now = StdInstant::now();
-            let i = match self
+            let mut found = self
                 .dns
                 .iter()
-                .position(|d| d.guest_port == gport && d.resolver == dst)
+                .position(|d| d.guest_port == gport && d.resolver == dst);
+            // the default route moved: this query goes out the new way
+            if let Some(i) = found
+                && self.dns[i].index != index
             {
+                self.dns.swap_remove(i);
+                found = None;
+            }
+            let i = match found {
                 Some(i) => i,
                 None => {
                     if self.dns.len() >= MAX_DNS
@@ -753,6 +762,7 @@ impl Gw<'_> {
                                 host,
                                 guest_port: gport,
                                 resolver: dst,
+                                index,
                                 last: now,
                             });
                             self.dns.len() - 1
@@ -867,6 +877,9 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket, up: &mut Rate, down: &mut Rate) {
 /// out the interface the policy checked, whatever the routes say by the time
 /// the syn leaves
 fn bind_to(s: &Socket, index: u16) -> io::Result<()> {
+    if index == 0 {
+        return Err(io::Error::other("no interface to bind to"));
+    }
     let i = libc::c_int::from(index);
     // SAFETY: setsockopt reads one int from a live local
     let r = unsafe {

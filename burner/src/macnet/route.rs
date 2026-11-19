@@ -36,13 +36,15 @@ impl Route {
 /// check (a vpn coming up) can't carry it
 pub fn check(dst: Ipv4Addr) -> Result<u16, &'static str> {
     let unreadable = "can't read the route to it";
+    // binding to interface 0 would unbind, and a route has no reason to say 0
+    let no_if = "the route names no interface";
     let r = lookup(dst, false).map_err(|_| unreadable)?;
     if r.is_default() {
-        return Ok(r.index);
+        return (r.index != 0).then_some(r.index).ok_or(no_if);
     }
     let d = lookup(Ipv4Addr::UNSPECIFIED, true).map_err(|_| "no default route")?;
     if allowed(&r, &d) {
-        Ok(d.index)
+        (d.index != 0).then_some(d.index).ok_or(no_if)
     } else {
         Err("not routed through the default route")
     }
