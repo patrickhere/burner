@@ -112,6 +112,8 @@ i run it on a box that's only reachable over a VPN. yours might sit on a home LA
 
 what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel and burner's pinned firecracker updated), side channels between VMs on the same cpu, and anything you pipe in yourself.
 
+one thing the shell filter takes on trust: that your terminal decodes utf-8. burner can't ask the terminal, so it goes by the locale (`LC_ALL`, `LC_CTYPE`, `LANG`) and takes utf-8 when none is set. on a terminal that decodes latin-1 or another 8-bit charset and acts on C1 controls (xterm without utf-8, luit, screen with `c1 on`), part of a utf-8 char can be a control like CSI. if that's yours, pass the locale through sudo, `sudo env LC_ALL=en_US.ISO-8859-1 burner shell`, and non-ascii from the guest shows as `?`.
+
 ## install details
 
 burner needs linux on x86_64 or aarch64 with kvm and cgroup v2. the one-liner from [install](#install) downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image.
