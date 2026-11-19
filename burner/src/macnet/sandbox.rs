@@ -2,8 +2,9 @@
 //! and holds real sockets, so it runs under a seatbelt profile of its own:
 //! outbound connections and the routing socket, nothing else. no files, no
 //! processes, no mach services (so no resolving names either). a bug in the
-//! frame parsing or tcp stack then gets the guest no more than macnet already
-//! gives it on purpose
+//! frame parsing or tcp stack then gets the guest no files and no processes,
+//! but still any address the mac can reach: the policy that keeps loopback,
+//! the lan and vpns out runs in this same process
 
 use std::ffi::{CStr, CString, c_char, c_int};
 use std::io;
