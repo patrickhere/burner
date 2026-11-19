@@ -222,12 +222,6 @@ pub(super) struct Shell {
     pub(super) screen: Out,
 }
 
-pub(super) struct Ended {
-    pub(super) rc: u8,
-    /// b'p' when the VM was powered off or halted from inside, b'r' rebooted
-    pub(super) how: Option<u8>,
-}
-
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
 /// ways. keystrokes go to the VM as they are; what the VM prints goes through a
 /// filter so it can't set titles, the clipboard or anything else on the terminal.
@@ -279,7 +273,7 @@ pub(super) fn relay(
     let (mut ready_at, mut quiet_from): (Option<Instant>, Option<Instant>) = (None, None);
     let mut filter = crate::output::TermFilter::new(!crate::output::term_utf8());
     let mut escape = Escape::default();
-    let mut end = Markers::new(token);
+    let mut end = Markers::new(token, legacy);
     // the last of the console, and when it ended in the kernel's halt line,
     // with the vCPUs' run count then
     let (mut tail, mut halt_seen): (Vec<u8>, Option<(Instant, Option<u64>)>) = (Vec::new(), None);
@@ -426,7 +420,7 @@ pub(super) fn relay(
                     }
                     held_since =
                         (!end.held.is_empty()).then(|| held_since.unwrap_or_else(Instant::now));
-                    if end.ended && ended_at.is_none() {
+                    if end.ended.is_some() && ended_at.is_none() {
                         ended_at = Some(Instant::now());
                         to_vm.clear();
                     }
@@ -455,15 +449,9 @@ pub(super) fn relay(
     screen.drain(Instant::now() + Duration::from_secs(2));
     screen.finish_reset();
     let end = if halted {
-        Some(Ended {
-            rc: 0,
-            how: Some(b'p'),
-        })
+        Some(Ended::PowerOff)
     } else {
-        end.ended.then(|| Ended {
-            rc: end.rc().unwrap_or(0),
-            how: end.how(),
-        })
+        end.ended
     };
     Shell {
         outcome,
@@ -524,109 +512,153 @@ fn vcpu_runs(pid: u32) -> Option<u64> {
 
 /// watches the shell's console for guest init's markers and keeps them off the
 /// caller's terminal: `BURNER-<token>-READY` right before the shell starts, and
-/// `BURNER-<token>-END` after it, followed by the shell's exit code and `;` (an
-/// image built before that sends none). what comes after the end marker (the
-/// guest kernel's reboot line) never shows either. bytes that could be the
-/// start of a marker wait until it's clear they aren't
+/// the end record `BURNER-<token>-END<status>;` after it, where status is the
+/// shell's exit code, or p (powered off), r (rebooted), f (the shell couldn't
+/// start) or l (it ended without an exit code). the end record only counts
+/// once it's whole; an image built before that sends a bare `END`, which
+/// counts for one (legacy) only. what comes after the end (the guest kernel's
+/// reboot line) never shows either.
+///
+/// bytes that could be the start of a marker are held until it's clear. once
+/// they have the whole `BURNER-<token>-`, they're held for as long as it takes
+/// (only the guest knows the token, so it can only hide its own output)
 struct Markers {
-    ready_marker: Vec<u8>,
-    marker: Vec<u8>,
+    prefix: Vec<u8>,
+    legacy: bool,
     held: Vec<u8>,
     ready: bool,
-    ended: bool,
-    /// what came after the end marker, up to the `;`
-    tail: Vec<u8>,
+    ended: Option<Ended>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Ended {
+    Exit(u8),
+    PowerOff,
+    Reboot,
+    /// the shell couldn't be started
+    NoStart,
+    /// the shell went away without an exit code
+    Lost,
+    /// an image built before the end record had a status
+    Legacy,
+}
+
+/// what's after `END` so far
+enum Record {
+    Done(Ended),
+    Partial,
+    Bad,
+}
+
+fn end_record(p: &[u8]) -> Record {
+    let digits = p.iter().take_while(|b| b.is_ascii_digit()).count();
+    let (status, rest) = match (digits, p.first()) {
+        (0, None) => return Record::Partial,
+        (0, Some(b'p')) => (Some(Ended::PowerOff), &p[1..]),
+        (0, Some(b'r')) => (Some(Ended::Reboot), &p[1..]),
+        (0, Some(b'f')) => (Some(Ended::NoStart), &p[1..]),
+        (0, Some(b'l')) => (Some(Ended::Lost), &p[1..]),
+        (0, Some(_)) => return Record::Bad,
+        (n, _) if n > 3 => return Record::Bad,
+        (n, _) => (
+            std::str::from_utf8(&p[..n])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .map(Ended::Exit),
+            &p[n..],
+        ),
+    };
+    match (status, rest.first()) {
+        (None, _) => Record::Bad,
+        (Some(e), Some(b';')) => Record::Done(e),
+        // digits can go on up to three
+        (Some(_), None) => Record::Partial,
+        (Some(_), Some(_)) => Record::Bad,
+    }
 }
 
 impl Markers {
-    fn new(token: &str) -> Markers {
+    fn new(token: &str, legacy: bool) -> Markers {
         Markers {
-            ready_marker: format!("BURNER-{token}-READY").into_bytes(),
-            marker: format!("BURNER-{token}-END").into_bytes(),
+            prefix: format!("BURNER-{token}-").into_bytes(),
+            legacy,
             held: Vec::new(),
             ready: false,
-            ended: false,
-            tail: Vec::new(),
+            ended: None,
         }
     }
 
     /// what can go to the screen now
     fn feed(&mut self, b: &[u8]) -> Vec<u8> {
-        if self.ended {
-            self.keep_tail(b);
+        if self.ended.is_some() {
             return Vec::new();
         }
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(b);
-        let find = |buf: &[u8], m: &[u8]| buf.windows(m.len()).position(|w| w == m);
-        while let Some(i) = find(&buf, &self.ready_marker) {
-            if find(&buf, &self.marker).is_some_and(|j| j < i) {
-                break;
+        let mut out = Vec::with_capacity(buf.len());
+        let mut at = 0;
+        loop {
+            let Some(i) = buf[at..]
+                .windows(self.prefix.len())
+                .position(|w| w == self.prefix)
+                .map(|i| at + i)
+            else {
+                // a cut-off start of the prefix waits
+                let tail = &buf[at..];
+                let keep = (1..self.prefix.len().min(tail.len() + 1))
+                    .rev()
+                    .find(|&k| tail.ends_with(&self.prefix[..k]))
+                    .unwrap_or(0);
+                out.extend_from_slice(&tail[..tail.len() - keep]);
+                self.held = tail[tail.len() - keep..].to_vec();
+                return out;
+            };
+            out.extend_from_slice(&buf[at..i]);
+            let rest = &buf[i + self.prefix.len()..];
+            if let Some(after) = rest.strip_prefix(b"READY") {
+                self.ready = true;
+                at = buf.len() - after.len();
+                continue;
             }
-            self.ready = true;
-            buf.drain(i..i + self.ready_marker.len());
+            if let Some(p) = rest.strip_prefix(b"END") {
+                if self.legacy {
+                    self.ended = Some(Ended::Legacy);
+                    return out;
+                }
+                match end_record(p) {
+                    Record::Done(e) => {
+                        self.ended = Some(e);
+                        return out;
+                    }
+                    Record::Partial => {
+                        self.held = buf[i..].to_vec();
+                        return out;
+                    }
+                    Record::Bad => {}
+                }
+            } else if b"READY".starts_with(rest) || b"END".starts_with(rest) {
+                self.held = buf[i..].to_vec();
+                return out;
+            }
+            // not a marker after all: the guest's own text
+            out.push(buf[i]);
+            at = i + 1;
         }
-        if let Some(i) = find(&buf, &self.marker) {
-            self.ended = true;
-            self.keep_tail(&buf[i + self.marker.len()..]);
-            buf.truncate(i);
-            return buf;
-        }
-        let longest = self.marker.len().max(self.ready_marker.len());
-        let keep = (1..longest.min(buf.len() + 1))
-            .rev()
-            .find(|&k| {
-                [&self.marker, &self.ready_marker]
-                    .iter()
-                    .any(|m| k < m.len() && buf.ends_with(&m[..k]))
-            })
-            .unwrap_or(0);
-        self.held = buf.split_off(buf.len() - keep);
-        buf
     }
 
-    /// how long held bytes wait for the rest of the marker. a short start
-    /// ("B", "BURNER-") is let out after 30ms, so typing never lags; one that
-    /// already has part of the token is all but certainly the marker, split by
-    /// a gap in the console, and waits a second
+    /// how long held bytes wait for the rest of a marker. a short start ("B",
+    /// "BURNER-") goes out after 30ms, so typing never lags
     fn hold(&self) -> Duration {
-        if self.held.len() >= "BURNER-".len() + 4 {
-            Duration::from_secs(1)
+        if self.held.len() >= self.prefix.len() {
+            Duration::MAX
         } else {
             Duration::from_millis(30)
         }
     }
 
-    /// nothing more came, so what was held back wasn't the marker
+    /// nothing more came, so what was held back wasn't a marker
     fn flush(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.held)
-    }
-
-    fn keep_tail(&mut self, b: &[u8]) {
-        if !self.tail.contains(&b';') {
-            let room = 8usize.saturating_sub(self.tail.len());
-            self.tail.extend(b.iter().take(room));
-        }
-    }
-
-    /// the shell's exit code from after the marker, if it sent one
-    fn rc(&self) -> Option<u8> {
-        let n = self.tail.iter().take_while(|b| b.is_ascii_digit()).count();
-        let how = usize::from(matches!(self.tail.get(n), Some(b'p' | b'r')));
-        if n == 0 || self.tail.get(n + how) != Some(&b';') {
-            return None;
-        }
-        std::str::from_utf8(&self.tail[..n]).ok()?.parse().ok()
-    }
-
-    /// p or r after the exit code: the shell ended in a poweroff or a reboot
-    fn how(&self) -> Option<u8> {
-        self.rc()?;
-        let n = self.tail.iter().take_while(|b| b.is_ascii_digit()).count();
-        self.tail
-            .get(n)
-            .copied()
-            .filter(|b| matches!(b, b'p' | b'r'))
     }
 }
 
@@ -799,28 +831,29 @@ mod tests {
 
     #[test]
     fn shell_end_marker() {
+        // the bare marker an image built before the end record sends
         let all = b"burner:~# exit\r\nBURNER-abc-END[ 10.66] reboot: Restarting system\r\n";
         let want = b"burner:~# exit\r\n".to_vec();
         for i in 0..=all.len() {
-            let mut e = Markers::new("abc");
+            let mut e = Markers::new("abc", true);
             let mut got = e.feed(&all[..i]);
             got.extend(e.feed(&all[i..]));
             assert_eq!(got, want, "split at {i}");
-            assert!(e.ended);
+            assert_eq!(e.ended, Some(Ended::Legacy));
         }
         // a held "BUR" that turns out not to be the marker still shows
-        let mut e = Markers::new("abc");
+        let mut e = Markers::new("abc", false);
         assert_eq!(e.feed(b"echo BUR"), b"echo ".to_vec());
         assert_eq!(e.hold(), Duration::from_millis(30));
         assert_eq!(e.flush(), b"BUR".to_vec());
         assert_eq!(e.feed(b"NING\r\n"), b"NING\r\n".to_vec());
         // another token's marker is just output
-        let mut e = Markers::new("abc");
+        let mut e = Markers::new("abc", false);
         assert_eq!(
             e.feed(b"BURNER-xyz-END\r\n"),
             b"BURNER-xyz-END\r\n".to_vec()
         );
-        assert!(!e.ended);
+        assert!(e.ended.is_none());
     }
 
     #[test]
@@ -853,7 +886,7 @@ mod tests {
     fn shell_ready_marker() {
         let all = b"\r\nburner: fresh VM.\r\n\r\nBURNER-abc-READYburner:~# ";
         for i in 0..=all.len() {
-            let mut e = Markers::new("abc");
+            let mut e = Markers::new("abc", false);
             let mut got = e.feed(&all[..i]);
             got.extend(e.feed(&all[i..]));
             got.extend(e.flush());
@@ -862,63 +895,72 @@ mod tests {
                 b"\r\nburner: fresh VM.\r\n\r\nburner:~# ".to_vec(),
                 "split at {i}"
             );
-            assert!(e.ready && !e.ended, "split at {i}");
+            assert!(e.ready && e.ended.is_none(), "split at {i}");
         }
-        let mut e = Markers::new("abc");
+        let mut e = Markers::new("abc", false);
         assert_eq!(
             e.feed(b"BURNER-abc-READYx\r\nBURNER-abc-END0;"),
             b"x\r\n".to_vec()
         );
-        assert!(e.ready && e.ended);
-        let mut e = Markers::new("abc");
+        assert!(e.ready && e.ended == Some(Ended::Exit(0)));
+        let mut e = Markers::new("abc", false);
         assert_eq!(e.feed(b"BURNER-abc-REA"), b"".to_vec());
         assert_eq!(e.feed(b"L"), b"BURNER-abc-REAL".to_vec());
         assert!(!e.ready);
     }
 
     #[test]
-    fn shell_end_holds_a_marker_split_by_a_gap() {
-        let mut e = Markers::new("f72b08526ecfa370");
+    fn shell_end_record_held_across_gaps() {
+        // a gap of any length in the middle of the record: it's held, not let
+        // out, once it has the whole token
+        let mut e = Markers::new("f72b08526ecfa370", false);
         assert_eq!(e.feed(b"$ BURNER-f72b08526ecfa370-E"), b"$ ".to_vec());
-        assert_eq!(e.hold(), Duration::from_secs(1));
-        assert_eq!(
-            e.feed(b"ND0;[ 3.05] reboot: Restarting system"),
-            b"".to_vec()
-        );
-        assert!(e.ended);
-        assert_eq!(e.rc(), Some(0));
+        assert_eq!(e.hold(), Duration::MAX);
+        assert_eq!(e.feed(b"ND"), b"".to_vec());
+        assert_eq!(e.feed(b"0"), b"".to_vec());
+        assert_eq!(e.hold(), Duration::MAX);
+        assert_eq!(e.feed(b";[ 3.05] reboot: Restarting system"), b"".to_vec());
+        assert_eq!(e.ended, Some(Ended::Exit(0)));
+        // before the token is whole it's let out after a moment
+        let mut e = Markers::new("f72b08526ecfa370", false);
+        assert_eq!(e.feed(b"BURNER-f72b"), b"".to_vec());
+        assert_eq!(e.hold(), Duration::from_millis(30));
     }
 
     #[test]
-    fn shell_end_exit_code() {
+    fn shell_end_record() {
         let all = b"exit 3\r\nBURNER-abc-END3;[ 1.0] reboot: Restarting system\r\n";
         for i in 0..=all.len() {
-            let mut e = Markers::new("abc");
+            let mut e = Markers::new("abc", false);
             let mut got = e.feed(&all[..i]);
             got.extend(e.feed(&all[i..]));
             assert_eq!(got, b"exit 3\r\n".to_vec(), "split at {i}");
-            assert_eq!(e.rc(), Some(3), "split at {i}");
+            assert_eq!(e.ended, Some(Ended::Exit(3)), "split at {i}");
         }
-        let rc = |s: &[u8]| {
-            let mut e = Markers::new("abc");
-            e.feed(s);
-            (e.ended, e.rc())
+        let end = |s: &[u8]| {
+            let mut e = Markers::new("abc", false);
+            let shown = e.feed(s);
+            (e.ended, shown)
         };
-        assert_eq!(rc(b"BURNER-abc-END0;"), (true, Some(0)));
-        assert_eq!(rc(b"BURNER-abc-END255;"), (true, Some(255)));
-        // an older guest init sends no code
-        assert_eq!(rc(b"BURNER-abc-END[ 1.0] reboot"), (true, None));
-        assert_eq!(rc(b"BURNER-abc-END256;"), (true, None));
-        assert_eq!(rc(b"BURNER-abc-END12"), (true, None));
-        let how = |s: &[u8]| {
-            let mut e = Markers::new("abc");
-            e.feed(s);
-            (e.rc(), e.how())
-        };
-        assert_eq!(how(b"BURNER-abc-END0p;"), (Some(0), Some(b'p')));
-        assert_eq!(how(b"BURNER-abc-END0r;"), (Some(0), Some(b'r')));
-        assert_eq!(how(b"BURNER-abc-END3;"), (Some(3), None));
-        assert_eq!(how(b"BURNER-abc-END0x;"), (None, None));
+        assert_eq!(end(b"BURNER-abc-END0;").0, Some(Ended::Exit(0)));
+        assert_eq!(end(b"BURNER-abc-END255;").0, Some(Ended::Exit(255)));
+        assert_eq!(end(b"BURNER-abc-ENDp;").0, Some(Ended::PowerOff));
+        assert_eq!(end(b"BURNER-abc-ENDr;").0, Some(Ended::Reboot));
+        assert_eq!(end(b"BURNER-abc-ENDf;").0, Some(Ended::NoStart));
+        assert_eq!(end(b"BURNER-abc-ENDl;").0, Some(Ended::Lost));
+        // only a whole, well formed record counts; anything else is text
+        for bad in [
+            &b"BURNER-abc-END[ 1.0] reboot\r\n"[..],
+            b"BURNER-abc-END256;x",
+            b"BURNER-abc-END1234;",
+            b"BURNER-abc-END0p;",
+            b"BURNER-abc-ENDx;",
+            b"BURNER-abc-END;",
+        ] {
+            assert_eq!(end(bad), (None, bad.to_vec()), "{bad:?}");
+        }
+        // a record still coming in is held
+        assert_eq!(end(b"BURNER-abc-END12"), (None, b"".to_vec()));
     }
 
     #[test]

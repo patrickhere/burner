@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use serde_json::json;
 
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
-use super::console::{ShellIo, deliver, print_rest, relay, stream, supervise};
+use super::console::{Ended, ShellIo, deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
@@ -433,14 +433,32 @@ fn run_vm(
             // guest init passes on the shell's exit code. a VM that stopped
             // without saying so crashed or was reset under the shell
             Outcome::Done => match sh.end {
-                Some(e) => {
-                    set_status("exited", Some(i32::from(e.rc)));
-                    let how = match e.how {
-                        Some(b'p') => Some("the VM was powered off".into()),
-                        Some(b'r') => Some("the VM was rebooted, which ends it".into()),
-                        _ => None,
-                    };
-                    (e.rc, how)
+                Some(Ended::Exit(rc)) => {
+                    set_status("exited", Some(i32::from(rc)));
+                    (rc, None)
+                }
+                Some(Ended::Legacy) => {
+                    set_status("exited", Some(0));
+                    (0, None)
+                }
+                Some(Ended::PowerOff) => {
+                    set_status("exited", Some(0));
+                    (0, Some("the VM was powered off".into()))
+                }
+                Some(Ended::Reboot) => {
+                    set_status("exited", Some(0));
+                    (0, Some("the VM was rebooted, which ends it".into()))
+                }
+                Some(Ended::NoStart) => {
+                    set_status("sandbox_error", None);
+                    (EXIT_SANDBOX, Some("the guest shell couldn't start".into()))
+                }
+                Some(Ended::Lost) => {
+                    set_status("sandbox_error", None);
+                    (
+                        EXIT_SANDBOX,
+                        Some("the guest shell ended without an exit code".into()),
+                    )
                 }
                 None => {
                     set_status("sandbox_error", None);

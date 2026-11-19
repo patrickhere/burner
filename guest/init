@@ -20,22 +20,39 @@ console_dev() {
     echo "$dev"
 }
 
-# burner shell: runs login shell $1 in its own session and waits for it, with
-# the shell's exit code going to $2/rc. the shell's processes see this as pid
-# 1, so poweroff, halt and reboot without -f signal it (busybox sends USR2,
-# USR1 and TERM), which ends the wait with p or r in $2/how
+# burner shell: runs login shell $1 and waits for it. the shell runs under a
+# small sh in a session of its own, which owns it: that sh checks it got the
+# console as its controlling tty, says the shell is ready (token $3), runs it
+# and puts its exit code in $2/rc, or why it couldn't in $2/fail. the shell's
+# processes see this function's shell as pid 1, so poweroff, halt and reboot
+# without -f signal it (busybox sends USR2, USR1 and TERM), which ends the
+# wait with p or r in $2/how. a wrapper gone with none of those is lost
 run_shell() {
     trap 'echo p > "$2/how"' USR1 USR2
     trap 'echo r > "$2/how"' TERM
-    # setsid twice: the second one forks, so the shell gets a session of its
+    # setsid twice: the second one forks, so the wrapper gets a session of its
     # own with the console as its tty, and this one stays free to take those
     # signals. a shell started with & would ignore ctrl-c for good
     # shellcheck disable=SC2016
-    setsid setsid -c /bin/sh -c 'echo $$ > "$2/pid"; "$1" -l; echo $? > "$2/rc"' sh "$1" "$2"
-    while [ ! -s "$2/rc" ] && [ ! -s "$2/how" ]; do
-        if [ -s "$2/pid" ] && read -r pid < "$2/pid" && ! kill -0 "$pid" 2>/dev/null; then
-            break
+    if ! setsid setsid -c /bin/sh -c '
+        echo $$ > "$2/pid"
+        if ! { : < /dev/tty; } 2>/dev/null; then echo "no controlling tty" > "$2/fail"; exit 1; fi
+        [ -n "$3" ] && printf "BURNER-%s-READY" "$3"
+        "$1" -l
+        echo $? > "$2/rc"' sh "$1" "$2" "$3"; then
+        echo "setsid failed" > "$2/fail"
+        return
+    fi
+    n=0
+    while [ ! -s "$2/rc" ] && [ ! -s "$2/how" ] && [ ! -s "$2/fail" ]; do
+        if [ -s "$2/pid" ]; then
+            # pid 1 reaps the wrapper once it's gone, then kill -0 fails
+            read -r pid < "$2/pid"
+            kill -0 "$pid" 2>/dev/null || break
+        elif [ "$n" -ge 50 ]; then
+            echo "the shell never started" > "$2/fail"
         fi
+        n=$((n + 1))
         sleep 0.2
     done
 }
@@ -44,7 +61,7 @@ run_shell() {
 # call reboot(2), which in a pid namespace ends only the namespace: pid 1
 # outside sees this one die of SIGINT (poweroff, halt) or SIGHUP (reboot)
 if [ "${1:-}" = shellns ]; then
-    run_shell "$2" "$3"
+    run_shell "$2" "$3" "$4"
     exit 0
 fi
 
@@ -111,35 +128,40 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     name=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-linux}")
     printf '\nburner: fresh %s VM. nothing is kept when you exit.\n\n' "$name"
     token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
-    # burner holds the caller's keys until this, so none reach a console
-    # that isn't set up yet, and ctrl-c until then stops the VM
+    # burner holds the caller's keys until the shell says it's ready, so none
+    # reach a console that isn't set up yet, and ctrl-c until then stops the VM
     st=/run/burner-shell
     rm -rf "$st"; mkdir -p "$st"
-    [ -n "$token" ] && printf 'BURNER-%s-READY' "$token"
-    s=0
     if ! command -v setsid >/dev/null 2>&1; then
         # nothing here can give the shell a controlling tty
         echo "burner: this image has no setsid, so the shell gets no job control and ctrl-c can't stop what runs in it. ~. after enter still leaves"
+        [ -n "$token" ] && printf 'BURNER-%s-READY' "$token"
         "$sh" -l; echo $? > "$st/rc"
     elif unshare -m -p -f --mount-proc true 2>/dev/null; then
-        unshare -m -p -f --mount-proc /bin/sh /sbin/burner-init shellns "$sh" "$st"
-        s=$?
-        case $s in 129) echo r > "$st/how" ;; 130) echo p > "$st/how" ;; esac
+        unshare -m -p -f --mount-proc /bin/sh /sbin/burner-init shellns "$sh" "$st" "$token"
+        case $? in 129) echo r > "$st/how" ;; 130) echo p > "$st/how" ;; esac
     else
         # no pid namespaces: poweroff -f and the like stop the kernel here
-        run_shell "$sh" "$st"
+        run_shell "$sh" "$st" "$token"
     fi
     kill "$sizer" 2>/dev/null
+    # how the shell ended, as burner reads it: its exit code, p or r, f when it
+    # couldn't start, l when it went away without an exit code
     how=$(cat "$st/how" 2>/dev/null); rc=$(cat "$st/rc" 2>/dev/null)
-    [ -n "$how" ] && rc=0
-    case $rc in ''|*[!0-9]*) rc=$s ;; esac
+    if [ -n "$how" ]; then
+        status=$how
+    elif [ -s "$st/fail" ]; then
+        echo "burner-init: the shell didn't start: $(cat "$st/fail")" > "$con"
+        status=f
+    else
+        case $rc in ''|*[!0-9]*) status=l ;; *) status=$rc ;; esac
+    fi
     dmesg -n 1 2>/dev/null
-    # burner shows nothing past the end marker, so the kernel's reboot line
+    # burner shows nothing past the end record, so the kernel's reboot line
     # (logged at a level no loglevel setting hides) doesn't end up on the
-    # caller's terminal. the shell's exit code follows it, burner exits with
-    # it, and p or r for a poweroff or reboot. $con is reopened: the login
-    # shell's exit hung up the tty init's own fds point at
-    [ -n "$token" ] && printf 'BURNER-%s-END%s%s;' "$token" "$rc" "$how" > "$con"
+    # caller's terminal. $con is reopened: the login shell's exit hung up the
+    # tty init's own fds point at
+    [ -n "$token" ] && printf 'BURNER-%s-END%s;' "$token" "$status" > "$con"
     halt
 fi
 
