@@ -195,9 +195,13 @@ echo "$PROTO" > /result/proto
 # raw console: no \n -> \r\n, so the live bytes match the log exactly
 stty -opost 2>/dev/null
 
-fail() {   # sandbox-side failure before the command ran
-    echo "BURNER-$token-BEGIN"; echo "burner: $1"; echo "BURNER-$token-END"
-    echo "burner: $1" > /result/log.txt
+# sandbox-side failure before the command ran: $1 says what failed (input,
+# job, proto) in result/fail, $2 why. a burner from before result/fail
+# takes the 125 in rc for the command's exit code, as it always did
+fail() {
+    echo "BURNER-$token-BEGIN"; echo "burner: $2"; echo "BURNER-$token-END"
+    echo "burner: $2" > /result/log.txt
+    echo "$1" > /result/fail
     echo 125 > /result/rc
 }
 
@@ -257,11 +261,11 @@ strays() {
 }
 
 if [ "$want" != "$PROTO" ]; then
-    fail "this image's guest init speaks protocol $PROTO and burner wants ${want:-none}, rebuild the image with tools/build-image"
+    fail proto "this image's guest init speaks protocol $PROTO and burner wants ${want:-none}, rebuild the image with tools/build-image"
 elif ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
-    fail "job disk unreadable"
+    fail job "job disk unreadable"
 elif [ -f /job/input.tar ] && ! tar -x -C /work -f /job/input.tar 2>/result/untar.err; then
-    fail "input tar did not unpack: $(head -c 300 /result/untar.err)"
+    fail input "input tar did not unpack: $(head -c 300 /result/untar.err)"
 else
     rm -f /job/input.tar /result/untar.err
     stdin=/dev/null; [ -f /job/stdin ] && stdin=/job/stdin

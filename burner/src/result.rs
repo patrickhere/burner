@@ -42,6 +42,10 @@ pub struct Meta {
     /// the guest stopped the job at its time limit and still wrote results
     #[serde(default)]
     pub timed_out: bool,
+    /// what the guest couldn't set up before the command (input, job), from
+    /// result/fail: the command never ran
+    #[serde(default)]
+    pub fail: Option<String>,
 }
 
 /// reads exactly `left` bytes or fails: a member whose body runs past the end
@@ -174,6 +178,12 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
         p.chars()
             .take(300)
             .map(|c| if c.is_control() { '?' } else { c })
+            .collect()
+    });
+    meta.fail = meta.fail.map(|f| {
+        f.chars()
+            .filter(char::is_ascii_lowercase)
+            .take(16)
             .collect()
     });
     if meta.rc.is_none() && !meta.fatal {
@@ -401,6 +411,7 @@ fn walk(
             "result/rc" if size <= 8 => meta.rc = read_small(&mut e)?.trim().parse().ok(),
             "result/proto" if size <= 8 => meta.proto = read_small(&mut e)?.trim().parse().ok(),
             "result/timed_out" => meta.timed_out = true,
+            "result/fail" if size <= 16 => meta.fail = Some(read_small(&mut e)?.trim().to_string()),
             "result/log_skipped" if size <= 20 => {
                 meta.skipped = read_small(&mut e)?.trim().parse().unwrap_or(0)
             }
@@ -557,6 +568,13 @@ mod tests {
         assert!(walk_bytes(&tar_of(&[("out/a", b"x"), ("out/a", b"y")])).is_err());
         let err = walk_bytes(&tar_of(&[("result/rc", b"0\n"), ("result/error", b"boom")])).unwrap();
         assert!(err.guest_error);
+        let fail = walk_bytes(&tar_of(&[
+            ("result/rc", b"125\n"),
+            ("result/fail", b"input\n"),
+        ]))
+        .unwrap();
+        assert_eq!((fail.rc, fail.fail.as_deref()), (Some(125), Some("input")));
+        assert_eq!(ok.fail, None);
     }
 
     fn with_type(t: tar::EntryType, size: u64) -> Vec<u8> {

@@ -463,6 +463,19 @@ fn run_vm(
                 Some(rc) if !meta.guest_error => set_status("exited", Some(rc)),
                 _ => set_status("sandbox_error", None),
             }
+            // the guest failed before the command ran. its rc of 125 is for
+            // burners that don't read result/fail
+            if let (Some(_), Some(f)) = (meta.rc, &meta.fail) {
+                code = EXIT_SANDBOX;
+                set_status(
+                    if f == "input" {
+                        "input_error"
+                    } else {
+                        "sandbox_error"
+                    },
+                    None,
+                );
+            }
             if meta.timed_out {
                 diag.put(
                     format!(
