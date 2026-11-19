@@ -300,16 +300,17 @@ fn run_vm(
                     set_status("exited", Some(i32::from(rc)));
                     (rc, None)
                 }
+                // these end the shell fine, but the guest gave no exit code
                 Some(Ended::Legacy) => {
-                    set_status("exited", Some(0));
+                    set_status("exited", None);
                     (0, None)
                 }
                 Some(Ended::PowerOff) => {
-                    set_status("exited", Some(0));
+                    set_status("exited", None);
                     (0, Some("the VM was powered off".into()))
                 }
                 Some(Ended::Reboot) => {
-                    set_status("exited", Some(0));
+                    set_status("exited", None);
                     (0, Some("the VM was rebooted, which ends it".into()))
                 }
                 Some(Ended::NoStart) => {
