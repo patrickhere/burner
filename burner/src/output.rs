@@ -356,7 +356,8 @@ impl TermFilter {
             self.utf8.clear(); // a cut-off multibyte char is dropped
             match b {
                 0x1b => self.start_esc(),
-                b'\t' | b'\n' | b'\r' | 0x08 | 0x07 => out.push(b),
+                // vertical tab and form feed move down a line, like line feed
+                b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | 0x08 | 0x07 => out.push(b),
                 0x20..=0x7e => out.push(b),
                 _ => {}
             }
@@ -532,6 +533,7 @@ mod tests {
         assert_eq!(f.feed(&v[1..]), v.to_vec());
         assert_eq!(f.feed(b"\xff\xfeok"), b"ok".to_vec());
         assert_eq!(f.feed(b"\x00\x0e\x7fok"), b"ok".to_vec());
+        assert_eq!(f.feed(b"v\x0bw\x0cx"), b"v\x0bw\x0cx".to_vec());
     }
 
     #[test]
