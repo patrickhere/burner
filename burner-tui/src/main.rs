@@ -45,8 +45,14 @@ static WINCH: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_winch(_: libc::c_int) {
     let fd = WINCH.load(Ordering::Relaxed);
-    // SAFETY: write is async-signal-safe; a full pipe already has a wakeup in it
-    unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+    // SAFETY: errno is this thread's, and write is async-signal-safe. a full
+    // pipe already has a wakeup in it, and its EAGAIN mustn't reach the call
+    // this signal interrupted, which looks at errno next
+    unsafe {
+        let errno = *libc::__errno_location();
+        libc::write(fd, [0u8].as_ptr().cast(), 1);
+        *libc::__errno_location() = errno;
+    }
 }
 
 fn handle(sig: libc::c_int, f: extern "C" fn(libc::c_int)) {
