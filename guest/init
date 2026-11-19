@@ -11,6 +11,15 @@ halt() {
     sleep 3; echo b > /proc/sysrq-trigger
 }
 
+# the tty the kernel was told to use, the last console= like the kernel's own
+# pick: ttyS0 under firecracker, hvc0 (virtio console) under libkrun. a name
+# that isn't a plain device here falls back to ttyS0
+console_dev() {
+    dev=$(sed -n 's/^/ /; s/.* console=\([A-Za-z0-9]*\).*/\1/p' "${1:-/proc/cmdline}")
+    if [ -z "$dev" ] || [ ! -c "/dev/$dev" ]; then dev=ttyS0; fi
+    echo "$dev"
+}
+
 if [ "${1:-}" != stage2 ]; then
     mount -t proc proc /proc
     mount -t devtmpfs dev /dev 2>/dev/null
@@ -42,8 +51,11 @@ if [ -n "$dns" ]; then
 fi
 
 if grep -q 'burner\.shell=1' /proc/cmdline; then
-    # interactive: a login shell on the serial console, the VM ends when it exits
-    exec < /dev/ttyS0 > /dev/ttyS0 2>&1
+    # interactive: a login shell on the console, the VM ends when it exits
+    con=/dev/$(console_dev)
+    # a tty, read and written both ways on purpose
+    # shellcheck disable=SC2094
+    exec < "$con" > "$con" 2>&1
     tty=$(sed -n 's/.*burner\.tty=\([0-9]*x[0-9]*\).*/\1/p' /proc/cmdline)
     [ -n "$tty" ] && stty rows "${tty%x*}" cols "${tty#*x}" 2>/dev/null
     term=$(sed -n 's/.*burner\.term=\([a-z0-9.+-]*\).*/\1/p' /proc/cmdline)
@@ -59,7 +71,7 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     # level no loglevel setting hides) doesn't end up on the caller's terminal
     token=$(sed -n 's/.*burner\.token=\([A-Za-z0-9]*\).*/\1/p' /proc/cmdline)
     # reopened: the login shell's exit hung up the tty init's own fds point at
-    [ -n "$token" ] && printf 'BURNER-%s-END' "$token" > /dev/ttyS0
+    [ -n "$token" ] && printf 'BURNER-%s-END' "$token" > "$con"
     halt
 fi
 
