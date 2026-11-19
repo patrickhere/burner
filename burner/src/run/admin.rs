@@ -19,6 +19,22 @@ use crate::sys;
 const REAPED: &str = "reaped";
 const REAPER_MAX_AGE: Duration = Duration::from_secs(120);
 
+/// each VM's own dir under paths.root: its disks, its VMM's log
+#[cfg(target_os = "linux")]
+pub(super) const VM_DIRS: &str = "jail/firecracker";
+#[cfg(target_os = "macos")]
+pub(super) const VM_DIRS: &str = "vm";
+
+#[cfg(target_os = "linux")]
+fn cgroup_dir() -> PathBuf {
+    PathBuf::from("/sys/fs/cgroup").join(cgroup::PARENT)
+}
+
+#[cfg(target_os = "macos")]
+fn cgroup_dir() -> PathBuf {
+    cgroup::dir()
+}
+
 pub(super) fn reaper_alive(cfg: &Config) -> Result<()> {
     match reaper_age(cfg) {
         Some(a) if a <= REAPER_MAX_AGE => Ok(()),
@@ -93,7 +109,7 @@ pub(super) fn release(cfg: &Config, id: &str, slot: Slot, wait: Duration) -> Rel
         Slot::Tap(i) => net::tap_down(cfg, i),
         Slot::Unknown => false,
     };
-    let jail_gone = remove_tree(&cfg.paths.root.join("jail/firecracker").join(id));
+    let jail_gone = remove_tree(&cfg.paths.root.join(VM_DIRS).join(id));
     if tap_gone && jail_gone {
         Released::Done
     } else {
@@ -378,10 +394,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
     for i in net::reap_orphan_taps(cfg) {
         log_line(&format!("reap orphan tap {i}"));
     }
-    for base in [
-        cfg.paths.root.join("jail/firecracker"),
-        PathBuf::from("/sys/fs/cgroup").join(cgroup::PARENT),
-    ] {
+    for base in [cfg.paths.root.join(VM_DIRS), cgroup_dir()] {
         for e in fs::read_dir(&base)
             .into_iter()
             .flatten()

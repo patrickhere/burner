@@ -518,6 +518,7 @@ pub fn signal_ident(who: &crate::ledger::Ident, sig: libc::c_int) -> bool {
 }
 
 /// the mount a file descriptor lives on, from /proc/self/fdinfo
+#[cfg(target_os = "linux")]
 fn mnt_id(fd: libc::c_int) -> Option<u64> {
     fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
         .ok()?
@@ -526,6 +527,56 @@ fn mnt_id(fd: libc::c_int) -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// macOS has no bind mounts, so the filesystem a fd lives on is enough
+#[cfg(target_os = "macos")]
+fn mnt_id(fd: libc::c_int) -> Option<u64> {
+    // SAFETY: zeroed stat is a valid out-parameter for fstat on a fd we hold
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_dev as u64)
+}
+
+/// the names in a directory, read through the fd we hold
+#[cfg(target_os = "linux")]
+fn dir_names(fd: libc::c_int) -> io::Result<Vec<std::ffi::CString>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    // listing through the fd's /proc entry keeps it anchored to this directory
+    Ok(fs::read_dir(format!("/proc/self/fd/{fd}"))?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| CString::new(e.file_name().as_bytes()).ok())
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn dir_names(fd: libc::c_int) -> io::Result<Vec<std::ffi::CString>> {
+    // SAFETY: fdopendir takes over a dup of our fd and closedir releases it;
+    // readdir's entries are copied out before the next call
+    unsafe {
+        let dup = libc::dup(fd);
+        if dup < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let d = libc::fdopendir(dup);
+        if d.is_null() {
+            libc::close(dup);
+            return Err(io::Error::last_os_error());
+        }
+        let mut names = Vec::new();
+        loop {
+            let e = libc::readdir(d);
+            if e.is_null() {
+                break;
+            }
+            let n = std::ffi::CStr::from_ptr((*e).d_name.as_ptr());
+            if n != c"." && n != c".." {
+                names.push(n.to_owned());
+            }
+        }
+        libc::closedir(d);
+        Ok(names)
+    }
 }
 
 /// delete a tree without following symlinks or leaving the mount it starts on.
@@ -564,8 +615,6 @@ pub fn remove_tree_at(path: &std::path::Path) -> bool {
 }
 
 fn remove_at(dirfd: libc::c_int, name: &std::ffi::CStr, mnt: u64) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
     // SAFETY: openat(2) relative to a dir fd we hold, never following a symlink
     let fd = unsafe {
         libc::openat(
@@ -588,17 +637,10 @@ fn remove_at(dirfd: libc::c_int, name: &std::ffi::CStr, mnt: u64) -> bool {
     }
     let mut ok = mnt_id(fd) == Some(mnt);
     if ok {
-        // listing through the fd's /proc entry keeps it anchored to this directory
-        let names: Vec<CString> = fs::read_dir(format!("/proc/self/fd/{fd}"))
-            .map(|rd| {
-                rd.filter_map(|e| e.ok())
-                    .filter_map(|e| CString::new(e.file_name().as_bytes()).ok())
-                    .collect()
-            })
-            .unwrap_or_else(|_| {
-                ok = false;
-                Vec::new()
-            });
+        let names = dir_names(fd).unwrap_or_else(|_| {
+            ok = false;
+            Vec::new()
+        });
         for n in names {
             ok &= remove_at(fd, &n, mnt);
         }

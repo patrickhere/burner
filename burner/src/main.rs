@@ -1,3 +1,4 @@
+#[cfg_attr(target_os = "macos", path = "cgroup_macos.rs")]
 mod cgroup;
 mod config;
 mod doctor;
@@ -79,6 +80,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let cfg = Config::load(&cli.config)?;
+    #[cfg(target_os = "macos")]
+    cgroup::set_dir(&cfg.paths.state);
     match cli.cmd {
         Cmd::Config => {
             print!("{}", toml::to_string_pretty(&cfg)?);
