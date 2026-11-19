@@ -146,11 +146,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }),
         Cmd::Run(a) => Ok(run::main(&cfg, a)),
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
+        // not there on this OS rather than failed, like a wrong flag
         #[cfg(target_os = "macos")]
         Cmd::Net { .. } => {
-            anyhow::bail!(
-                "on macOS each VM's network is a process of its own, there's nothing to set up"
-            )
+            eprintln!(
+                "burner: on macOS each VM's network is a process of its own, there's nothing to set up"
+            );
+            Ok(ExitCode::from(run::EXIT_USAGE))
         }
         #[cfg(target_os = "linux")]
         Cmd::Net { action } => match action.as_str() {
