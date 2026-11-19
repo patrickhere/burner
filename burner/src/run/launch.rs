@@ -250,13 +250,13 @@ fn run_vm(
         #[cfg(target_os = "macos")]
             net: _net,
     } = launch(cfg, p, id, &job, net_slot, uid, size)?;
+    // an image built with another guest init doesn't say when its shell is
+    // ready for keys, and never writes result/fail itself
+    let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
+        .ok()
+        .as_deref()
+        != Some(crate::doctor::GUEST_INIT);
     if p.shell {
-        // an image built with another guest init doesn't say when its shell
-        // is ready for keys
-        let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
-            .ok()
-            .as_deref()
-            != Some(crate::doctor::GUEST_INIT);
         #[cfg(target_os = "linux")]
         let fix = format!("rebuild it: tools/build-image {}", p.img);
         #[cfg(target_os = "macos")]
@@ -465,8 +465,9 @@ fn run_vm(
                 _ => set_status("sandbox_error", None),
             }
             // the guest failed before the command ran. its rc of 125 is for
-            // burners that don't read result/fail
-            if let (Some(_), Some(f)) = (meta.rc, &meta.fail) {
+            // burners that don't read result/fail. from an older guest init
+            // the file can only be the command's own
+            if let (Some(_), Some(f), false) = (meta.rc, &meta.fail, legacy) {
                 code = EXIT_SANDBOX;
                 set_status(
                     if f == "input" {

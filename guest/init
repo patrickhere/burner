@@ -308,6 +308,8 @@ else
     kept=$(wc -c < /result/log.txt 2>/dev/null || echo 0)
     [ "$total" -gt "$kept" ] && echo $((total - kept)) > /result/log_skipped
     rm -rf "$C" /result/head /result/total
+    # the command ran, so a result/fail now can only be one it wrote itself
+    rm -f /result/fail
     [ -f /result/rc ] || echo 125 > /result/rc
 fi
 
