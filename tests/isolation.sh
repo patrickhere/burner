@@ -22,9 +22,11 @@ mkdir -p "$T/proj"; echo 'print me' > "$T/proj/a.txt"
 out=$(tar -C "$T/proj" -c . | sudo burner run --in tar -- 'cat /work/a.txt' 2>&1); rc=$?
 [ "$rc" = 0 ] && [ "$out" = "print me" ] && ok "--in tar" || bad "--in tar" "rc=$rc out=$out"
 
-# 3 memory bomb: guest OOMs inside itself, firecracker survives and returns a result
-out=$(sudo burner run --mem 256 -- 'awk "BEGIN{while(1) s=s sprintf(\"%1000000s\",\"x\")}"; echo after=$?' </dev/null 2>&1); rc=$?
-echo "$out" | grep -qE 'after=(137|1|2)' && [ "$rc" = 0 ] && ok "memory bomb contained (guest OOM, VM survived)" \
+# 3 memory bomb: guest OOMs inside itself, firecracker survives and returns a result.
+# a string that doubles grows under any awk (mawk refuses a big sprintf at once,
+# exit 2, without allocating anything), and "grew" says it reached 64M
+out=$(sudo burner run --mem 256 -- 'awk "BEGIN{s=\"x\"; for(i=0;;i++){s=s s; if(i==25){print \"grew\"; fflush()}}}"; echo after=$?' </dev/null 2>&1); rc=$?
+echo "$out" | grep -qx grew && echo "$out" | grep -qE 'after=(137|1|2)' && [ "$rc" = 0 ] && ok "memory bomb contained (guest OOM, VM survived)" \
   || bad "memory bomb" "rc=$rc out=$(echo "$out" | tail -2 | tr '\n' ' ')"
 
 # 4 fork bomb + busy loops: the VM's cgroup stays within 1 core and the run ends
