@@ -96,6 +96,21 @@ impl Input {
     }
 
     fn wait(&mut self, ms: i32) -> Tty {
+        // the wait ends in time for a held ESC to become the escape key
+        let ms = self.keys.deadline().map_or(ms, |d| {
+            let left = d.saturating_duration_since(Instant::now()).as_millis();
+            ms.min(i32::try_from(left).unwrap_or(ms).saturating_add(1))
+        });
+        match self.poll(ms) {
+            Tty::Quiet => match self.keys.expire(Instant::now()) {
+                k if k.is_empty() => Tty::Quiet,
+                k => Tty::Keys(k),
+            },
+            t => t,
+        }
+    }
+
+    fn poll(&mut self, ms: i32) -> Tty {
         let mut p = [0, self.winch].map(|fd| libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -123,7 +138,7 @@ impl Input {
         let mut buf = [0u8; 1024];
         match tty().read(&mut buf) {
             Ok(0) => Tty::Gone,
-            Ok(n) => Tty::Keys(self.keys.feed(&buf[..n])),
+            Ok(n) => Tty::Keys(self.keys.feed(&buf[..n], Instant::now())),
             Err(e) if e.kind() == io::ErrorKind::Interrupted => Tty::Quiet,
             Err(_) => Tty::Gone,
         }

@@ -2,20 +2,27 @@
 //! through crossterm's event queue, so one poll sees keys, resizes and a
 //! hangup, and nothing typed before a handover is left in a queue it can't see
 
+use std::time::{Duration, Instant};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// a sequence longer than this isn't a key
 const SEQ_MAX: usize = 32;
+/// how long the start of a sequence waits for the rest. a terminal sends a
+/// key's sequence in one write, but a read can still end inside it
+const ESC_WAIT: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub struct Keys {
     held: Vec<u8>,
+    /// when the held bytes started waiting
+    since: Option<Instant>,
 }
 
 impl Keys {
-    /// the keys in one read. an ESC that ends the read is the escape key; the
-    /// start of a longer sequence or utf-8 char waits for the next read
-    pub fn feed(&mut self, b: &[u8]) -> Vec<KeyEvent> {
+    /// the keys in one read. the start of a sequence or utf-8 char, a lone
+    /// ESC included, waits for the next read, until ESC_WAIT has passed
+    pub fn feed(&mut self, b: &[u8], now: Instant) -> Vec<KeyEvent> {
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(b);
         let mut out = Vec::new();
@@ -33,11 +40,37 @@ impl Keys {
                 Parsed::More => at = buf.len(),
             }
         }
+        self.since = if self.held.is_empty() {
+            None
+        } else {
+            Some(self.since.unwrap_or(now))
+        };
         out
+    }
+
+    /// when what's held stops waiting, if anything is
+    pub fn deadline(&self) -> Option<Instant> {
+        self.since.map(|t| t + ESC_WAIT)
+    }
+
+    /// past the deadline a lone ESC is the escape key, and the start of
+    /// anything else is dropped
+    pub fn expire(&mut self, now: Instant) -> Vec<KeyEvent> {
+        if self.deadline().is_none_or(|d| now < d) {
+            return Vec::new();
+        }
+        let esc = self.held == [0x1b];
+        self.clear();
+        if esc {
+            vec![KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]
+        } else {
+            Vec::new()
+        }
     }
 
     pub fn clear(&mut self) {
         self.held.clear();
+        self.since = None;
     }
 }
 
@@ -64,11 +97,14 @@ fn key(b: &[u8]) -> Parsed {
     let ctrl = KeyModifiers::CONTROL;
     match b[0] {
         0x1b => match b.get(1) {
-            None | Some(0x1b) => used(1, press(KeyCode::Esc, none)),
+            None => Parsed::More,
+            Some(0x1b) => used(1, press(KeyCode::Esc, none)),
             Some(b'[') => csi(b),
             Some(b'O') => match b.get(2) {
                 None => Parsed::More,
-                Some(&f) => used(3, Parsed::Key(0, arrow(f, none))),
+                Some(&f @ 0x40..=0x7e) => used(3, Parsed::Key(0, arrow(f, none))),
+                // not SS3 after all: alt-O, then whatever this is
+                Some(_) => used(2, press(KeyCode::Char('O'), KeyModifiers::ALT)),
             },
             // alt with a key
             Some(_) => match key(&b[1..]) {
@@ -119,12 +155,17 @@ fn utf8(b: &[u8]) -> Parsed {
     }
 }
 
-/// ESC [ params final. arrows can carry modifiers (1;5A is ctrl-up)
+/// ESC [ params final. arrows can carry modifiers (1;5A is ctrl-up). one
+/// nothing here uses is still taken whole, so none of it acts as keys; a
+/// byte that can't be in one ends it there
 fn csi(b: &[u8]) -> Parsed {
-    let Some(end) = b[2..].iter().position(|c| (0x40..=0x7e).contains(c)) else {
+    let Some(end) = b[2..].iter().position(|c| !(0x20..=0x3f).contains(c)) else {
         return Parsed::More;
     };
     let (params, fin) = (&b[2..2 + end], b[2 + end]);
+    if !(0x40..=0x7e).contains(&fin) {
+        return Parsed::Key(end + 2, None);
+    }
     let n = end + 3;
     let m = std::str::from_utf8(params)
         .ok()
@@ -169,9 +210,10 @@ mod tests {
 
     fn codes(chunks: &[&[u8]]) -> Vec<(KeyCode, KeyModifiers)> {
         let mut k = Keys::default();
+        let now = Instant::now();
         chunks
             .iter()
-            .flat_map(|c| k.feed(c))
+            .flat_map(|c| k.feed(c, now))
             .map(|e| (e.code, e.modifiers))
             .collect()
     }
@@ -222,11 +264,8 @@ mod tests {
     #[test]
     fn split_reads() {
         let n = KeyModifiers::NONE;
-        // a lone ESC that ends a read is the key
-        assert_eq!(
-            codes(&[b"\x1b", b"q"]),
-            [(KeyCode::Esc, n), (KeyCode::Char('q'), n)]
-        );
+        // an arrow cut after its ESC is still the arrow
+        assert_eq!(codes(&[b"\x1b", b"[A"]), [(KeyCode::Up, n)]);
         assert_eq!(codes(&[b"\x1b[", b"D"]), [(KeyCode::Left, n)]);
         assert_eq!(codes(&[b"\x1bO", b"A"]), [(KeyCode::Up, n)]);
         let e = "é".as_bytes();
@@ -234,11 +273,43 @@ mod tests {
     }
 
     #[test]
-    fn clear_drops_a_held_start() {
+    fn a_lone_esc_is_the_key_after_a_moment() {
+        let t = Instant::now();
         let mut k = Keys::default();
-        assert!(k.feed(b"\x1b[").is_empty());
+        assert!(k.feed(b"\x1b", t).is_empty());
+        assert_eq!(k.deadline(), Some(t + ESC_WAIT));
+        assert!(k.expire(t + ESC_WAIT / 2).is_empty());
+        assert_eq!(k.expire(t + ESC_WAIT)[0].code, KeyCode::Esc);
+        assert_eq!(k.deadline(), None);
+        // the start of anything else is dropped then
+        assert!(k.feed(b"\x1b[1;", t).is_empty());
+        assert!(k.expire(t + ESC_WAIT).is_empty());
+        assert_eq!(k.feed(b"5A", t)[0].code, KeyCode::Char('5'));
+    }
+
+    #[test]
+    fn unknown_sequences_are_taken_whole() {
+        let n = KeyModifiers::NONE;
+        // a mouse report and a focus event: none of their bytes are keys
+        assert_eq!(
+            codes(&[b"\x1b[<0;12;5Mq", b"\x1b[Iq"]),
+            [(KeyCode::Char('q'), n); 2]
+        );
+        // a byte no sequence can hold ends it, and acts
+        assert_eq!(codes(&[b"\x1b[1\r"]), [(KeyCode::Enter, n)]);
+        assert_eq!(
+            codes(&[b"\x1bO\r"]),
+            [(KeyCode::Char('O'), KeyModifiers::ALT), (KeyCode::Enter, n)]
+        );
+    }
+
+    #[test]
+    fn clear_drops_a_held_start() {
+        let t = Instant::now();
+        let mut k = Keys::default();
+        assert!(k.feed(b"\x1b[", t).is_empty());
         k.clear();
-        assert_eq!(k.feed(b"A")[0].code, KeyCode::Char('A'));
+        assert_eq!(k.feed(b"A", t)[0].code, KeyCode::Char('A'));
     }
 
     #[test]
