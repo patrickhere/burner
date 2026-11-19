@@ -226,8 +226,9 @@ pub const TERM_RESET: &[u8] =
 /// bracketed paste
 const PRIVATE_MODES: &[u32] = &[1, 7, 12, 25, 47, 1047, 1048, 1049, 2004];
 
-/// CSI finals that only move the cursor, erase, scroll or set colors
-const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefgmr";
+/// CSI finals that only move the cursor, erase, scroll or set colors. not g
+/// (tab clear): the guest could clear the caller's tab stops for good
+const CSI_FINALS: &[u8] = b"@ABCDEFGHIJKLMPSTXZ`adefmr";
 
 impl TermFilter {
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
@@ -437,6 +438,12 @@ mod tests {
         for bad in [&b"\x1b[3J"[..], b"\x1b[2;3J", b"\x1b[03J"] {
             assert_eq!(f.feed(bad), b"".to_vec(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn filter_keeps_tab_stops() {
+        let mut f = TermFilter::default();
+        assert_eq!(f.feed(b"a\x1b[3gb\x1b[0gc\x1b[gd"), b"abcd".to_vec());
     }
 
     #[test]
