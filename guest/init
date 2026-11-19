@@ -86,6 +86,8 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     exec < "$con" > "$con" 2>&1
     tty=$(sed -n 's/.*burner\.tty=\([0-9]*x[0-9]*\).*/\1/p' /proc/cmdline)
     [ -n "$tty" ] && stty rows "${tty%x*}" cols "${tty#*x}" 2>/dev/null
+    # backspace in a line read (cat, read) takes a whole utf-8 char, not a byte
+    stty iutf8 2>/dev/null
     term=$(sed -n 's/.*burner\.term=\([a-z0-9.+-]*\).*/\1/p' /proc/cmdline)
     export TERM="${term:-xterm}" HOME=/root
     cd /root 2>/dev/null || cd /
