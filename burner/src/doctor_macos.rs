@@ -10,6 +10,10 @@ use std::time::Duration;
 use crate::config::{self, Config};
 use crate::sys;
 
+/// the guest init this burner speaks to, what burner setup records next to an
+/// image from its own release
+pub const GUEST_INIT: &[u8] = include_bytes!("../guest-init");
+
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum Level {
     Ok,
@@ -270,5 +274,26 @@ fn images(r: &mut Report, cfg: &Config) {
     }
     if !good.is_empty() {
         r.line(Level::Ok, "images", good.join(", "));
+    }
+    // burner shell still works with these, but sends keys typed during boot
+    // before the guest is ready for them
+    let other: Vec<String> = crate::run::images(cfg)
+        .into_iter()
+        .filter(|n| {
+            std::fs::read(cfg.paths.root.join("images").join(n).join("init"))
+                .ok()
+                .as_deref()
+                != Some(GUEST_INIT)
+        })
+        .collect();
+    if !other.is_empty() {
+        r.line(
+            Level::Warn,
+            "images",
+            format!(
+                "{} not from this burner's guest init, burner setup fetches one that is",
+                other.join(", ")
+            ),
+        );
     }
 }

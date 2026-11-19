@@ -53,8 +53,9 @@ enum Source {
     /// the copy the homebrew formula installed, checked by brew against the
     /// formula's sha256s
     Brew(PathBuf),
-    /// a release: SHA256SUMS from the same place, and the kernel pin
-    Release(String),
+    /// a release: SHA256SUMS from the same place, and the kernel pin. true
+    /// when it's this burner's own
+    Release(String, bool),
     /// --from: only that dir's SHA256SUMS
     From(String, &'static str),
 }
@@ -126,7 +127,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
                     .with_context(|| format!("copying {}", from.display()))?;
             }
         }
-        Source::Release(base) => {
+        Source::Release(base, _) => {
             eprintln!("burner: fetching the guest kernel and the alpine image from {base}");
             download(base, "=https", &stage.0)?;
         }
@@ -148,7 +149,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
         }
         eprintln!("burner: {KERNEL} matches the pinned sha256");
     }
-    if matches!(src, Source::Release(_)) {
+    if matches!(src, Source::Release(..)) {
         eprintln!(
             "burner: the image is checked only against the release's own SHA256SUMS, \
              which comes from the same place. gh attestation verify checks where it was built"
@@ -159,8 +160,20 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     gunzip(&stage.0.join(IMAGE), &rootfs)?;
     let defaults = stage.0.join("defaults.toml");
     fs::write(&defaults, ALPINE_DEFAULTS)?;
+    // the guest init the image was built with, what burner shell checks to
+    // know the image tells it when the shell is ready. only known for an image
+    // from this burner's own release; any other one counts as built with
+    // another init, and the shell falls back to how older images worked
+    let init = stage.0.join("init");
+    let own = matches!(src, Source::Brew(_) | Source::Release(_, true));
+    if own {
+        fs::write(&init, crate::doctor::GUEST_INIT)?;
+    }
     let kernel = stage.0.join(KERNEL);
-    for f in [&kernel, &rootfs, &defaults] {
+    for f in [&kernel, &rootfs, &defaults]
+        .into_iter()
+        .chain(own.then_some(&init))
+    {
         fs::set_permissions(f, fs::Permissions::from_mode(0o644))?;
     }
 
@@ -181,6 +194,14 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     fs::rename(&kernel, kdir.join("vmlinux"))?;
     fs::rename(&rootfs, idir.join("rootfs.ext4"))?;
     fs::rename(&defaults, idir.join("defaults.toml"))?;
+    if own {
+        fs::rename(&init, idir.join("init"))?;
+    } else {
+        match fs::remove_file(idir.join("init")) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+    }
     drop(ledger);
 
     println!("kernel  {}", kdir.join("vmlinux").display());
@@ -226,7 +247,11 @@ fn source(a: &SetupArgs) -> Result<Source> {
     if !valid_tag(&tag) {
         bail!("{tag:?} doesn't look like a release tag");
     }
-    Ok(Source::Release(format!("{REPO}/releases/download/{tag}")))
+    let own = tag == format!("v{}", env!("CARGO_PKG_VERSION"));
+    Ok(Source::Release(
+        format!("{REPO}/releases/download/{tag}"),
+        own,
+    ))
 }
 
 /// share/burner next to the bin dir this burner runs from, where the formula

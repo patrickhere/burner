@@ -237,11 +237,15 @@ fn run_vm(
             .ok()
             .as_deref()
             != Some(crate::doctor::GUEST_INIT);
+        #[cfg(target_os = "linux")]
+        let fix = format!("rebuild it: tools/build-image {}", p.img);
+        #[cfg(target_os = "macos")]
+        let fix = "burner setup fetches one that matches";
         if legacy {
             diag.put(
                 format!(
-                    "burner: image {} was built with a different guest init, rebuild it: tools/build-image {}\n",
-                    p.img, p.img
+                    "burner: image {} was built with a different guest init, {fix}\n",
+                    p.img
                 )
                 .as_bytes(),
                 None,
