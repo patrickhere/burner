@@ -50,7 +50,7 @@ fn usage(msg: impl Into<String>) -> anyhow::Error {
     Exit(EXIT_USAGE, msg.into()).into()
 }
 
-fn interrupted() -> &'static Arc<AtomicBool> {
+pub(crate) fn interrupted() -> &'static Arc<AtomicBool> {
     static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
     FLAG.get_or_init(|| {
         let f = Arc::new(AtomicBool::new(false));
@@ -65,7 +65,7 @@ fn interrupted() -> &'static Arc<AtomicBool> {
     })
 }
 
-fn is_interrupted() -> bool {
+pub(crate) fn is_interrupted() -> bool {
     interrupted().load(Ordering::Relaxed)
 }
 

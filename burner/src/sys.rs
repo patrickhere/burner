@@ -380,6 +380,17 @@ pub fn dup_above(fd: i32, min: i32) -> io::Result<std::os::fd::OwnedFd> {
 /// anything it forks and its output pipes. on timeout its whole process group is
 /// killed and reaped. `input` goes to its stdin
 pub fn run_timeout(cmd: &mut Command, input: Option<&[u8]>, limit: Duration) -> io::Result<Output> {
+    run_until(cmd, input, limit, &|| false)
+}
+
+/// run_timeout that also gives up, the same way, as soon as `stop` says so.
+/// the helper has its own process group, so a ctrl-c only reaches burner
+pub fn run_until(
+    cmd: &mut Command,
+    input: Option<&[u8]>,
+    limit: Duration,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Output> {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc;
@@ -434,6 +445,10 @@ pub fn run_timeout(cmd: &mut Command, input: Option<&[u8]>, limit: Duration) -> 
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
+            Ok(None) if stop() => {
+                kill_all(&mut child);
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
+            }
             Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
             Ok(None) => {
                 kill_all(&mut child);
