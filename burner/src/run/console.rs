@@ -212,6 +212,8 @@ pub(super) struct Shell {
 
 pub(super) struct Ended {
     pub(super) rc: u8,
+    /// b'p' when the VM was powered off or halted from inside, b'r' rebooted
+    pub(super) how: Option<u8>,
 }
 
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
@@ -396,6 +398,7 @@ pub(super) fn relay(
         outcome,
         end: end.ended.then(|| Ended {
             rc: end.rc().unwrap_or(0),
+            how: end.how(),
         }),
         screen,
     }
@@ -491,10 +494,21 @@ impl Markers {
     /// the shell's exit code from after the marker, if it sent one
     fn rc(&self) -> Option<u8> {
         let n = self.tail.iter().take_while(|b| b.is_ascii_digit()).count();
-        if n == 0 || self.tail.get(n) != Some(&b';') {
+        let how = usize::from(matches!(self.tail.get(n), Some(b'p' | b'r')));
+        if n == 0 || self.tail.get(n + how) != Some(&b';') {
             return None;
         }
         std::str::from_utf8(&self.tail[..n]).ok()?.parse().ok()
+    }
+
+    /// p or r after the exit code: the shell ended in a poweroff or a reboot
+    fn how(&self) -> Option<u8> {
+        self.rc()?;
+        let n = self.tail.iter().take_while(|b| b.is_ascii_digit()).count();
+        self.tail
+            .get(n)
+            .copied()
+            .filter(|b| matches!(b, b'p' | b'r'))
     }
 }
 
@@ -752,6 +766,15 @@ mod tests {
         assert_eq!(rc(b"BURNER-abc-END[ 1.0] reboot"), (true, None));
         assert_eq!(rc(b"BURNER-abc-END256;"), (true, None));
         assert_eq!(rc(b"BURNER-abc-END12"), (true, None));
+        let how = |s: &[u8]| {
+            let mut e = Markers::new("abc");
+            e.feed(s);
+            (e.rc(), e.how())
+        };
+        assert_eq!(how(b"BURNER-abc-END0p;"), (Some(0), Some(b'p')));
+        assert_eq!(how(b"BURNER-abc-END0r;"), (Some(0), Some(b'r')));
+        assert_eq!(how(b"BURNER-abc-END3;"), (Some(3), None));
+        assert_eq!(how(b"BURNER-abc-END0x;"), (None, None));
     }
 
     #[test]

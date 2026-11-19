@@ -419,7 +419,12 @@ fn run_vm(
             Outcome::Done => match sh.end {
                 Some(e) => {
                     set_status("exited", Some(i32::from(e.rc)));
-                    (e.rc, None)
+                    let how = match e.how {
+                        Some(b'p') => Some("the VM was powered off".into()),
+                        Some(b'r') => Some("the VM was rebooted, which ends it".into()),
+                        _ => None,
+                    };
+                    (e.rc, how)
                 }
                 None => {
                     set_status("sandbox_error", None);
