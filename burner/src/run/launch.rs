@@ -4,6 +4,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, chown};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -375,7 +376,7 @@ fn run_vm(
         .spawn()
         .context("starting the jailer")?;
     if p.shell {
-        let outcome = relay(&mut child, &token, deadline, cfg, id);
+        let (outcome, screen) = relay(&mut child, &token, deadline, cfg, id);
         sys::restore_tty(saved_tty.as_ref());
         if matches!(outcome, Outcome::Failed) {
             // the jail and its firecracker.log are gone after teardown
@@ -392,6 +393,11 @@ fn run_vm(
             p.tag,
             t0.elapsed().as_secs_f64()
         ));
+        // the terminal reset goes out before any message. a caller's terminal
+        // that stalled gets it once it reads again, the VM is gone by then; a
+        // second signal stops the wait
+        interrupted().store(false, Ordering::Relaxed);
+        screen.wait_last(is_interrupted);
         return Ok(match outcome {
             Outcome::Done => {
                 set_status("exited", None);

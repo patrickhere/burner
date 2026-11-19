@@ -12,12 +12,20 @@ const QUEUE_CAP: usize = 8 << 20;
 const CHUNK_COST: usize = 128;
 
 pub struct Out {
-    tx: mpsc::Sender<Vec<u8>>,
+    tx: mpsc::Sender<Chunk>,
     queued: Arc<AtomicUsize>,
     broken: Arc<AtomicBool>,
+    /// set by finish: what's still queued is dropped, only the last chunk goes out
+    skip: Arc<AtomicBool>,
+    last_done: Arc<AtomicBool>,
     dropped: AtomicBool,
     tty: bool,
     esc: Mutex<TtyEscape>,
+}
+
+enum Chunk {
+    Data(Vec<u8>),
+    Last(Vec<u8>),
 }
 
 pub enum Dest {
@@ -34,34 +42,52 @@ impl Out {
     }
 
     pub fn new(dest: Dest) -> Out {
-        let fd = match dest {
-            Dest::Stdout => 1,
-            Dest::Stderr => 2,
+        let (fd, w): (i32, Box<dyn Write + Send>) = match dest {
+            Dest::Stdout => (1, Box::new(std::io::stdout())),
+            Dest::Stderr => (2, Box::new(std::io::stderr())),
         };
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        Out::to(w, crate::sys::is_tty(fd))
+    }
+
+    fn to(mut w: Box<dyn Write + Send>, tty: bool) -> Out {
+        let (tx, rx) = mpsc::channel::<Chunk>();
         let queued = Arc::new(AtomicUsize::new(0));
         let broken = Arc::new(AtomicBool::new(false));
-        let (q, b) = (queued.clone(), broken.clone());
+        let skip = Arc::new(AtomicBool::new(false));
+        let last_done = Arc::new(AtomicBool::new(false));
+        let (q, b, sk, done) = (
+            queued.clone(),
+            broken.clone(),
+            skip.clone(),
+            last_done.clone(),
+        );
         std::thread::spawn(move || {
-            let mut w: Box<dyn Write> = match dest {
-                Dest::Stdout => Box::new(std::io::stdout()),
-                Dest::Stderr => Box::new(std::io::stderr()),
-            };
-            for chunk in rx {
+            for c in rx {
+                let (chunk, last) = match c {
+                    Chunk::Data(v) => (v, false),
+                    Chunk::Last(v) => (v, true),
+                };
                 if !b.load(Ordering::Relaxed)
+                    && (last || !sk.load(Ordering::Relaxed))
                     && (w.write_all(&chunk).is_err() || w.flush().is_err())
                 {
                     b.store(true, Ordering::Relaxed);
                 }
-                q.fetch_sub(chunk.len() + CHUNK_COST, Ordering::Relaxed);
+                if last {
+                    done.store(true, Ordering::Relaxed);
+                } else {
+                    q.fetch_sub(chunk.len() + CHUNK_COST, Ordering::Relaxed);
+                }
             }
         });
         Out {
             tx,
             queued,
             broken,
+            skip,
+            last_done,
             dropped: AtomicBool::new(false),
-            tty: crate::sys::is_tty(fd),
+            tty,
             esc: Mutex::new(TtyEscape::default()),
         }
     }
@@ -88,7 +114,7 @@ impl Out {
             if q + b.len() + CHUNK_COST <= QUEUE_CAP {
                 self.queued
                     .fetch_add(b.len() + CHUNK_COST, Ordering::Relaxed);
-                let _ = self.tx.send(b);
+                let _ = self.tx.send(Chunk::Data(b));
                 return;
             }
             if wait_until.is_none_or(|t| Instant::now() > t) || self.broken.load(Ordering::Relaxed)
@@ -123,6 +149,24 @@ impl Out {
                 return;
             }
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// drops whatever is still queued and writes `last` next, past the queue
+    /// cap. for the shell's terminal reset: a reader that stalled behind a
+    /// pile of guest output still gets it, and gets it last
+    pub fn finish(&self, last: &[u8]) {
+        self.skip.store(true, Ordering::Relaxed);
+        let _ = self.tx.send(Chunk::Last(last.to_vec()));
+    }
+
+    /// waits until finish's chunk is written, the writer broke, or `give_up`
+    pub fn wait_last(&self, give_up: impl Fn() -> bool) {
+        while !self.last_done.load(Ordering::Relaxed)
+            && !self.broken.load(Ordering::Relaxed)
+            && !give_up()
+        {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -571,6 +615,39 @@ fn csi_allowed(body: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a reader that stalls: each write waits until the test lets it through
+    struct Stalled(mpsc::Receiver<()>, Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Stalled {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            self.1.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn finish_goes_out_past_a_stalled_backlog() {
+        let (go, wait) = mpsc::channel();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let o = Out::to(Box::new(Stalled(wait, got.clone())), false);
+        o.put(b"first", None);
+        // the writer is stuck on "first"; the rest piles up behind it
+        std::thread::sleep(Duration::from_millis(50));
+        for _ in 0..100 {
+            o.put(b"guest", None);
+        }
+        o.finish(b"RESET");
+        for _ in 0..3 {
+            go.send(()).unwrap();
+        }
+        o.wait_last(|| false);
+        assert_eq!(*got.lock().unwrap(), b"firstRESET".to_vec());
+    }
 
     #[test]
     fn term_reset_keeps_the_cursor() {

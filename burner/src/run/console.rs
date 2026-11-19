@@ -195,26 +195,28 @@ fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<
 
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
 /// ways. keystrokes go to the VM as they are; what the VM prints goes through a
-/// filter so it can't set titles, the clipboard or anything else on the terminal
+/// filter so it can't set titles, the clipboard or anything else on the terminal.
+/// the terminal reset is queued last on the returned Out, which the caller
+/// waits on before it prints anything
 pub(super) fn relay(
     child: &mut Child,
     token: &str,
     deadline: Deadline,
     cfg: &Config,
     id: &str,
-) -> Outcome {
+) -> (Outcome, Out) {
+    let screen = Out::new_unescaped(Dest::Stdout);
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
-        return Outcome::Failed;
+        return (Outcome::Failed, screen);
     };
     let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
     // blocking pipes would let a stuck VM freeze the loop that enforces the ttl
     if sys::set_nonblocking(vin_fd).is_err() || sys::set_nonblocking(vout_fd).is_err() {
-        return Outcome::Failed;
+        return (Outcome::Failed, screen);
     }
     let mut vin = Some(vin);
     sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
     let _ = sys::set_raw(0);
-    let screen = Out::new_unescaped(Dest::Stdout);
     let mut filter = crate::output::TermFilter::new(!crate::output::term_utf8());
     let mut escape = Escape::default();
     let mut end = ShellEnd::new(token);
@@ -298,9 +300,11 @@ pub(super) fn relay(
         Outcome::Done | Outcome::Failed if cancelled(cfg, id) => Outcome::Cancelled,
         o => o,
     };
-    screen.put(&filter.reset(), None);
+    // output still queued goes out if the terminal takes it soon; a terminal
+    // that has stopped reading would leave the reset stuck behind it
     screen.drain(Instant::now() + Duration::from_secs(2));
-    outcome
+    screen.finish(&filter.reset());
+    (outcome, screen)
 }
 
 /// watches the shell's console for guest init's end marker. what comes after it
