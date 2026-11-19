@@ -1,6 +1,9 @@
-//! `burner setup` on macOS: the guest kernel and the alpine image from a
-//! release, checked against its SHA256SUMS and put where burner looks for them.
-//! curl, shasum and gzip all come with macOS, so no http or archive crates
+//! `burner setup` on macOS: the guest kernel and the alpine image, checked
+//! and put where burner looks for them. they come from the copy homebrew
+//! installed next to burner when there is one (the formula pins both), else
+//! from a release. the kernel always has to match the sha256 install.sh pins,
+//! built into burner, except with --from. curl, shasum and gzip all come with
+//! macOS, so no http or archive crates
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -28,17 +31,31 @@ const MAX_UNPACKED: u64 = 4 << 30;
 const STAGE_PREFIX: &str = ".setup-";
 // what tools/build-image puts next to the image
 const ALPINE_DEFAULTS: &str = include_str!("../alpine-defaults.toml");
+/// the kernel install.sh pins for aarch64, read from it by build.rs
+const KERNEL_SHA256: &str = env!("BURNER_KERNEL_SHA256");
 
 #[derive(Args)]
 pub struct SetupArgs {
-    /// a release tag (like v0.2.0) instead of this burner's own version. with no
-    /// tag, the latest release
+    /// fetch from a github release (like v0.2.0) instead of the copy homebrew
+    /// installed or this burner's own release. with no tag, the latest release
     #[arg(long, value_name = "TAG", num_args = 0..=1, default_missing_value = "latest")]
     version: Option<String>,
-    /// fetch from this directory instead of a github release (https:// or file://).
-    /// it has to hold SHA256SUMS and the release's files
+    /// fetch from this directory instead (https:// or file://). it has to hold
+    /// SHA256SUMS and the release's files, and the files are checked only
+    /// against that: the kernel's pinned checksum is skipped
     #[arg(long, value_name = "URL", conflicts_with = "version")]
     from: Option<String>,
+}
+
+/// where the kernel and image come from
+enum Source {
+    /// the copy the homebrew formula installed, checked by brew against the
+    /// formula's sha256s
+    Brew(PathBuf),
+    /// a release: SHA256SUMS from the same place, and the kernel pin
+    Release(String),
+    /// --from: only that dir's SHA256SUMS
+    From(String, &'static str),
 }
 
 pub fn main(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
@@ -61,7 +78,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     if cfg!(not(target_arch = "aarch64")) {
         bail!("burner on macOS needs apple silicon");
     }
-    let (base, proto) = source(&a)?;
+    let src = source(&a)?;
     // checked again before the swap, this only saves a pointless download
     drop(idle(cfg)?);
 
@@ -76,29 +93,47 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let _setup = sys::Lock::exclusive_until(&cfg.paths.state.join("setup.lock"), Instant::now())
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
-    eprintln!("burner: fetching the guest kernel and the alpine image from {base}");
     let stage = Stage::new(root)?;
-
-    fetch(
-        &format!("{base}/{SUMS}"),
-        proto,
-        &stage.0.join(SUMS),
-        64 << 10,
-    )?;
-    let sums = fs::read_to_string(stage.0.join(SUMS)).context("reading SHA256SUMS")?;
-    for name in [KERNEL, IMAGE] {
-        let Some(want) = sum_for(&sums, name) else {
-            bail!(
-                "{name} isn't in the release's SHA256SUMS (releases before the macOS port don't have it)"
+    match &src {
+        Source::Brew(dir) => {
+            eprintln!(
+                "burner: the guest kernel and alpine image homebrew installed with burner, from {}",
+                dir.display()
             );
-        };
-        let f = stage.0.join(name);
-        fetch(&format!("{base}/{name}"), proto, &f, MAX_DOWNLOAD)?;
-        let got = sha256(&f)?;
-        if got != want {
-            bail!("checksum mismatch for {name}: SHA256SUMS says {want}, the download is {got}");
+            for name in [KERNEL, IMAGE] {
+                let from = dir.join(name);
+                config::trusted_file(&from)?;
+                fs::copy(&from, stage.0.join(name))
+                    .with_context(|| format!("copying {}", from.display()))?;
+            }
         }
-        eprintln!("burner: {name} ok");
+        Source::Release(base) => {
+            eprintln!("burner: fetching the guest kernel and the alpine image from {base}");
+            download(base, "=https", &stage.0)?;
+        }
+        Source::From(base, proto) => {
+            eprintln!(
+                "burner: fetching from {base}. --from skips the kernel checksum built into \
+                 burner, both files are checked only against the SHA256SUMS there"
+            );
+            download(base, proto, &stage.0)?;
+        }
+    }
+    if !matches!(src, Source::From(..)) {
+        let got = sha256(&stage.0.join(KERNEL))?;
+        if got != KERNEL_SHA256 {
+            bail!(
+                "the kernel is {got}, not the {KERNEL_SHA256} this burner pins. \
+                 if you meant to use another kernel, --from skips the pin"
+            );
+        }
+        eprintln!("burner: {KERNEL} matches the pinned sha256");
+    }
+    if matches!(src, Source::Release(_)) {
+        eprintln!(
+            "burner: the image is checked only against the release's own SHA256SUMS, \
+             which comes from the same place. gh attestation verify checks where it was built"
+        );
     }
 
     let rootfs = stage.0.join("rootfs.ext4");
@@ -147,17 +182,21 @@ fn idle(cfg: &Config) -> Result<Ledger> {
     Ok(ledger)
 }
 
-/// the base url of the release files, and the one protocol curl may use for them
-fn source(a: &SetupArgs) -> Result<(String, &'static str)> {
+fn source(a: &SetupArgs) -> Result<Source> {
     if let Some(from) = &a.from {
         let from = from.trim_end_matches('/').to_string();
         return if from.starts_with("https://") {
-            Ok((from, "=https"))
+            Ok(Source::From(from, "=https"))
         } else if from.starts_with("file://") {
-            Ok((from, "=file"))
+            Ok(Source::From(from, "=file"))
         } else {
             bail!("--from takes an https:// or file:// url")
         };
+    }
+    if a.version.is_none()
+        && let Some(dir) = brew_copy()
+    {
+        return Ok(Source::Brew(dir));
     }
     let tag = match a.version.as_deref() {
         None => format!("v{}", env!("CARGO_PKG_VERSION")),
@@ -167,7 +206,38 @@ fn source(a: &SetupArgs) -> Result<(String, &'static str)> {
     if !valid_tag(&tag) {
         bail!("{tag:?} doesn't look like a release tag");
     }
-    Ok((format!("{REPO}/releases/download/{tag}"), "=https"))
+    Ok(Source::Release(format!("{REPO}/releases/download/{tag}")))
+}
+
+/// share/burner next to the bin dir this burner runs from, where the formula
+/// puts the kernel and image it fetched
+fn brew_copy() -> Option<PathBuf> {
+    let dir = sys::self_exe().parent()?.parent()?.join("share/burner");
+    [KERNEL, IMAGE]
+        .iter()
+        .all(|f| dir.join(f).is_file())
+        .then_some(dir)
+}
+
+/// SHA256SUMS and both files from base into dir, each checked against it
+fn download(base: &str, proto: &str, dir: &Path) -> Result<()> {
+    fetch(&format!("{base}/{SUMS}"), proto, &dir.join(SUMS), 64 << 10)?;
+    let sums = fs::read_to_string(dir.join(SUMS)).context("reading SHA256SUMS")?;
+    for name in [KERNEL, IMAGE] {
+        let Some(want) = sum_for(&sums, name) else {
+            bail!(
+                "{name} isn't in the release's SHA256SUMS (releases before the macOS port don't have it)"
+            );
+        };
+        let f = dir.join(name);
+        fetch(&format!("{base}/{name}"), proto, &f, MAX_DOWNLOAD)?;
+        let got = sha256(&f)?;
+        if got != want {
+            bail!("checksum mismatch for {name}: SHA256SUMS says {want}, the download is {got}");
+        }
+        eprintln!("burner: {name} matches SHA256SUMS");
+    }
+    Ok(())
 }
 
 /// github redirects releases/latest to releases/tag/TAG
@@ -350,6 +420,12 @@ mod tests {
         assert_eq!(sum_for(&list, IMAGE).as_deref(), Some(h));
         assert_eq!(sum_for(&list, "vmlinux"), None);
         assert_eq!(sum_for(&list, "aarch64"), None);
+    }
+
+    #[test]
+    fn pinned_kernel() {
+        assert!(is_sha256(KERNEL_SHA256));
+        assert_eq!(KERNEL_SHA256, KERNEL_SHA256.to_ascii_lowercase());
     }
 
     #[test]

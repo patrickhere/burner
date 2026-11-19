@@ -152,10 +152,12 @@ on an M1 or M2 there's no kvm inside the VM, so no burner through lima. on windo
 native on a mac is coming with the next release: no linux VM in between, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. it'll be a homebrew formula that builds burner, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs, and then:
 
 ```
-burner setup                     # the guest kernel and alpine image from the release, checked against SHA256SUMS
+burner setup                     # the guest kernel and alpine image homebrew fetched with it
 burner doctor
 burner run -- 'uname -m'         # no sudo, VMs run as you
 ```
+
+the formula pins the kernel and the image by sha256 in the tap, which isn't the place the files come from, so `burner setup` installs what brew already checked. `burner setup --version v0.2.0` fetches them from a github release instead: the kernel still has to match the sha256 built into burner (the one `install.sh` pins), but the image is only checked against that release's own `SHA256SUMS`. `--from DIR` takes both from anywhere you point it at and skips the kernel pin.
 
 the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` doesn't know about the mac yet.
 
