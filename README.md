@@ -106,15 +106,15 @@ sudo burner doctor
 
 releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
 
-on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and [lima](https://lima-vm.io) makes that one command:
+on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and the homebrew tap sets that up with [lima](https://lima-vm.io):
 
 ```
-brew install lima
-limactl start --name=burner --vm-type=vz --set '.nestedVirtualization=true' template:ubuntu-24.04
-limactl shell burner
+brew install burnervm/tap/burner
+burner setup                     # makes the VM and installs burner in it, once
+burner run -- 'uname -a'         # every burner command runs in the VM, no sudo needed
 ```
 
-then the same `curl ... | sh` in there. on an M1 or M2 there's no kvm inside the VM, so no burner. on windows 11, WSL2 with nested virtualization should work the same way (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
+on an M1 or M2 there's no kvm inside the VM, so no burner. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
 
 or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
 
