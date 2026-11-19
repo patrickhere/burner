@@ -2,8 +2,9 @@ class Burner < Formula
   desc "Throwaway Linux VMs on your own hardware"
   homepage "https://burnervm.dev"
   # the first release with the macOS port. at release, tools/formula-shas TAG
-  # prints the urls and the three sha256s for this file, each checked against
-  # the tag or the release's build provenance, not taken from what github serves
+  # COMMIT prints the urls and the three sha256s for this file, each checked
+  # against the tagged commit or the release's build provenance, not taken
+  # from what github serves
   url "https://github.com/patrickhere/burner/archive/refs/tags/v0.2.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["MIT", "Apache-2.0"]
