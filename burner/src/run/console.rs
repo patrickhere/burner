@@ -17,6 +17,8 @@ const SERIAL_CAP: u64 = 1 << 20;
 const LIVE_BYTES: u64 = 65536;
 /// input the shell holds for a VM that isn't taking it; past this it's dropped
 const TO_VM_CAP: usize = 16 << 20;
+/// how long after guest init's end marker the VM gets to stop on its own
+const END_GRACE: Duration = Duration::from_secs(5);
 
 /// copy the console between the BEGIN/END markers to `out`, byte for byte.
 /// the markers are only presentation: the guest knows the token and can end its
@@ -243,6 +245,8 @@ pub(super) fn relay(
     let mut escape = Escape::default();
     let mut end = ShellEnd::new(token);
     let mut held_since: Option<Instant> = None;
+    // when guest init's end marker came: the VM stops right after it
+    let mut ended_at: Option<Instant> = None;
     let mut to_vm: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16384];
     let mut next_check = Instant::now();
@@ -260,6 +264,12 @@ pub(super) fn relay(
                 break Outcome::Cancelled;
             }
         }
+        // the guest can print the marker itself (the token is on its kernel
+        // command line). the session ends either way, rather than going on
+        // with nothing shown
+        if ended_at.is_some_and(|t| t.elapsed() >= END_GRACE) {
+            break Outcome::Done;
+        }
         // stdin is always read, so ~. works even when the VM stops taking input
         let mut fds = Vec::new();
         if stdin_open {
@@ -268,7 +278,6 @@ pub(super) fn relay(
         if console_open {
             fds.push(vout_fd);
         }
-        // a held possible marker start waits at most 30ms, so typing never lags
         let wait = if held_since.is_some() { 30 } else { 200 };
         let ready = sys::poll_read(&fds, deadline.left().min(Duration::from_millis(wait)));
         if ready.contains(&0) {
@@ -279,7 +288,7 @@ pub(super) fn relay(
                     if escape.feed(&buf[..n], &mut keys) {
                         break Outcome::Detached;
                     }
-                    if console_open {
+                    if console_open && ended_at.is_none() {
                         let room = TO_VM_CAP.saturating_sub(to_vm.len());
                         to_vm.extend_from_slice(&keys[..keys.len().min(room)]);
                     }
@@ -308,6 +317,10 @@ pub(super) fn relay(
                     screen.put(&filter.feed(&show), None);
                     held_since =
                         (!end.held.is_empty()).then(|| held_since.unwrap_or_else(Instant::now));
+                    if end.ended && ended_at.is_none() {
+                        ended_at = Some(Instant::now());
+                        to_vm.clear();
+                    }
                 }
                 Err(e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -318,7 +331,7 @@ pub(super) fn relay(
         } else if matches!(child.try_wait(), Ok(Some(_))) {
             break child_outcome(child);
         }
-        if held_since.is_some_and(|t| t.elapsed() >= Duration::from_millis(30)) {
+        if held_since.is_some_and(|t| t.elapsed() >= end.hold()) {
             screen.put(&filter.feed(&end.flush()), None);
             held_since = None;
         }
@@ -387,6 +400,18 @@ impl ShellEnd {
             .unwrap_or(0);
         self.held = buf.split_off(buf.len() - keep);
         buf
+    }
+
+    /// how long held bytes wait for the rest of the marker. a short start
+    /// ("B", "BURNER-") is let out after 30ms, so typing never lags; one that
+    /// already has part of the token is all but certainly the marker, split by
+    /// a gap in the console, and waits a second
+    fn hold(&self) -> Duration {
+        if self.held.len() >= "BURNER-".len() + 4 {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(30)
+        }
     }
 
     /// nothing more came, so what was held back wasn't the marker
@@ -592,6 +617,7 @@ mod tests {
         // a held "BUR" that turns out not to be the marker still shows
         let mut e = ShellEnd::new("abc");
         assert_eq!(e.feed(b"echo BUR"), b"echo ".to_vec());
+        assert_eq!(e.hold(), Duration::from_millis(30));
         assert_eq!(e.flush(), b"BUR".to_vec());
         assert_eq!(e.feed(b"NING\r\n"), b"NING\r\n".to_vec());
         // another token's marker is just output
@@ -601,6 +627,19 @@ mod tests {
             b"BURNER-xyz-END\r\n".to_vec()
         );
         assert!(!e.ended);
+    }
+
+    #[test]
+    fn shell_end_holds_a_marker_split_by_a_gap() {
+        let mut e = ShellEnd::new("f72b08526ecfa370");
+        assert_eq!(e.feed(b"$ BURNER-f72b08526ecfa370-E"), b"$ ".to_vec());
+        assert_eq!(e.hold(), Duration::from_secs(1));
+        assert_eq!(
+            e.feed(b"ND0;[ 3.05] reboot: Restarting system"),
+            b"".to_vec()
+        );
+        assert!(e.ended);
+        assert_eq!(e.rc(), Some(0));
     }
 
     #[test]
