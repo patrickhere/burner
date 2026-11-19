@@ -12,6 +12,8 @@ mod net;
 mod output;
 mod result;
 mod run;
+#[cfg(target_os = "macos")]
+mod setup;
 mod sys;
 
 use std::path::PathBuf;
@@ -56,6 +58,9 @@ enum Cmd {
     Kill { id: String },
     /// list installed images
     Images,
+    /// fetch the guest kernel and alpine image from a release and install them
+    #[cfg(target_os = "macos")]
+    Setup(setup::SetupArgs),
     /// clean up after dead runs (run by the burner-reap timer)
     #[command(hide = true)]
     Reap,
@@ -150,6 +155,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reap => run::reap(&cfg),
+        #[cfg(target_os = "macos")]
+        Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::VmmKrun(_) | Cmd::Macnet(_) => unreachable!("handled before the config loads"),
