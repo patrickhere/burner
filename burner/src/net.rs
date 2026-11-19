@@ -496,7 +496,10 @@ pub fn public_ip(cfg: &Config) -> Option<(Ipv4Addr, Duration)> {
         return None;
     }
     let path = cfg.paths.state.join(PUBLIC_IP);
-    let ip = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    #[cfg(target_os = "macos")]
+    let text = same_uplink(&text)?;
+    let ip = text.trim().parse().ok()?;
     let age = std::fs::metadata(&path)
         .and_then(|m| m.modified())
         .ok()
@@ -517,12 +520,38 @@ fn plausible_public(ip: Ipv4Addr) -> bool {
         || ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
 }
 
+/// on macOS, the network an address was looked up on: the default route's
+/// gateway and interface. a mac moves between networks, and the address found
+/// behind the last router says nothing about the one it's behind now
+#[cfg(target_os = "macos")]
+fn uplink() -> Option<String> {
+    use crate::macnet::route::{Gateway, lookup};
+    let r = lookup(Ipv4Addr::UNSPECIFIED, true).ok()?;
+    Some(match r.gateway {
+        Gateway::Inet(gw) => format!("{gw} {}", r.index),
+        Gateway::Link => format!("link {}", r.index),
+    })
+}
+
+/// the address line, if the file was written on the network the mac is on now
+#[cfg(target_os = "macos")]
+fn same_uplink(text: &str) -> Option<&str> {
+    let mut lines = text.lines();
+    let ip = lines.next()?;
+    (lines.next().map(str::trim) == Some(uplink()?.as_str())).then_some(ip)
+}
+
 /// from the reaper, before check(): ask again when the last answer is 10 min
 /// old. the worst a lying service can do is get one more address blocked
 pub fn refresh_public_ip(cfg: &Config) {
     if !cfg.net.block_public_ip || public_ip(cfg).is_some_and(|(_, age)| age < PUBLIC_IP_EVERY) {
         return;
     }
+    // no default route, no way out to ask
+    #[cfg(target_os = "macos")]
+    let Some(net) = uplink() else {
+        return;
+    };
     for url in PUBLIC_IP_URLS {
         let Ok(out) = sys::run_timeout(
             Command::new("curl").args(["-4", "-sSf", "-m", "5", "--max-filesize", "64", url]),
@@ -540,7 +569,10 @@ pub fn refresh_public_ip(cfg: &Config) {
         };
         let path = cfg.paths.state.join(PUBLIC_IP);
         let tmp = path.with_extension("new");
-        if std::fs::write(&tmp, format!("{ip}\n")).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        let text = format!("{ip}\n");
+        #[cfg(target_os = "macos")]
+        let text = format!("{text}{net}\n");
+        if std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
             return;
         }
     }
@@ -886,5 +918,19 @@ mod tests {
         assert!(!owned_by_vm(&cfg, 0, None));
         assert!(!owned_by_vm(&cfg, 1000, None));
         assert!(owned_by_vm(&cfg, 998, Some(998)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn public_ip_is_per_network() {
+        let Some(here) = uplink() else {
+            return;
+        };
+        assert_eq!(
+            same_uplink(&format!("203.0.113.9\n{here}\n")),
+            Some("203.0.113.9")
+        );
+        assert_eq!(same_uplink("203.0.113.9\n192.0.2.1 99\n"), None);
+        assert_eq!(same_uplink("203.0.113.9\n"), None, "written before");
     }
 }
