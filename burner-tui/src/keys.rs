@@ -23,9 +23,11 @@ impl Keys {
     /// the keys in one read. the start of a sequence or utf-8 char, a lone
     /// ESC included, waits for the next read, until ESC_WAIT has passed
     pub fn feed(&mut self, b: &[u8], now: Instant) -> Vec<KeyEvent> {
+        // something that already ran out of time doesn't join the new bytes
+        let mut out = self.expire(now);
+        let old = self.held.len();
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(b);
-        let mut out = Vec::new();
         let mut at = 0;
         while at < buf.len() {
             match key(&buf[at..]) {
@@ -40,10 +42,13 @@ impl Keys {
                 Parsed::More => at = buf.len(),
             }
         }
+        // a key that only started in this read gets its own wait
         self.since = if self.held.is_empty() {
             None
-        } else {
+        } else if at < old {
             Some(self.since.unwrap_or(now))
+        } else {
+            Some(now)
         };
         out
     }
@@ -216,6 +221,30 @@ mod tests {
             .flat_map(|c| k.feed(c, now))
             .map(|e| (e.code, e.modifiers))
             .collect()
+    }
+
+    #[test]
+    fn split_key_waits_from_its_own_start() {
+        let t0 = Instant::now();
+        let mut k = Keys::default();
+        assert!(k.feed(b"\x1b", t0).is_empty());
+        let t1 = t0 + Duration::from_millis(90);
+        let up: Vec<_> = k.feed(b"[A\x1b", t1).iter().map(|e| e.code).collect();
+        assert_eq!(up, [KeyCode::Up]);
+        assert_eq!(k.deadline(), Some(t1 + ESC_WAIT));
+        let t2 = t1 + Duration::from_millis(50);
+        let up: Vec<_> = k.feed(b"[A", t2).iter().map(|e| e.code).collect();
+        assert_eq!(up, [KeyCode::Up]);
+    }
+
+    #[test]
+    fn expired_esc_doesnt_join_new_bytes() {
+        let t0 = Instant::now();
+        let mut k = Keys::default();
+        assert!(k.feed(b"\x1b", t0).is_empty());
+        let late = t0 + ESC_WAIT + Duration::from_millis(1);
+        let got: Vec<_> = k.feed(b"[A", late).iter().map(|e| e.code).collect();
+        assert_eq!(got, [KeyCode::Esc, KeyCode::Char('['), KeyCode::Char('A')]);
     }
 
     #[test]
