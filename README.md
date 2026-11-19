@@ -89,7 +89,7 @@ what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel 
 linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/patrickhere/burner/main/get.sh | sh
+curl -fsSL https://get.burnervm.dev | sh
 ```
 
 run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:

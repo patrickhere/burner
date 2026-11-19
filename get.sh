@@ -1,6 +1,6 @@
 #!/bin/sh
 # install or upgrade burner from the latest release:
-#   curl -fsSL https://raw.githubusercontent.com/patrickhere/burner/main/get.sh | sh
+#   curl -fsSL https://get.burnervm.dev | sh
 # downloads the release for this cpu, checks it against SHA256SUMS, installs the
 # packages burner needs, runs install.sh and builds the alpine image.
 #   BURNER_VERSION=v0.1.0   install that release instead of the latest
