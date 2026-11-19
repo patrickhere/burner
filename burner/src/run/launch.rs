@@ -651,17 +651,9 @@ fn launch(
 
     prep_ok(cfg, id)?;
     let token = sys::random_hex(8)?;
-    // guest init runs a shell on ttyS0, firecracker's serial port. this kernel
-    // has no driver for libkrun's, so a shell boots through sh first, which
-    // makes ttyS0 the virtio console (hvc0, 229:0) in devtmpfs, the same
-    // devtmpfs guest init mounts again later
-    let init = if p.shell {
-        "/bin/sh"
-    } else {
-        "/sbin/burner-init"
-    };
+    // hvc0 is libkrun's virtio console, guest init puts the shell on it too
     let mut boot = format!(
-        "console=hvc0 reboot=k panic=1 pci=off quiet loglevel=1 root=/dev/vda ro init={init} burner.token={token} burner.proto={GUEST_PROTO}"
+        "console=hvc0 reboot=k panic=1 pci=off quiet loglevel=1 root=/dev/vda ro init=/sbin/burner-init burner.token={token} burner.proto={GUEST_PROTO}"
     );
     if !p.shell {
         boot += &format!(" burner.limit={}", guest_limit(p.ttl));
@@ -684,8 +676,6 @@ fn launch(
     };
     if p.shell {
         boot += &shell_args();
-        boot +=
-            " -- -c \"rm -f /dev/ttyS0; mknod -m 600 /dev/ttyS0 c 229 0; exec /sbin/burner-init\"";
     }
 
     let deadline = Deadline::in_secs(p.ttl);
