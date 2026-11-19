@@ -22,8 +22,11 @@ const END_GRACE: Duration = Duration::from_secs(5);
 /// an image whose init should say it's ready but hasn't by then gets the
 /// caller's keys anyway
 const READY_WAIT: Duration = Duration::from_secs(60);
-/// how long the vCPUs must sit still after the kernel's halt line
+/// how long the vCPUs must all sit asleep, never scheduled, behind the
+/// kernel's halt line. an idle guest's timers wake them every half second
 const HALT_CHECK: Duration = Duration::from_millis(1500);
+/// a halt line the vCPUs don't stop behind by then was the guest's own text
+const HALT_GIVE_UP: Duration = Duration::from_secs(10);
 
 /// copy the console between the BEGIN/END markers to `out`, byte for byte.
 /// the markers are only presentation: the guest knows the token and can end its
@@ -274,9 +277,9 @@ pub(super) fn relay(
     let mut filter = crate::output::TermFilter::new(!crate::output::term_utf8());
     let mut escape = Escape::default();
     let mut end = Markers::new(token, legacy);
-    // the last of the console, and when it ended in the kernel's halt line,
-    // with the vCPUs' run count then
-    let (mut tail, mut halt_seen): (Vec<u8>, Option<(Instant, Option<u64>)>) = (Vec::new(), None);
+    let mut halt = HaltLine::default();
+    // the vCPUs' run count while they've all been asleep, and since when
+    let mut still: Option<(u64, Instant)> = None;
     let mut halted = false;
     // a resize goes to the guest through the job disk, see write_size. it
     // starts out set, for a resize between writing the disk and getting here
@@ -310,19 +313,26 @@ pub(super) fn relay(
             break Outcome::Done;
         }
         // a guest kernel that stops without a reset (poweroff -f where the
-        // shell has no pid namespace of its own, sysrq o) leaves firecracker
-        // running. its last line can be printed by anyone, so it only counts
-        // once the vCPUs have stopped running too
-        if let Some((t, runs)) = halt_seen
-            && t.elapsed() >= HALT_CHECK
-        {
-            let now = vcpu_runs(child.id());
-            if runs.is_some() && now == runs {
+        // shell has no pid namespace of its own) leaves firecracker running,
+        // and firecracker has no way to tell: on x86 the guest can't power
+        // off. its last line can be printed by anyone, so it's held back and
+        // only counts once the vCPUs have stopped too. when that can't be
+        // read, the line shows after HALT_GIVE_UP and the ttl ends the VM
+        if let Some(t) = halt.whole_since {
+            match (vcpus_asleep(child.id()), still) {
+                (Some(r), Some((s, _))) if r == s => {}
+                (Some(r), _) => still = Some((r, Instant::now())),
+                (None, _) => still = None,
+            }
+            if still.is_some_and(|(_, at)| at.elapsed() >= HALT_CHECK) {
                 halted = true;
                 break Outcome::Done;
             }
-            // still running: it can take a moment after the line to stop
-            halt_seen = Some((Instant::now(), now));
+            if t.elapsed() >= HALT_GIVE_UP {
+                screen.put(&filter.feed(&halt.release()), None);
+            }
+        } else {
+            still = None;
         }
         if winch.swap(false, std::sync::atomic::Ordering::Relaxed)
             && let Some(f) = &tty_rec
@@ -360,7 +370,7 @@ pub(super) fn relay(
         if console_open {
             fds.push(vout_fd);
         }
-        let wait = if held_since.is_some() || (raw && !open) {
+        let wait = if held_since.is_some() || halt.since.is_some() || (raw && !open) {
             30
         } else {
             200
@@ -402,13 +412,7 @@ pub(super) fn relay(
             match vout.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let show = end.feed(&buf[..n]);
-                    screen.put(&filter.feed(&show), None);
-                    if !show.is_empty() {
-                        tail.extend_from_slice(&show);
-                        tail.drain(..tail.len().saturating_sub(128));
-                        halt_seen =
-                            halt_line(&tail).then(|| (Instant::now(), vcpu_runs(child.id())));
-                    }
+                    screen.put(&filter.feed(&halt.feed(&show)), None);
                     if end.ready && !raw {
                         let _ = sys::set_raw(0);
                         raw = true;
@@ -436,10 +440,18 @@ pub(super) fn relay(
             break child_outcome(child);
         }
         if held_since.is_some_and(|t| t.elapsed() >= end.hold()) {
-            screen.put(&filter.feed(&end.flush()), None);
+            screen.put(&filter.feed(&halt.feed(&end.flush())), None);
             held_since = None;
         }
+        if halt.whole_since.is_none() && halt.since.is_some_and(|t| t.elapsed() >= HALT_HOLD) {
+            screen.put(&filter.feed(&halt.release()), None);
+        }
     };
+    // what the guest printed is shown, unless it was the halt line of a guest
+    // that did halt
+    if !halted {
+        screen.put(&filter.feed(&halt.release()), None);
+    }
     // a kill that landed as the VM was exiting still counts as a kill
     let outcome = match outcome {
         Outcome::Done | Outcome::Failed if cancelled(cfg, id) => Outcome::Cancelled,
@@ -473,28 +485,123 @@ pub(super) fn write_size(f: &File, seq: u64, (rows, cols): (u16, u16)) -> io::Re
     )
 }
 
-/// whether the console ends in the line the guest kernel prints when it stops
-/// for good: `[    1.389719] reboot: System halted` or `... reboot: Power down`
-fn halt_line(tail: &[u8]) -> bool {
-    let t = tail.strip_suffix(b"\n").unwrap_or(tail);
-    let t = t.strip_suffix(b"\r").unwrap_or(t);
-    let Some(t) = [&b"] reboot: System halted"[..], b"] reboot: Power down"]
-        .iter()
-        .find_map(|m| t.strip_suffix(*m))
-    else {
-        return false;
+/// how long the start of what could be a halt line waits for the rest
+const HALT_HOLD: Duration = Duration::from_millis(30);
+
+/// keeps the line the guest kernel prints when it stops for good off the
+/// screen while it's the last thing on the console:
+/// `[    1.389719] reboot: System halted` or `... reboot: Power down`.
+/// the kernel doesn't know where the tty's cursor is, so it can come after
+/// anything on a line (a full-screen app's last draw). it goes out as soon as
+/// more comes after it, or by release
+#[derive(Default)]
+struct HaltLine {
+    /// from the line's [ on
+    held: Vec<u8>,
+    /// what went out last was an ESC, so a [ now starts a CSI
+    esc: bool,
+    /// since when bytes are held, and since when they're a whole halt line
+    since: Option<Instant>,
+    whole_since: Option<Instant>,
+}
+
+#[derive(PartialEq, Debug)]
+enum Halt {
+    No,
+    Start,
+    Whole,
+}
+
+/// what bytes from a [ on, \r\n included, are of a halt line
+fn halt_match(l: &[u8]) -> Halt {
+    let Some(rest) = l.strip_prefix(b"[") else {
+        return Halt::No;
     };
-    let line = t.rsplit(|&b| b == b'\n').next().unwrap_or(t);
-    let line = line.strip_prefix(b"\r").unwrap_or(line);
-    line.strip_prefix(b"[").is_some_and(|ts| {
-        !ts.is_empty() && ts.iter().all(|b| b.is_ascii_digit() || b" .".contains(b))
-    })
+    let ts = rest
+        .iter()
+        .take_while(|b| b.is_ascii_digit() || b" .".contains(b))
+        .count();
+    let rest = &rest[ts..];
+    if rest.is_empty() {
+        return Halt::Start;
+    }
+    if ts == 0 {
+        return Halt::No;
+    }
+    for m in [&b"] reboot: System halted"[..], b"] reboot: Power down"] {
+        if rest.len() < m.len() && m.starts_with(rest) {
+            return Halt::Start;
+        }
+        if let Some(after) = rest.strip_prefix(m) {
+            return match after {
+                b"" | b"\r" | b"\r\n" | b"\n" => Halt::Whole,
+                _ => Halt::No,
+            };
+        }
+    }
+    Halt::No
+}
+
+impl HaltLine {
+    /// what can go to the screen now
+    fn feed(&mut self, b: &[u8]) -> Vec<u8> {
+        if b.is_empty() {
+            return Vec::new();
+        }
+        let mut buf = std::mem::take(&mut self.held);
+        buf.extend_from_slice(b);
+        // the last [ on the last line, its line break aside
+        let body = buf.strip_suffix(b"\n").unwrap_or(&buf);
+        let line = body.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1);
+        let from = body[line..]
+            .iter()
+            .rposition(|&c| c == b'[')
+            .map(|i| line + i)
+            .filter(|&i| {
+                if i == 0 {
+                    !self.esc
+                } else {
+                    buf[i - 1] != 0x1b
+                }
+            });
+        let m = from.map_or(Halt::No, |i| halt_match(&buf[i..]));
+        let Some(from) = from.filter(|_| m != Halt::No) else {
+            (self.since, self.whole_since) = (None, None);
+            self.esc = buf.last() == Some(&0x1b);
+            return buf;
+        };
+        let now = Instant::now();
+        if from > 0 || self.since.is_none() {
+            self.since = Some(now);
+        }
+        self.whole_since = match m {
+            Halt::Whole => Some(self.whole_since.filter(|_| from == 0).unwrap_or(now)),
+            _ => None,
+        };
+        self.held = buf.split_off(from);
+        if !buf.is_empty() {
+            self.esc = buf.last() == Some(&0x1b);
+        }
+        buf
+    }
+
+    /// what's held goes out after all
+    fn release(&mut self) -> Vec<u8> {
+        (self.since, self.whole_since) = (None, None);
+        let held = std::mem::take(&mut self.held);
+        if !held.is_empty() {
+            self.esc = false;
+        }
+        held
+    }
 }
 
 /// how many times firecracker's vCPU threads have been scheduled, from
-/// /proc/PID/task/*/schedstat. a halted guest's vCPUs never run again; an idle
-/// one still wakes for its timers
-fn vcpu_runs(pid: u32) -> Option<u64> {
+/// /proc/PID/task/*/schedstat, while every one of them is asleep. None when
+/// one is running or waiting to (a busy host can leave a live vCPU
+/// unscheduled), or when there's nothing to read. a halted guest's vCPUs
+/// sleep and never run again
+fn vcpus_asleep(pid: u32) -> Option<u64> {
     let mut total = None;
     for t in std::fs::read_dir(format!("/proc/{pid}/task"))
         .ok()?
@@ -504,8 +611,13 @@ fn vcpu_runs(pid: u32) -> Option<u64> {
         if !std::fs::read_to_string(p.join("comm")).is_ok_and(|c| c.starts_with("fc_vcpu")) {
             continue;
         }
-        let stat = std::fs::read_to_string(p.join("schedstat")).ok()?;
-        let runs: u64 = stat.split_whitespace().nth(2)?.parse().ok()?;
+        // the state comes after the name, which can hold spaces and parens
+        let stat = std::fs::read_to_string(p.join("stat")).ok()?;
+        if stat.rsplit_once(')')?.1.split_whitespace().next()? != "S" {
+            return None;
+        }
+        let sched = std::fs::read_to_string(p.join("schedstat")).ok()?;
+        let runs: u64 = sched.split_whitespace().nth(2)?.parse().ok()?;
         total = Some(total.unwrap_or(0) + runs);
     }
     total
@@ -890,17 +1002,59 @@ mod tests {
 
     #[test]
     fn halt_lines() {
-        assert!(halt_line(
-            b"# poweroff -f\r\n[    1.389719] reboot: System halted\r\n"
-        ));
-        assert!(halt_line(b"[ 12.5] reboot: Power down\r\n"));
-        assert!(halt_line(b"[    1.0] reboot: Power down"));
-        assert!(!halt_line(
-            b"[    1.389719] reboot: System halted\r\nburner:~# "
-        ));
-        assert!(!halt_line(b"echo [ 1.0] reboot: System halted\r\n"));
-        assert!(!halt_line(b"reboot: System halted\r\n"));
-        assert!(!halt_line(b"[    1.0] reboot: Restarting system\r\n"));
+        assert_eq!(
+            halt_match(b"[    1.389719] reboot: System halted\r\n"),
+            Halt::Whole
+        );
+        assert_eq!(halt_match(b"[ 12.5] reboot: Power down"), Halt::Whole);
+        assert_eq!(halt_match(b"[ 12.5] reboot: Pow"), Halt::Start);
+        assert_eq!(halt_match(b"[    1"), Halt::Start);
+        assert_eq!(halt_match(b"[1]+  Done"), Halt::No);
+        assert_eq!(halt_match(b"[] reboot: Power down"), Halt::No);
+        assert_eq!(halt_match(b"reboot: System halted\r\n"), Halt::No);
+        assert_eq!(halt_match(b"[1;1H"), Halt::No);
+        assert_eq!(
+            halt_match(b"[    1.0] reboot: Restarting system\r\n"),
+            Halt::No
+        );
+        assert_eq!(halt_match(b"[    1.0] reboot: Power down\r\nx"), Halt::No);
+    }
+
+    #[test]
+    fn halt_line_held_while_last() {
+        let line = b"[    1.389719] reboot: System halted\r\n";
+        let all = [&b"# poweroff -f\r\n"[..], line].concat();
+        for i in 0..=all.len() {
+            let mut h = HaltLine::default();
+            let mut got = h.feed(&all[..i]);
+            got.extend(h.feed(&all[i..]));
+            assert_eq!(got, b"# poweroff -f\r\n".to_vec(), "split at {i}");
+            assert!(h.whole_since.is_some(), "split at {i}");
+            // more output: it wasn't the end, and it all shows
+            got.extend(h.feed(b"# "));
+            assert_eq!(got, [&all[..], b"# "].concat(), "split at {i}");
+            assert!(h.since.is_none() && h.whole_since.is_none());
+        }
+        // after what a full-screen app drew last, with no line break
+        let mut h = HaltLine::default();
+        assert_eq!(
+            h.feed(b"\x1b[24;1H- f 1/1\x1b[1;1H"),
+            b"\x1b[24;1H- f 1/1\x1b[1;1H"
+        );
+        assert_eq!(h.feed(line), b"".to_vec());
+        assert!(h.whole_since.is_some());
+        // but never the [ of a CSI, even when the ESC came in an earlier read
+        let mut h = HaltLine::default();
+        assert_eq!(h.feed(b"x\x1b"), b"x\x1b".to_vec());
+        assert_eq!(h.feed(b"[1"), b"[1".to_vec());
+        assert_eq!(h.feed(b"\x1b[1"), b"\x1b[1".to_vec());
+        assert!(h.since.is_none());
+        // a start that goes nowhere is let out by release
+        let mut h = HaltLine::default();
+        assert_eq!(h.feed(b"x\n[ 1"), b"x\n".to_vec());
+        assert!(h.since.is_some() && h.whole_since.is_none());
+        assert_eq!(h.release(), b"[ 1".to_vec());
+        assert_eq!(h.feed(b".0]"), b".0]".to_vec());
     }
 
     #[test]
