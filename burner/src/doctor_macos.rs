@@ -44,7 +44,25 @@ pub fn run(cfg: &Config, config_path: &Path) -> bool {
     }
     hypervisor(&mut r);
     match crate::krun::probe() {
-        Ok(path) => r.line(Level::Ok, "libkrun", path),
+        Ok(path) => match crate::krun::version(&path) {
+            Some(v) if v >= crate::krun::MIN_VERSION => {
+                r.line(Level::Ok, "libkrun", format!("{}, {path}", dotted(v)))
+            }
+            Some(v) => r.line(
+                Level::Warn,
+                "libkrun",
+                format!(
+                    "{} is older than {}, the oldest burner was tested with: brew upgrade libkrun ({path})",
+                    dotted(v),
+                    dotted(crate::krun::MIN_VERSION)
+                ),
+            ),
+            None => r.line(
+                Level::Warn,
+                "libkrun",
+                format!("{path}, can't tell its version"),
+            ),
+        },
         Err(e) => r.line(
             Level::Fail,
             "libkrun",
@@ -130,6 +148,10 @@ pub fn run(cfg: &Config, config_path: &Path) -> bool {
         Level::Fail => println!("not ready, fix the FAIL lines first"),
     }
     r.worst != Level::Fail
+}
+
+fn dotted(v: [u32; 3]) -> String {
+    format!("{}.{}.{}", v[0], v[1], v[2])
 }
 
 fn hypervisor(r: &mut Report) {

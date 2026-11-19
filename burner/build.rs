@@ -1,32 +1,28 @@
 // macOS runs VMs on libkrun, linked from homebrew. LIBKRUN_LIB_DIR overrides
 // where it's found. nothing to link anywhere else
 use std::path::PathBuf;
-use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=LIBKRUN_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=HOMEBREW_PREFIX");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
     println!("cargo:rerun-if-changed=install.sh");
     println!("cargo:rustc-env=BURNER_KERNEL_SHA256={}", kernel_sha256());
+    // homebrew's own places only, never a brew found on PATH: what's linked
+    // here is the VM boundary
     let dir = std::env::var_os("LIBKRUN_LIB_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Command::new("brew")
-                .args(["--prefix", "libkrun"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| PathBuf::from(s.trim()))
-                .or_else(|| {
-                    std::env::var_os("HOMEBREW_PREFIX")
-                        .map(|p| PathBuf::from(p).join("opt/libkrun"))
-                })
-                .unwrap_or_else(|| PathBuf::from("/opt/homebrew/opt/libkrun"))
-                .join("lib")
+            std::env::var_os("HOMEBREW_PREFIX")
+                .map(PathBuf::from)
+                .into_iter()
+                .chain([PathBuf::from("/opt/homebrew")])
+                .map(|p| p.join("opt/libkrun/lib"))
+                .find(|d| d.is_dir())
+                .unwrap_or_else(|| PathBuf::from("/opt/homebrew/opt/libkrun/lib"))
         });
     println!("cargo:rustc-link-search=native={}", dir.display());
     println!("cargo:rustc-link-lib=dylib=krun");

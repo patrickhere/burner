@@ -24,6 +24,8 @@ const NET_FEATURES: u32 = 0;
 const NET_FLAGS: u32 = 0;
 // each VM is alone on its wire with macnet, so every guest can have the same one
 const GUEST_MAC: [u8; 6] = [0x06, 0x00, 0xac, 0x1d, 0x00, 0x02];
+/// the oldest libkrun burner was tested with, the same one the formula asks for
+pub const MIN_VERSION: [u32; 3] = [1, 19, 0];
 
 // linked by build.rs
 unsafe extern "C" {
@@ -57,6 +59,37 @@ unsafe extern "C" {
         flags: u32,
     ) -> i32;
     fn krun_start_enter(ctx: u32) -> i32;
+}
+
+// dyld's, deprecated but still there: the loaded dylib's current_version
+unsafe extern "C" {
+    fn NSVersionOfRunTimeLibrary(name: *const c_char) -> i32;
+}
+
+/// the loaded libkrun's version: from homebrew's file name
+/// (libkrun.1.19.8.dylib) when it has one, else what the dylib itself says,
+/// which leaves out the patch level
+pub fn version(path: &str) -> Option<[u32; 3]> {
+    let real = std::fs::canonicalize(path).ok()?;
+    real.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(version_in_name)
+        .or_else(|| {
+            // SAFETY: a NUL-terminated library name, nothing else is read
+            let v = unsafe { NSVersionOfRunTimeLibrary(c"krun".as_ptr()) };
+            (v >= 0).then(|| {
+                let v = v as u32;
+                [v >> 16, (v >> 8) & 0xff, v & 0xff]
+            })
+        })
+}
+
+fn version_in_name(name: &str) -> Option<[u32; 3]> {
+    let v = name.strip_prefix("libkrun.")?.strip_suffix(".dylib")?;
+    let mut parts = v.split('.');
+    let mut next = || parts.next()?.parse::<u32>().ok();
+    let v = [next()?, next()?, next()?];
+    next().is_none().then_some(v)
 }
 
 #[derive(Args)]
@@ -346,5 +379,19 @@ extern "C" fn drain() {
         if n <= 0 || !write_all(1, &buf[..n as usize]) {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_from_names() {
+        assert_eq!(version_in_name("libkrun.1.19.8.dylib"), Some([1, 19, 8]));
+        assert_eq!(version_in_name("libkrun.1.dylib"), None);
+        assert_eq!(version_in_name("libkrun.dylib"), None);
+        assert_eq!(version_in_name("libkrun.1.19.8.1.dylib"), None);
+        assert!([1, 18, 9] < MIN_VERSION && [1, 19, 0] >= MIN_VERSION);
     }
 }
