@@ -1,6 +1,6 @@
 # changelog
 
-## unreleased
+## 0.1.1
 
 - a run ends when its command ends, even with something left running in the background
 - a failed filter refresh cuts open connections too, and stops VMs if nft itself fails
@@ -10,6 +10,7 @@
 - helpers run as root use a fixed PATH
 - CRLF and split UTF-8 on a terminal
 - help text for run
+- leaving a shell shows no guest kernel reboot line, and the prompt comes back below the session
 - release tarballs come with build provenance
 - `get.sh`: a one-line installer and upgrader
 - aarch64 tested: both suites pass on ubuntu 24.04 arm, and the README says how to run burner on a mac through lima
