@@ -271,6 +271,9 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     // only say it's gone once its wrapper (or the reaper) has cleaned it up
     let end = Instant::now() + Duration::from_secs(20);
     while Instant::now() < end {
+        // no reaper timer on macOS: a VM whose wrapper is gone is cleaned up here
+        #[cfg(target_os = "macos")]
+        let _ = reap(cfg);
         if matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None)) {
             println!("killed {id}");
             return Ok(ExitCode::SUCCESS);
