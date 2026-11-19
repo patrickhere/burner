@@ -124,17 +124,66 @@ impl Bucket {
         }
     }
 
-    fn take(&mut self) -> bool {
+    fn refill(&mut self) {
         let now = StdInstant::now();
         self.tokens =
             (self.tokens + now.duration_since(self.last).as_secs_f64() * self.rate).min(self.burst);
         self.last = now;
+    }
+
+    fn take(&mut self) -> bool {
+        self.refill();
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
         } else {
             false
         }
+    }
+}
+
+/// never less than a segment at a time, unless the rate itself is lower
+const RATE_CHUNK: f64 = 1460.0;
+
+/// net.rate, bytes a second one way, like firecracker's limiter on linux: the
+/// bucket holds a second's worth, so a short burst goes at full speed. counts
+/// tcp payload, not headers or dns. None is no limit
+struct Rate(Option<Bucket>);
+
+impl Rate {
+    fn new(bytes: u64) -> Rate {
+        Rate((bytes > 0).then(|| Bucket::new(bytes as f64, bytes as f64)))
+    }
+
+    fn chunk(b: &Bucket) -> f64 {
+        RATE_CHUNK.min(b.burst)
+    }
+
+    /// bytes that may go now: nothing until a chunk's worth has built up
+    fn allow(&mut self) -> usize {
+        let Some(b) = &mut self.0 else {
+            return usize::MAX;
+        };
+        b.refill();
+        if b.tokens < Self::chunk(b) {
+            0
+        } else {
+            b.tokens as usize
+        }
+    }
+
+    fn spend(&mut self, n: usize) {
+        if let Some(b) = &mut self.0 {
+            b.tokens -= n as f64;
+        }
+    }
+
+    /// ms until allow gives something again, None while it does
+    fn wait(&self) -> Option<u64> {
+        let b = self.0.as_ref()?;
+        let have = b.tokens + b.last.elapsed().as_secs_f64() * b.rate;
+        let need = Self::chunk(b) - have;
+        (need > 0.0).then(|| (need / b.rate * 1000.0).ceil() as u64)
     }
 }
 
@@ -167,6 +216,9 @@ struct Gw<'a> {
     // web mode and 50, burst 100 in open mode, and 20 dns packets a second, burst 50
     new_conns: Bucket,
     dns_rate: Bucket,
+    // guest to host and host to guest
+    up: Rate,
+    down: Rate,
     tx_blocked: bool,
 }
 
@@ -236,6 +288,8 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         dns: Vec::new(),
         new_conns,
         dns_rate: Bucket::new(20.0, 50.0),
+        up: Rate::new(args.rate),
+        down: Rate::new(args.rate),
         tx_blocked: false,
     };
     let mut buf = vec![0u8; 65536];
@@ -318,6 +372,8 @@ impl Gw<'_> {
         }
         let mut fds = vec![pfd(self.vm, ev)];
         let mut who = vec![Who::Vm];
+        // past the rate, host sockets wait for the timer instead
+        let down = self.down.wait().is_none();
         for (k, p) in &self.pending {
             fds.push(pfd(p.sock.as_raw_fd(), libc::POLLOUT));
             who.push(Who::Pending(*k));
@@ -325,7 +381,7 @@ impl Gw<'_> {
         for (k, c) in &self.conns {
             let s = self.sockets.get::<tcp::Socket>(c.handle);
             let mut ev = 0;
-            if !c.host_eof && s.may_send() && s.send_queue() < s.send_capacity() {
+            if down && !c.host_eof && s.may_send() && s.send_queue() < s.send_capacity() {
                 ev |= libc::POLLIN;
             }
             if !c.to_host.is_empty() {
@@ -359,6 +415,9 @@ impl Gw<'_> {
         }
         for p in self.pending.values() {
             ms = ms.min(p.deadline.saturating_duration_since(now).as_millis() as u64);
+        }
+        for w in [self.up.wait(), self.down.wait()].into_iter().flatten() {
+            ms = ms.min(w.max(1));
         }
         ms as libc::c_int
     }
@@ -582,9 +641,16 @@ impl Gw<'_> {
     }
 
     fn pump(&mut self) {
-        for c in self.conns.values_mut() {
-            let s = self.sockets.get_mut::<tcp::Socket>(c.handle);
-            pump(c, s);
+        let Gw {
+            conns,
+            sockets,
+            up,
+            down,
+            ..
+        } = self;
+        for c in conns.values_mut() {
+            let s = sockets.get_mut::<tcp::Socket>(c.handle);
+            pump(c, s, up, down);
         }
     }
 
@@ -692,15 +758,20 @@ fn guest_closed(st: tcp::State) -> bool {
     matches!(st, CloseWait | LastAck | Closing | TimeWait | Closed)
 }
 
-fn pump(c: &mut Conn, s: &mut tcp::Socket) {
+fn pump(c: &mut Conn, s: &mut tcp::Socket, up: &mut Rate, down: &mut Rate) {
     // guest to host. at most one chunk held here, the rest waits in smoltcp,
     // which shrinks the guest's window
     loop {
         if c.to_host.is_empty() {
-            let _ = s.recv(|b| {
-                c.to_host.extend_from_slice(b);
-                (b.len(), ())
-            });
+            let lim = up.allow();
+            let n = s
+                .recv(|b| {
+                    let n = b.len().min(lim);
+                    c.to_host.extend_from_slice(&b[..n]);
+                    (n, n)
+                })
+                .unwrap_or(0);
+            up.spend(n);
         }
         if c.to_host.is_empty() {
             break;
@@ -721,14 +792,21 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket) {
         let _ = c.host.shutdown(Shutdown::Write);
         c.shut = true;
     }
-    // host to guest, only as much as smoltcp has room for
+    // host to guest, only as much as smoltcp has room for and the rate allows
     let readable = std::mem::take(&mut c.readable);
     while readable && !c.host_eof && s.may_send() && s.send_queue() < s.send_capacity() {
+        let lim = down.allow();
+        if lim == 0 {
+            // still readable: the timer brings it back
+            c.readable = true;
+            break;
+        }
         let r = s.send(|b| {
             if b.is_empty() {
                 return (0, Err(ErrorKind::WouldBlock.into()));
             }
-            match c.host.read(b) {
+            let n = b.len().min(lim);
+            match c.host.read(&mut b[..n]) {
                 Ok(n) => (n, Ok(n)),
                 Err(e) => (0, Err(e)),
             }
@@ -738,7 +816,7 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket) {
                 c.host_eof = true;
                 s.close();
             }
-            Ok(Ok(_)) => {}
+            Ok(Ok(n)) => down.spend(n),
             Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => break,
             Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => {}
             _ => {

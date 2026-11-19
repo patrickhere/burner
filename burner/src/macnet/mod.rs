@@ -47,6 +47,9 @@ pub struct MacnetArgs {
     /// this process's address on the guest's network
     #[arg(long, default_value = "172.29.217.1")]
     gateway: Ipv4Addr,
+    /// bytes a second each way, 0 for no limit
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
     /// log every connection and refusal to stderr
     #[arg(short)]
     v: bool,
@@ -57,6 +60,7 @@ pub struct Link {
     pub guest: Ipv4Addr,
     pub prefix: u8,
     pub gateway: Ipv4Addr,
+    pub rate: u64,
     pub verbose: bool,
 }
 
@@ -92,6 +96,7 @@ fn start(a: MacnetArgs) -> io::Result<()> {
         guest: ip,
         prefix,
         gateway: a.gateway,
+        rate: a.rate,
         verbose: a.v,
     };
     net::run(&args, pol)
@@ -135,7 +140,8 @@ pub fn spawn(
     cmd.arg("macnet")
         .args(["--fd", &raw.to_string(), "--mode", mode.name()])
         .args(["--guest", &format!("{}/30", s.guest)])
-        .args(["--gateway", &s.host.to_string()]);
+        .args(["--gateway", &s.host.to_string()])
+        .args(["--rate", &cfg.net.rate.to_string()]);
     for r in &cfg.net.resolvers {
         cmd.args(["--resolver", &r.to_string()]);
     }
