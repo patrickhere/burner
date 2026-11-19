@@ -55,7 +55,7 @@ pub struct RunArgs {
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
     #[arg(skip)]
-    shell: bool,
+    pub(super) shell: bool,
     /// --net wasn't given: lower it to limits.net instead of refusing
     #[arg(skip)]
     net_default: bool,

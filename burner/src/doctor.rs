@@ -10,7 +10,7 @@ use crate::config::{self, Config};
 use crate::net;
 use crate::sys;
 
-const GUEST_INIT: &[u8] = include_bytes!("../guest-init");
+pub const GUEST_INIT: &[u8] = include_bytes!("../guest-init");
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum Level {

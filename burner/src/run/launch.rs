@@ -60,6 +60,12 @@ fn set_status(outcome: &'static str, rc: Option<i32>) {
 
 pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     interrupted();
+    if a.shell {
+        // saved for every way out, a panic included, then in boot mode from
+        // the start: keys typed during setup wait for the VM, ctrl-c works
+        sys::restore_tty_on_panic(crate::output::TERM_RESET);
+        let _ = sys::set_boot_mode(0);
+    }
     if let Some(fd) = a.status_fd {
         // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
         // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
@@ -74,6 +80,9 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     let code = match run(cfg, &a) {
         Ok(code) => code,
         Err(e) => {
+            if a.shell {
+                sys::restore_saved_tty();
+            }
             eprintln!("burner: {e:#}");
             match e.downcast_ref::<Exit>() {
                 Some(Exit(code, _)) => *code,
@@ -255,7 +264,6 @@ fn run_vm(
             dns.join(",")
         );
     }
-    let saved_tty = p.shell.then(sys::save_tty).flatten();
     if p.shell {
         let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
         let term = std::env::var("TERM").ok().filter(|t| {
@@ -376,8 +384,24 @@ fn run_vm(
         .spawn()
         .context("starting the jailer")?;
     if p.shell {
-        let sh = relay(&mut child, &token, deadline, cfg, id);
-        sys::restore_tty(saved_tty.as_ref());
+        // an image built with another guest init doesn't say when its shell
+        // is ready for keys
+        let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
+            .ok()
+            .as_deref()
+            != Some(crate::doctor::GUEST_INIT);
+        if legacy {
+            diag.put(
+                format!(
+                    "burner: image {} was built with a different guest init, rebuild it: tools/build-image {}\n",
+                    p.img, p.img
+                )
+                .as_bytes(),
+                None,
+            );
+        }
+        let sh = relay(&mut child, &token, deadline, cfg, id, legacy);
+        sys::restore_saved_tty();
         let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {
             // the jail and its firecracker.log are gone after teardown

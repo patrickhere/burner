@@ -201,6 +201,31 @@ pub fn set_raw(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// fd 0 while a shell's VM boots: no echo and no line editing, so keys typed
+/// early are read as they come and wait for the guest, but ctrl-c still
+/// interrupts burner and burner's own messages still get \r\n. ctrl-\ and
+/// ctrl-z are off, they'd kill or stop burner
+pub fn set_boot_mode(fd: i32) -> io::Result<()> {
+    // SAFETY: zeroed termios is a valid out-parameter
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and termios pointer
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHONL | libc::IEXTEN);
+    t.c_lflag |= libc::ISIG;
+    // 0 is _POSIX_VDISABLE on linux
+    t.c_cc[libc::VQUIT] = 0;
+    t.c_cc[libc::VSUSP] = 0;
+    t.c_cc[libc::VMIN] = 1;
+    t.c_cc[libc::VTIME] = 0;
+    // SAFETY: valid fd and termios pointer
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// put the terminal back right away, without waiting on output a dead VM left queued
 pub fn restore_tty(t: Option<&libc::termios>) {
     if let Some(t) = t {
@@ -381,6 +406,11 @@ pub fn which(cmd: &str) -> bool {
 }
 
 static SAVED_TTY: std::sync::OnceLock<libc::termios> = std::sync::OnceLock::new();
+
+/// the terminal as restore_tty_on_panic found it
+pub fn restore_saved_tty() {
+    restore_tty(SAVED_TTY.get());
+}
 
 /// release builds abort on panic, which skips every cleanup path. the hook
 /// still runs first: put the terminal back and undo any screen modes
