@@ -235,6 +235,7 @@ pub(super) fn relay(
     cfg: &Config,
     id: &str,
     legacy: bool,
+    tty_rec: Option<File>,
 ) -> Shell {
     let screen = Out::new_unescaped(Dest::Stdout);
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
@@ -269,6 +270,10 @@ pub(super) fn relay(
     // with the vCPUs' run count then
     let (mut tail, mut halt_seen): (Vec<u8>, Option<(Instant, Option<u64>)>) = (Vec::new(), None);
     let mut halted = false;
+    // a resize goes to the guest through the job disk, see write_size
+    let winch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, winch.clone());
+    let (mut size, mut size_seq) = (sys::term_size(1), 0u64);
     let mut held_since: Option<Instant> = None;
     // when guest init's end marker came: the VM stops right after it
     let mut ended_at: Option<Instant> = None;
@@ -309,6 +314,15 @@ pub(super) fn relay(
             }
             // still running: it can take a moment after the line to stop
             halt_seen = Some((Instant::now(), now));
+        }
+        if winch.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && let Some(f) = &tty_rec
+            && let Some(now) = sys::term_size(1)
+            && size != Some(now)
+        {
+            size = Some(now);
+            size_seq += 1;
+            let _ = write_size(f, size_seq, now);
         }
         if !raw && started.elapsed() >= READY_WAIT {
             let _ = sys::set_raw(0);
@@ -437,6 +451,18 @@ pub(super) fn relay(
         end,
         screen,
     }
+}
+
+/// the caller's terminal size as the first line of a shell's job disk:
+/// `burner-tty SEQ ROWS COLS SEQ`. guest init reads it every half second and
+/// sets it on the console, which sends the shell's foreground job SIGWINCH.
+/// SEQ twice: a line read while it was being written doesn't match itself
+pub(super) fn write_size(f: &File, seq: u64, (rows, cols): (u16, u16)) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(
+        format!("burner-tty {seq} {rows} {cols} {seq}\n").as_bytes(),
+        0,
+    )
 }
 
 /// whether the console ends in the line the guest kernel prints when it stops
@@ -776,6 +802,17 @@ mod tests {
             b"BURNER-xyz-END\r\n".to_vec()
         );
         assert!(!e.ended);
+    }
+
+    #[test]
+    fn size_record() {
+        let path = std::env::temp_dir().join(format!("burner-tty-{}", std::process::id()));
+        let f = File::create(&path).unwrap();
+        write_size(&f, 0, (30, 100)).unwrap();
+        write_size(&f, 12, (9, 7)).unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(got.lines().next(), Some("burner-tty 12 9 7 12"));
     }
 
     #[test]

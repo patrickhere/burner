@@ -186,7 +186,13 @@ fn run_vm(
     {
         return Err(Exit(EXIT_SANDBOX, "not enough disk to build the job disk".into()).into());
     }
-    build_job(&job, &p.cmd, a.input, spool.as_deref())?;
+    // a shell has no job: its job disk carries the caller's terminal size
+    let size = sys::term_size(1).unwrap_or((24, 80));
+    if p.shell {
+        tty_disk(&job, size)?;
+    } else {
+        build_job(&job, &p.cmd, a.input, spool.as_deref())?;
+    }
 
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     *held = Some(());
@@ -227,6 +233,12 @@ fn run_vm(
     )
     .context(same_fs)?;
     fs::rename(&job, root.join("job.tar"))?;
+    // opened before anything runs as the VM's uid, like the result disk
+    let tty_rec = if p.shell {
+        Some(OpenOptions::new().write(true).open(root.join("job.tar"))?)
+    } else {
+        None
+    };
     chown(root.join("job.tar"), Some(uid), Some(uid))?;
     let scratch = root.join("scratch.ext4");
     reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
@@ -265,7 +277,7 @@ fn run_vm(
         );
     }
     if p.shell {
-        let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
+        let (rows, cols) = size;
         let term = std::env::var("TERM").ok().filter(|t| {
             !t.is_empty()
                 && t.len() <= 32
@@ -273,9 +285,7 @@ fn run_vm(
                     .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
         });
         boot += &format!(
-            " burner.shell=1 burner.tty={}x{} burner.term={}",
-            rows.min(500),
-            cols.min(1000),
+            " burner.shell=1 burner.tty={rows}x{cols} burner.term={}",
             term.as_deref().unwrap_or("xterm")
         );
     }
@@ -400,7 +410,7 @@ fn run_vm(
                 None,
             );
         }
-        let sh = relay(&mut child, &token, deadline, cfg, id, legacy);
+        let sh = relay(&mut child, &token, deadline, cfg, id, legacy, tty_rec);
         sys::restore_saved_tty();
         let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {
@@ -663,6 +673,16 @@ fn spool_input(path: &Path, mode: Input, idle: Duration) -> Result<Option<PathBu
         f.write_all(&buf[..got])?;
     }
     Ok(Some(path.to_path_buf()))
+}
+
+/// a shell's job disk: its first line is the caller's terminal size, which
+/// relay rewrites when the terminal is resized and guest init polls
+fn tty_disk(path: &Path, size: (u16, u16)) -> Result<()> {
+    let f = File::create(path)?;
+    f.set_len(1 << 20)?;
+    super::console::write_size(&f, 0, size)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result<()> {

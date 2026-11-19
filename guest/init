@@ -88,6 +88,21 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     [ -n "$tty" ] && stty rows "${tty%x*}" cols "${tty#*x}" 2>/dev/null
     # backspace in a line read (cat, read) takes a whole utf-8 char, not a byte
     stty iutf8 2>/dev/null
+    # the caller's terminal size after a resize: burner rewrites the first line
+    # of vdc (burner-tty SEQ ROWS COLS SEQ). setting it on the console sends
+    # the shell's foreground job SIGWINCH
+    (
+        seen=0
+        while sleep 0.5; do
+            blockdev --flushbufs /dev/vdc 2>/dev/null
+            read -r tag n r c m < /dev/vdc || continue
+            [ "$tag" = burner-tty ] && [ "$n" = "$m" ] && [ "$n" != "$seen" ] || continue
+            case "$r$c" in ''|*[!0-9]*) continue ;; esac
+            seen=$n
+            stty -F "$con" rows "$r" cols "$c" 2>/dev/null
+        done
+    ) &
+    sizer=$!
     term=$(sed -n 's/.*burner\.term=\([a-z0-9.+-]*\).*/\1/p' /proc/cmdline)
     export TERM="${term:-xterm}" HOME=/root
     cd /root 2>/dev/null || cd /
@@ -112,6 +127,7 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
         # no pid namespaces: poweroff -f and the like stop the kernel here
         run_shell "$sh" "$st"
     fi
+    kill "$sizer" 2>/dev/null
     how=$(cat "$st/how" 2>/dev/null); rc=$(cat "$st/rc" 2>/dev/null)
     [ -n "$how" ] && rc=0
     case $rc in ''|*[!0-9]*) rc=$s ;; esac
