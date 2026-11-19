@@ -52,10 +52,21 @@ defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml
 ## how it works
 
 ```
-burner ──jailer──> firecracker VM ──tap──> nft ──nat──> internet
-                        │                   │
-                        │                   └──x──> LAN, the host, other VMs
-                        └── read-only image, scratch disk, job tar in, result tar out
+sudo burner run --net web --in tar --result tar -- cmd
+  │
+  │  jailer: its own uid, its own cgroup (cpu, memory, pids)
+  v
+┌────────────────────────────┐    tap, its own /30
+│ firecracker microVM        │───────────────────> nft ──nat──> internet
+│   its own kernel           │                      │
+│   read-only image          │                      └──x──> the host, your LAN,
+│   throwaway scratch disk   │                              other VMs, VPNs
+└──────┬──────────────┬──────┘
+       ^              │
+       │ job tar      │ result tar
+       │ (raw disk)   v (raw disk, never mounted on the host)
+     stdin       burner-parse ──> /out, rc and log as a tar on stdout
+                 (its own user, hard limits, only files and dirs)
 ```
 
 - every VM runs under firecracker's jailer as its own uid and gid, in its own cgroup with cpu, memory and pid caps. the ids come from `jail.uid_base` in the config (1900000000 up, no account behind them), so a guest that breaks out into firecracker can't open another VM's disks or signal its process. a uid stays taken until its VM is cleaned up, and `burner doctor` fails if an account, a group or a `/etc/subuid` range already uses one
