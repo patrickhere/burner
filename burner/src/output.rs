@@ -352,6 +352,8 @@ fn csi_allowed(body: &[u8]) -> bool {
                 .all(|b| b.is_ascii_digit() || *b == b';' || *b == b':');
             match fin {
                 b'h' | b'l' => rest == b"4", // insert mode, used by line editors
+                // ED 3 erases the caller's scrollback, outside the session
+                b'J' => matches!(rest, b"" | b"0" | b"1" | b"2"),
                 _ => digits && CSI_FINALS.contains(&fin),
             }
         }
@@ -424,6 +426,17 @@ mod tests {
         assert_eq!(f.feed(b"\x1b[1\x1b[31mr"), b"\x1b[31mr".to_vec());
         // a control inside a CSI ends it
         assert_eq!(f.feed(b"\x1b[1\nz"), b"\nz".to_vec());
+    }
+
+    #[test]
+    fn filter_keeps_scrollback() {
+        let mut f = TermFilter::default();
+        for ok in [&b"\x1b[J"[..], b"\x1b[0J", b"\x1b[1J", b"\x1b[2J"] {
+            assert_eq!(f.feed(ok), ok.to_vec());
+        }
+        for bad in [&b"\x1b[3J"[..], b"\x1b[2;3J", b"\x1b[03J"] {
+            assert_eq!(f.feed(bad), b"".to_vec(), "{bad:?}");
+        }
     }
 
     #[test]
