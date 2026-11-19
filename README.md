@@ -28,7 +28,7 @@ curl -fsSL https://get.burnervm.dev | sh
 
 ![the installer on a fresh aarch64 machine: packages, a checksummed download, firecracker and the units, the alpine image, then a first VM](docs/media/install.gif)
 
-that's linux with kvm (x86_64 or arm), or a mac with an M3 or newer, where it sets burner up in a linux VM through homebrew. run it again later to upgrade. [install details](#install-details) has what it does step by step, the manual way, macs, building from source and making more images.
+that's linux with kvm (x86_64 or arm), or any apple silicon mac (M1 and newer, macOS 15 or later), where it installs burner through homebrew and runs VMs natively. run it again later to upgrade. [install details](#install-details) has what it does step by step, the manual way, macs, building from source and making more images.
 
 ## what it does
 
@@ -114,7 +114,7 @@ what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel 
 
 one thing the shell filter takes on trust: that your terminal decodes utf-8. burner can't ask the terminal, so it goes by the locale (`LC_ALL`, `LC_CTYPE`, `LANG`) and takes utf-8 when none is set. on a terminal that decodes latin-1 or another 8-bit charset and acts on C1 controls (xterm without utf-8, luit, screen with `c1 on`), part of a utf-8 char can be a control like CSI. if that's yours, pass the locale through sudo, `sudo env LC_ALL=en_US.ISO-8859-1 burner shell`, and non-ascii from the guest shows as `?`.
 
-native on a mac (coming with the next release, see [install details](#install-details)) it's weaker than on linux, and here's how:
+on a mac (see [install details](#install-details)) it's weaker than on linux, and here's how:
 
 - each VM is libkrun on apple's hypervisor.framework. those two and the macOS kernel are the security boundary, where on linux it's firecracker, the jailer and kvm
 - the VMM runs as you. there's no uid per VM, no jailer and no chroot, so a guest that breaks out of libkrun can do anything you can, including reading other VMs' disks. the guest gets the cpus and memory you asked for, but nothing caps the VMM's own overhead the way a cgroup does on linux, and disk io isn't capped
@@ -141,23 +141,16 @@ sudo burner doctor
 
 releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
 
-on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and the homebrew tap sets that up with [lima](https://lima-vm.io). the same `curl ... | sh` line does it for you when it sees a mac, or by hand:
+on a mac, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework, no linux VM in between. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. the same `curl ... | sh` line does it for you when it sees a mac, or by hand with homebrew, which builds burner, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs:
 
 ```
 brew install burnervm/tap/burner
-burner setup                     # makes the VM and installs burner in it, once
-burner run -- 'uname -a'         # every burner command runs in the VM, no sudo needed
-```
-
-on an M1 or M2 there's no kvm inside the VM, so no burner through lima. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
-
-native on a mac is coming with the next release: no linux VM in between, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. it'll be a homebrew formula that builds burner, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs, and then:
-
-```
 burner setup                     # the guest kernel and alpine image homebrew fetched with it
 burner doctor
 burner run -- 'uname -m'         # no sudo, VMs run as you
 ```
+
+0.1.x on a mac ran burner inside a lima VM. upgrading to the native formula leaves that VM behind: `limactl delete burnervm` removes it, and `brew uninstall lima` if nothing else uses lima. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
 
 the formula pins the kernel and the image by sha256 in the tap, which isn't the place the files come from, so `burner setup` installs what brew already checked. `burner setup --version v0.2.0` fetches them from a github release instead: the kernel still has to match the sha256 built into burner (the one `install.sh` pins), but the image is only checked against that release's own `SHA256SUMS`. `--from DIR` takes both from anywhere you point it at and skips the kernel pin.
 

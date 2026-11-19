@@ -87,16 +87,13 @@ not_linux() {
     esac
 }
 
-# a mac can't run firecracker itself. homebrew installs the burner command,
-# which keeps a lima VM with nested virtualization and runs burner in there
+# on a mac burner runs VMs itself on hypervisor.framework through libkrun.
+# homebrew builds it, signs it and pulls in libkrun and e2fsprogs
 mac() {
-    [ "$(uname -m)" = arm64 ] || die "burner needs an apple silicon mac, an M3 or newer"
+    [ "$(uname -m)" = arm64 ] || die "burner needs an apple silicon mac, intel macs aren't supported"
     v=$(sw_vers -productVersion)
-    [ "${v%%.*}" -ge 15 ] || die "burner needs macOS 15 or later for nested virtualization, this is $v"
+    [ "${v%%.*}" -ge 15 ] || die "burner needs macOS 15 or later, this is $v"
     chip=$(sysctl -n machdep.cpu.brand_string)
-    case "$chip" in
-        *M1* | *M2*) die "the $chip can't pass kvm through to a VM, burner needs an M3 or newer" ;;
-    esac
     ok "this machine" "macOS $v, $chip"
     command -v brew >/dev/null 2>&1 || die "on a mac burner installs through homebrew, and it isn't here." \
         "get it from https://brew.sh, then run this again."
@@ -108,21 +105,23 @@ mac() {
         run "upgrading with homebrew" brew upgrade burnervm/tap/burner
         ok "homebrew" "burnervm/tap/burner, up to date"
     else
-        run "installing with homebrew" brew install burnervm/tap/burner
-        ok "homebrew" "burnervm/tap/burner, with lima"
+        run "installing with homebrew, it builds burner, a few minutes" brew install burnervm/tap/burner
+        ok "homebrew" "burnervm/tap/burner, with libkrun"
     fi
-    run "setting up the linux VM, a few minutes the first time" burner setup
+    run "installing the guest kernel and alpine image" burner setup
     version=$(burner --version 2>/dev/null | awk '{print $2}')
-    ok "linux VM" "lima, nested kvm, burner ${version:-installed}"
+    ok "burner" "native, ${version:-installed}"
+    if command -v limactl >/dev/null 2>&1 && limactl list -q 2>/dev/null | grep -qx burnervm; then
+        printf '  %sthe lima VM from burner 0.1.x is still there: limactl delete burnervm%s\n' "$D" "$R"
+    fi
 
     took=$(($(date +%s) - start))
     printf '\n  %sburner %s is ready%s %s(%ss)%s\n\n' "$B" "${version:-}" "$R" "$D" "$took" "$R"
     printf '  %stry it%s\n' "$D" "$R"
     printf "    burner run -- 'uname -a; cat /etc/alpine-release'\n"
     printf '    burner shell alpine\n'
-    printf '    burner-tui\n'
-    printf '\n  %sthe VM: burner vm start|stop|shell|delete%s\n' "$D" "$R"
-    printf '  %sdocs: https://github.com/%s%s\n\n' "$D" "$REPO" "$R"
+    printf '    burner doctor\n'
+    printf '\n  %sdocs: https://github.com/%s%s\n\n' "$D" "$REPO" "$R"
 }
 
 # the tools install.sh checks for, and the package each one comes in
