@@ -117,7 +117,9 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
         while sleep 0.5; do
             blockdev --flushbufs /dev/vdc 2>/dev/null
             read -r tag n r c m < /dev/vdc || continue
-            [ "$tag" = burner-tty ] && [ "$n" = "$m" ] && [ "$n" != "$seen" ] || continue
+            if [ "$tag" != burner-tty ] || [ "$n" != "$m" ] || [ "$n" = "$seen" ]; then
+                continue
+            fi
             case "$r$c" in ''|*[!0-9]*) continue ;; esac
             seen=$n
             stty -F "$con" rows "$r" cols "$c" 2>/dev/null
