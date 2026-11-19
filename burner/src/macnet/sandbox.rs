@@ -133,10 +133,13 @@ mod tests {
                 "tcp to 1.1.1.1:443",
                 tcp(Ipv4Addr::new(1, 1, 1, 1), 443),
             );
+            let quad9 = Ipv4Addr::new(9, 9, 9, 9);
             attempt(
                 &mut o,
                 "udp to 9.9.9.9:53",
-                super::super::net::dns_socket(Ipv4Addr::new(9, 9, 9, 9))
+                super::super::route::check(quad9)
+                    .map_err(std::io::Error::other)
+                    .and_then(|i| super::super::net::dns_socket(quad9, i))
                     .and_then(|u| u.send(b"x"))
                     .map(drop),
             );

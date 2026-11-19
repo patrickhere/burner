@@ -557,10 +557,13 @@ impl Gw<'_> {
             return;
         }
         let (_, dst, port) = key;
-        if let Err(why) = self.pol.tcp(dst, port) {
-            self.log(format_args!("tcp {dst}:{port} refused: {why}"));
-            return;
-        }
+        let index = match self.pol.tcp(dst, port) {
+            Ok(i) => i,
+            Err(why) => {
+                self.log(format_args!("tcp {dst}:{port} refused: {why}"));
+                return;
+            }
+        };
         if self.conns.len() + self.pending.len() >= MAX_FLOWS {
             self.log(format_args!(
                 "tcp {dst}:{port} refused: too many connections"
@@ -571,7 +574,7 @@ impl Gw<'_> {
             self.log(format_args!("tcp {dst}:{port} refused: rate limit"));
             return;
         }
-        match connect(dst, port) {
+        match connect(dst, port, index) {
             Ok(sock) => {
                 self.log(format_args!("tcp {dst}:{port} connecting"));
                 self.pending.insert(
@@ -720,10 +723,13 @@ impl Gw<'_> {
                 continue;
             };
             let gport = meta.endpoint.port;
-            if let Err(why) = self.pol.dns(dst) {
-                self.log(format_args!("dns {dst} refused: {why}"));
-                continue;
-            }
+            let index = match self.pol.dns(dst) {
+                Ok(i) => i,
+                Err(why) => {
+                    self.log(format_args!("dns {dst} refused: {why}"));
+                    continue;
+                }
+            };
             if !self.dns_rate.take() {
                 self.log(format_args!("dns {dst} refused: rate limit"));
                 continue;
@@ -741,7 +747,7 @@ impl Gw<'_> {
                     {
                         self.dns.swap_remove(old);
                     }
-                    match dns_socket(dst) {
+                    match dns_socket(dst, index) {
                         Ok(host) => {
                             self.dns.push(Dns {
                                 host,
@@ -858,10 +864,31 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket, up: &mut Rate, down: &mut Rate) {
     }
 }
 
-fn connect(dst: Ipv4Addr, port: u16) -> io::Result<Socket> {
+/// out the interface the policy checked, whatever the routes say by the time
+/// the syn leaves
+fn bind_to(s: &Socket, index: u16) -> io::Result<()> {
+    let i = libc::c_int::from(index);
+    // SAFETY: setsockopt reads one int from a live local
+    let r = unsafe {
+        libc::setsockopt(
+            s.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&i as *const libc::c_int).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn connect(dst: Ipv4Addr, port: u16, index: u16) -> io::Result<Socket> {
     let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
     s.set_nonblocking(true)?;
     setopt(s.as_raw_fd(), libc::SO_NOSIGPIPE, 1)?;
+    bind_to(&s, index)?;
     match s.connect(&SocketAddrV4::new(dst, port).into()) {
         Ok(()) => Ok(s),
         Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => Ok(s),
@@ -884,8 +911,9 @@ fn connected(s: &Socket) -> Option<io::Result<()>> {
 
 /// connected without a bind first: the sandbox allows no binds, and connect
 /// picks the local port anyway
-pub fn dns_socket(dst: Ipv4Addr) -> io::Result<UdpSocket> {
+pub fn dns_socket(dst: Ipv4Addr, index: u16) -> io::Result<UdpSocket> {
     let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    bind_to(&s, index)?;
     s.connect(&SocketAddrV4::new(dst, 53).into())?;
     s.set_nonblocking(true)?;
     Ok(s.into())

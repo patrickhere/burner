@@ -67,7 +67,7 @@ pub struct Policy {
     pub mode: Mode,
     pub resolvers: Vec<Ipv4Addr>,
     blocked: Vec<(Ipv4Addr, u8)>,
-    route: fn(Ipv4Addr) -> Result<(), &'static str>,
+    route: fn(Ipv4Addr) -> Result<u16, &'static str>,
 }
 
 impl Policy {
@@ -89,24 +89,25 @@ impl Policy {
         }
     }
 
-    /// Ok when a guest tcp connection to dst:port may go out, else why not
-    pub fn tcp(&self, dst: Ipv4Addr, port: u16) -> Result<(), &'static str> {
-        self.reachable(dst)?;
+    /// the interface a guest tcp connection to dst:port goes out on, if it may
+    /// go out at all, else why not
+    pub fn tcp(&self, dst: Ipv4Addr, port: u16) -> Result<u16, &'static str> {
+        let index = self.reachable(dst)?;
         if port == 53 {
-            return self.resolver(dst);
+            return self.resolver(dst).map(|()| index);
         }
         match self.mode {
-            Mode::Web if port == 80 || port == 443 => Ok(()),
+            Mode::Web if port == 80 || port == 443 => Ok(index),
             Mode::Web => Err("port closed in web mode"),
             Mode::Open if MAIL.contains(&port) => Err("mail port closed in open mode"),
-            Mode::Open => Ok(()),
+            Mode::Open => Ok(index),
         }
     }
 
-    /// Ok when a guest udp datagram to dst:53 may go out
-    pub fn dns(&self, dst: Ipv4Addr) -> Result<(), &'static str> {
-        self.reachable(dst)?;
-        self.resolver(dst)
+    /// the interface a guest udp datagram to dst:53 goes out on, if it may
+    pub fn dns(&self, dst: Ipv4Addr) -> Result<u16, &'static str> {
+        let index = self.reachable(dst)?;
+        self.resolver(dst).map(|()| index)
     }
 
     fn resolver(&self, dst: Ipv4Addr) -> Result<(), &'static str> {
@@ -117,7 +118,7 @@ impl Policy {
         }
     }
 
-    fn reachable(&self, dst: Ipv4Addr) -> Result<(), &'static str> {
+    fn reachable(&self, dst: Ipv4Addr) -> Result<u16, &'static str> {
         // read fresh every time: interfaces come and go (wifi, vpn, docker)
         let host = host_nets().ok_or("can't read the host's addresses")?;
         if host.iter().any(|&(n, p)| inside(dst, n, p)) {
@@ -174,7 +175,7 @@ mod tests {
 
     /// the ranges alone, whatever the routes of the machine running the tests
     fn any_route(mut p: Policy) -> Policy {
-        p.route = |_| Ok(());
+        p.route = |_| Ok(1);
         p
     }
 

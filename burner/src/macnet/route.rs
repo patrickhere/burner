@@ -31,16 +31,18 @@ impl Route {
     }
 }
 
-/// Ok when dst goes out the way the default route does
-pub fn check(dst: Ipv4Addr) -> Result<(), &'static str> {
+/// the interface dst goes out on, when that's the way the default route goes.
+/// the connection is then bound to it, so a route that shows up after this
+/// check (a vpn coming up) can't carry it
+pub fn check(dst: Ipv4Addr) -> Result<u16, &'static str> {
     let unreadable = "can't read the route to it";
     let r = lookup(dst, false).map_err(|_| unreadable)?;
     if r.is_default() {
-        return Ok(());
+        return Ok(r.index);
     }
     let d = lookup(Ipv4Addr::UNSPECIFIED, true).map_err(|_| "no default route")?;
     if allowed(&r, &d) {
-        Ok(())
+        Ok(d.index)
     } else {
         Err("not routed through the default route")
     }
