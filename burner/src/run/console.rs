@@ -15,6 +15,8 @@ use crate::sys;
 
 const SERIAL_CAP: u64 = 1 << 20;
 const LIVE_BYTES: u64 = 65536;
+/// input the shell holds for a VM that isn't taking it; past this it's dropped
+const TO_VM_CAP: usize = 16 << 20;
 
 /// copy the console between the BEGIN/END markers to `out`, byte for byte.
 /// the markers are only presentation: the guest knows the token and can end its
@@ -238,8 +240,9 @@ pub(super) fn relay(
                 break Outcome::Cancelled;
             }
         }
+        // stdin is always read, so ~. works even when the VM stops taking input
         let mut fds = Vec::new();
-        if stdin_open && console_open && to_vm.len() < 65536 {
+        if stdin_open {
             fds.push(0);
         }
         if console_open {
@@ -252,8 +255,13 @@ pub(super) fn relay(
             match io::stdin().lock().read(&mut buf) {
                 Ok(0) | Err(_) => stdin_open = false,
                 Ok(n) => {
-                    if escape.feed(&buf[..n], &mut to_vm) {
+                    let mut keys = Vec::new();
+                    if escape.feed(&buf[..n], &mut keys) {
                         break Outcome::Detached;
+                    }
+                    if console_open {
+                        let room = TO_VM_CAP.saturating_sub(to_vm.len());
+                        to_vm.extend_from_slice(&keys[..keys.len().min(room)]);
                     }
                 }
             }
