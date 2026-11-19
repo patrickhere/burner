@@ -376,7 +376,7 @@ fn trusted_mac(path: &Path) -> Result<()> {
 }
 
 /// a file and every directory above it owned by you or root and writable by
-/// nobody else
+/// nobody else, by its mode or by an ACL
 #[cfg(target_os = "macos")]
 pub fn trusted_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -384,7 +384,10 @@ pub fn trusted_file(path: &Path) -> Result<()> {
     let me = unsafe { libc::getuid() };
     for p in path.ancestors() {
         let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
-        if (m.uid() != me && m.uid() != 0) || m.mode() & 0o022 != 0 {
+        let others_write = m.mode() & 0o022 != 0
+            || acl::lets_others_write(p, me)
+                .with_context(|| format!("reading the ACL of {}", p.display()))?;
+        if (m.uid() != me && m.uid() != 0) || others_write {
             bail!(
                 "{} is owned or writable by someone other than you or root, so burner won't use it",
                 p.display()
@@ -392,6 +395,111 @@ pub fn trusted_file(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// macOS ACLs: an entry can let others write where the mode bits say nobody can
+#[cfg(target_os = "macos")]
+mod acl {
+    use std::ffi::{CString, c_int, c_void};
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    const ID_TYPE_UID: c_int = 0;
+    /// write and append data (add file and subdirectory on a dir), delete,
+    /// delete child, write attributes, extended attributes and the ACL, chown
+    const WRITES: u64 = 1 << 2 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 8 | 1 << 10 | 1 << 12 | 1 << 13;
+
+    unsafe extern "C" {
+        fn acl_get_file(path: *const libc::c_char, ty: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> c_int;
+        fn acl_get_qualifier(entry: *mut c_void) -> *mut c_void;
+        fn acl_free(obj: *mut c_void) -> c_int;
+        fn mbr_uuid_to_id(uu: *const u8, id: *mut libc::id_t, ty: *mut c_int) -> c_int;
+    }
+
+    /// true when an allow entry gives anyone but `me` or root any kind of write
+    pub fn lets_others_write(path: &Path, me: u32) -> io::Result<bool> {
+        let p = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+        // SAFETY: a NUL-terminated path; the ACL and each qualifier are freed
+        // with acl_free, entries belong to the ACL and aren't freed themselves
+        unsafe {
+            let acl = acl_get_file(p.as_ptr(), ACL_TYPE_EXTENDED);
+            if acl.is_null() {
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(libc::ENOENT) => Ok(false),
+                    _ => Err(e),
+                };
+            }
+            let mut found = false;
+            let mut entry = std::ptr::null_mut();
+            let mut id = ACL_FIRST_ENTRY;
+            while !found && acl_get_entry(acl, id, &mut entry) == 0 {
+                id = ACL_NEXT_ENTRY;
+                let (mut tag, mut mask) = (0, 0u64);
+                if acl_get_tag_type(entry, &mut tag) != 0
+                    || acl_get_permset_mask_np(entry, &mut mask) != 0
+                {
+                    found = true;
+                    break;
+                }
+                if tag != ACL_EXTENDED_ALLOW || mask & WRITES == 0 {
+                    continue;
+                }
+                let q = acl_get_qualifier(entry);
+                let (mut who, mut ty) = (0, -1);
+                let ok = !q.is_null() && mbr_uuid_to_id(q.cast(), &mut who, &mut ty) == 0;
+                if !q.is_null() {
+                    acl_free(q);
+                }
+                // a group can hold others, so only a user entry for you or root is fine
+                found = !(ok && ty == ID_TYPE_UID && (who == me || who == 0));
+            }
+            acl_free(acl);
+            Ok(found)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::process::Command;
+
+        fn with_acl(rule: &str) -> bool {
+            let f = std::env::temp_dir()
+                .join(format!("burner-acl-{}", crate::sys::random_hex(6).unwrap()));
+            std::fs::write(&f, b"x").unwrap();
+            if !rule.is_empty() {
+                let st = Command::new("chmod").arg("+a").arg(rule).arg(&f).status();
+                assert!(st.unwrap().success(), "{rule}");
+            }
+            // SAFETY: getuid can't fail
+            let r = super::lets_others_write(&f, unsafe { libc::getuid() }).unwrap();
+            // "deny delete" holds against its owner too
+            Command::new("chmod").arg("-N").arg(&f).status().unwrap();
+            std::fs::remove_file(&f).unwrap();
+            r
+        }
+
+        #[test]
+        fn write_entries_for_others() {
+            let me = std::env::var("USER").unwrap();
+            assert!(!with_acl(""));
+            assert!(!with_acl("everyone deny delete"));
+            assert!(!with_acl("everyone allow read"));
+            assert!(!with_acl(&format!("user:{me} allow write")));
+            assert!(with_acl("everyone allow write"));
+            assert!(with_acl("everyone allow append"));
+            assert!(with_acl("group:staff allow writeattr"));
+            assert!(with_acl("user:nobody allow delete"));
+        }
+    }
 }
 
 /// ipv4 addresses on an interface, from `ip -j`
