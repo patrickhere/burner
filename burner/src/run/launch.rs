@@ -4,7 +4,6 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, chown};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +15,7 @@ use super::console::{deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
-    is_interrupted, usage,
+    is_interrupted, signals, usage,
 };
 use crate::cgroup;
 use crate::config::{self, Config};
@@ -410,6 +409,9 @@ fn run_vm(
             );
         }
         let sh = relay(&mut child, &token, deadline, cfg, id, legacy, tty_rec);
+        // shutting down from here on: a signal after this point stops any
+        // wait on the caller's terminal
+        let seen = signals();
         sys::restore_saved_tty();
         let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {
@@ -481,12 +483,15 @@ fn run_vm(
             t0.elapsed().as_secs_f64()
         ));
         // the terminal reset goes out before any message. a caller's terminal
-        // that stalled gets it once it reads again, the VM is gone by then; a
-        // second signal stops the wait
-        interrupted().store(false, Ordering::Relaxed);
-        sh.screen.wait_last(is_interrupted);
-        if let Some(m) = msg {
-            eprintln!("burner: {m}");
+        // that stalled gets it once it reads again, the VM is gone by then. a
+        // signal stops the wait, and then nothing more is written to it
+        let give_up = || signals() > seen;
+        sh.screen.wait_last(give_up);
+        if let Some(m) = msg
+            && !give_up()
+        {
+            diag.put(format!("burner: {m}\n").as_bytes(), None);
+            diag.settle(give_up);
         }
         return Ok(code);
     }

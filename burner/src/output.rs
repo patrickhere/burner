@@ -171,6 +171,20 @@ impl Out {
         let _ = self.tx.send(Chunk::Reset);
     }
 
+    /// waits until everything queued is written, the writer broke, or `give_up`
+    pub fn settle(&self, give_up: impl Fn() -> bool) {
+        if self.tty && !self.broken.load(Ordering::Relaxed) {
+            let mut esc = self.esc.lock().unwrap_or_else(|e| e.into_inner());
+            self.send(esc.finish(), None);
+        }
+        while self.queued.load(Ordering::Relaxed) > 0
+            && !self.broken.load(Ordering::Relaxed)
+            && !give_up()
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// waits until finish_reset's chunk is written, the writer broke, or `give_up`
     pub fn wait_last(&self, give_up: impl Fn() -> bool) {
         while !self.last_done.load(Ordering::Relaxed)

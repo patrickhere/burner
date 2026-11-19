@@ -8,8 +8,8 @@
 // taken with no other lock held
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::sys;
@@ -44,23 +44,34 @@ fn usage(msg: impl Into<String>) -> anyhow::Error {
     Exit(EXIT_USAGE, msg.into()).into()
 }
 
-fn interrupted() -> &'static Arc<AtomicBool> {
-    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    FLAG.get_or_init(|| {
-        let f = Arc::new(AtomicBool::new(false));
+/// SIGINT, SIGTERM and SIGHUP so far. a count, not a flag: a wait that starts
+/// late can still tell a signal that came after it from one before
+static SIGNALS: AtomicUsize = AtomicUsize::new(0);
+
+fn interrupted() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
         for sig in [
             signal_hook::consts::SIGINT,
             signal_hook::consts::SIGTERM,
             signal_hook::consts::SIGHUP,
         ] {
-            let _ = signal_hook::flag::register(sig, f.clone());
+            // SAFETY: the handler only does an atomic add, which is async-signal-safe
+            let _ = unsafe {
+                signal_hook::low_level::register(sig, || {
+                    SIGNALS.fetch_add(1, Ordering::Relaxed);
+                })
+            };
         }
-        f
-    })
+    });
+}
+
+fn signals() -> usize {
+    SIGNALS.load(Ordering::Relaxed)
 }
 
 fn is_interrupted() -> bool {
-    interrupted().load(Ordering::Relaxed)
+    signals() > 0
 }
 
 /// a point in boot time (CLOCK_BOOTTIME, keeps counting through suspend). the
