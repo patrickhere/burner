@@ -1,0 +1,53 @@
+#!/bin/sh
+# the urls and sha256s for dist/homebrew/burner.rb (and the tap's copy of it)
+# for a release, once the release workflow has published it. none of them is
+# just what github serves right now:
+# - the source tarball has to unpack to exactly what git archive makes of the
+#   tag in this checkout
+# - the kernel has to be the one install.sh pins at that tag
+# - the kernel and the image need build provenance from this repo's release
+#   workflow (gh attestation verify, needs gh)
+#   tools/formula-shas v0.2.0
+set -eu
+tag="${1:?usage: tools/formula-shas TAG}"
+repo=patrickhere/burner
+src="$(cd "$(dirname "$0")/.." && pwd)"
+
+die() { echo "formula-shas: $*" >&2; exit 1; }
+get() { curl -fsSL --proto '=https' --retry 3 -o "$2" "$1" || die "download failed: $1"; }
+sha() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+
+command -v gh >/dev/null 2>&1 || die "needs gh, for gh attestation verify"
+git -C "$src" rev-parse -q --verify "refs/tags/$tag" >/dev/null || die "no tag $tag in $src, git fetch --tags first"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+tarball="https://github.com/$repo/archive/refs/tags/$tag.tar.gz"
+get "$tarball" "$work/src.tar.gz"
+mkdir "$work/github" "$work/tag"
+tar -xzf "$work/src.tar.gz" -C "$work/github"
+git -C "$src" archive --prefix=src/ "$tag" | tar -xf - -C "$work/tag"
+set -- "$work"/github/*
+[ $# = 1 ] && [ -d "$1" ] || die "github's tarball for $tag isn't one directory"
+diff -r "$1" "$work/tag/src" >/dev/null || die "github's tarball for $tag doesn't match the tag here"
+
+base="https://github.com/$repo/releases/download/$tag"
+for f in vmlinux-aarch64 alpine-aarch64.ext4.gz; do
+    get "$base/$f" "$work/$f"
+    gh attestation verify "$work/$f" -R "$repo" >/dev/null || die "$f has no build provenance from $repo"
+done
+pin=$(git -C "$src" show "$tag:install.sh" | sed -n '/^    aarch64)/,/;;/s/.*KERNEL_SHA=\([0-9a-f]*\).*/\1/p')
+[ "$(sha "$work/vmlinux-aarch64")" = "$pin" ] || die "the release's kernel isn't the one install.sh pins at $tag"
+
+echo "url     $tarball"
+echo "sha256  $(sha "$work/src.tar.gz")"
+echo
+echo "resource \"guest-kernel\""
+echo "url     $base/vmlinux-aarch64"
+echo "sha256  $(sha "$work/vmlinux-aarch64")"
+echo
+echo "resource \"alpine-image\""
+echo "url     $base/alpine-aarch64.ext4.gz"
+echo "sha256  $(sha "$work/alpine-aarch64.ext4.gz")"
