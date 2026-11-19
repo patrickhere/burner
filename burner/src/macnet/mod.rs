@@ -169,6 +169,35 @@ pub fn spawn(
     Ok(Proc(child))
 }
 
+/// for doctor: start macnet the way burner run does, on a socket whose other
+/// end is already closed. it has to get into its sandbox and its loop, see the
+/// VM gone and exit cleanly
+pub fn probe() -> Result<(), String> {
+    let (vm_end, net_end) = pair().map_err(|e| e.to_string())?;
+    drop(vm_end);
+    let raw = net_end.as_raw_fd();
+    let mut cmd = Command::new(sys::self_exe());
+    cmd.args(["macnet", "-v", "--fd", &raw.to_string(), "--mode", "web"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .current_dir("/");
+    // SAFETY: inherit only calls fcntl
+    unsafe {
+        cmd.pre_exec(move || inherit(raw));
+    }
+    let out = sys::run_timeout(&mut cmd, None, std::time::Duration::from_secs(10))
+        .map_err(|e| e.to_string())?;
+    drop(net_end);
+    let err = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() && err.contains("socket closed, exiting") {
+        return Ok(());
+    }
+    Err(err
+        .lines()
+        .last()
+        .map_or_else(|| format!("exited with {}", out.status), str::to_string))
+}
+
 /// the two ends of a VM's network, close-on-exec and with big enough buffers:
 /// (the VMM's, macnet's)
 pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {

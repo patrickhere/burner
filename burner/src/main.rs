@@ -113,7 +113,14 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             print!("{}", toml::to_string_pretty(&cfg)?);
             Ok(ExitCode::SUCCESS)
         }
+        #[cfg(target_os = "linux")]
         Cmd::Doctor => Ok(if doctor::run(&cfg) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }),
+        #[cfg(target_os = "macos")]
+        Cmd::Doctor => Ok(if doctor::run(&cfg, &cli.config) {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)

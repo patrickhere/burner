@@ -29,6 +29,7 @@ const GUEST_MAC: [u8; 6] = [0x06, 0x00, 0xac, 0x1d, 0x00, 0x02];
 unsafe extern "C" {
     fn krun_set_log_level(level: u32) -> i32;
     fn krun_create_ctx() -> i32;
+    fn krun_free_ctx(ctx: u32) -> i32;
     fn krun_set_vm_config(ctx: u32, vcpus: u8, ram_mib: u32) -> i32;
     fn krun_disable_implicit_vsock(ctx: u32) -> i32;
     fn krun_disable_implicit_console(ctx: u32) -> i32;
@@ -86,6 +87,33 @@ pub struct VmmArgs {
     /// boot time (sys::boottime) past which the VMM stops itself
     #[arg(long)]
     until: Option<f64>,
+}
+
+/// for doctor: the libkrun this binary loaded, once it has handed out a context
+pub fn probe() -> Result<String, String> {
+    // SAFETY: dladdr on a function this binary links, into a zeroed Dl_info
+    let path = unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(krun_create_ctx as *const libc::c_void, &mut info) != 0
+            && !info.dli_fname.is_null()
+        {
+            std::ffi::CStr::from_ptr(info.dli_fname)
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "libkrun".to_string()
+        }
+    };
+    // SAFETY: a context that is freed right away, no VM ever starts
+    let ctx = unsafe { krun_create_ctx() };
+    if ctx < 0 {
+        return Err(format!(
+            "{path} loaded but won't create a VM context ({})",
+            io::Error::from_raw_os_error(-ctx)
+        ));
+    }
+    unsafe { krun_free_ctx(ctx as u32) };
+    Ok(path)
 }
 
 pub fn main(a: VmmArgs) -> ExitCode {
