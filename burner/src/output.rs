@@ -292,6 +292,8 @@ pub struct TermFilter {
     seq: Vec<u8>,
     utf8: Vec<u8>,
     str_len: usize,
+    /// when the last read that left a string open came
+    str_at: Option<Instant>,
     /// the terminal isn't utf-8: non-ascii chars go out as ?
     ascii: bool,
 }
@@ -355,9 +357,11 @@ enum FState {
 }
 
 const SEQ_MAX: usize = 64;
-/// an OSC/DCS/APC/PM/SOS string longer than this is given up on, so one that
-/// never ends doesn't hide the rest of the session
+/// an OSC/DCS/APC/PM/SOS string longer than this, or one with nothing more for
+/// STR_IDLE, is given up on, so one that never ends doesn't hide the rest of
+/// the session. a real one comes in one go
 const STR_MAX: usize = 16 << 10;
+const STR_IDLE: Duration = Duration::from_secs(1);
 
 /// undoes every mode the filter lets through. the panic hook sends this one;
 /// a shell that ends normally gets Screen::reset, which knows whether the
@@ -501,10 +505,23 @@ impl TermFilter {
     }
 
     pub fn feed(&mut self, input: &[u8]) -> Vec<u8> {
+        self.feed_at(input, Instant::now())
+    }
+
+    fn feed_at(&mut self, input: &[u8], now: Instant) -> Vec<u8> {
+        let open = matches!(self.st, FState::Str | FState::StrEsc);
+        if open
+            && self
+                .str_at
+                .is_some_and(|t| now.duration_since(t) >= STR_IDLE)
+        {
+            self.st = FState::Text;
+        }
         let mut out = Vec::with_capacity(input.len());
         for &b in input {
             self.byte(b, &mut out);
         }
+        self.str_at = matches!(self.st, FState::Str | FState::StrEsc).then_some(now);
         out
     }
 
@@ -965,6 +982,21 @@ mod tests {
         // and one that runs on is given up on
         let long = [&b"\x1b]"[..], &vec![b'a'; STR_MAX], b"bcd"].concat();
         assert_eq!(f.feed(&long), b"cd".to_vec());
+        // as is one that's still open after a second with nothing more for it
+        let t = Instant::now();
+        assert_eq!(f.feed_at(b"\x1b]0;x", t), b"".to_vec());
+        assert_eq!(
+            f.feed_at(b"still in it", t + Duration::from_millis(500)),
+            b"".to_vec()
+        );
+        let later = t + Duration::from_millis(500) + STR_IDLE;
+        assert_eq!(f.feed_at(b"burner:~# ", later), b"burner:~# ".to_vec());
+        // a string that comes in pieces without such a gap still ends normally
+        assert_eq!(f.feed_at(b"\x1b]0;ti", later), b"".to_vec());
+        assert_eq!(
+            f.feed_at(b"tle\x07ok", later + Duration::from_millis(900)),
+            b"ok".to_vec()
+        );
     }
 
     #[test]
