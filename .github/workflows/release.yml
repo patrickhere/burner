@@ -172,6 +172,13 @@ jobs:
             v=$(sed -n 's/^version = "\(.*\)"/\1/p' "$c/Cargo.toml" | head -n 1)
             [ "v$v" = "$TAG" ] || { echo "$c/Cargo.toml says $v, the tag is $TAG" >&2; exit 1; }
           done
+      # build.rs reads the kernel pin from install.sh only for macOS, so a
+      # crate without it would build here and fail on every mac
+      - name: the crate carries install.sh
+        run: |
+          cargo package --locked --list -p burnervm > "$RUNNER_TEMP/files"
+          grep -qx install.sh "$RUNNER_TEMP/files" || { echo "install.sh isn't in the burnervm crate" >&2; exit 1; }
+          grep -q '^    aarch64)' burner/install.sh
       - name: publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
