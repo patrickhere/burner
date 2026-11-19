@@ -6,7 +6,7 @@ throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or 
 
 it started as a sandbox on my homelab for running code i don't trust (install scripts, other people's repos, things agents want to run) away from the box that has my keys on it. this is the rebuild in rust so other people can install it. the homelab version stays private, so the history here starts with the rebuild.
 
-status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's runners) and debian 13 on x86_64, aarch64 builds but has never booted a VM, and nobody has audited it.
+status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's runners) and debian 13 on x86_64, and ubuntu 24.04 on aarch64 (in a VM on an apple silicon mac). nobody has audited it.
 
 ```
 sudo burner shell                          # root shell in a fresh VM, gone when you exit
@@ -86,9 +86,13 @@ what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel 
 
 ## install
 
-linux on x86_64 or aarch64 with kvm, cgroup v2, nftables, iproute2 and conntrack. aarch64 is untested so far.
+linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image:
 
-grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
+```
+curl -fsSL https://raw.githubusercontent.com/patrickhere/burner/main/get.sh | sh
+```
+
+run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
 ```
 sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
@@ -101,6 +105,16 @@ sudo burner doctor
 ```
 
 releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
+
+on a mac, burner runs inside a linux VM. apple's virtualization passes kvm through to the VM on an M3 or newer with macOS 15 or later, and [lima](https://lima-vm.io) makes that one command:
+
+```
+brew install lima
+limactl start --name=burner --vm-type=vz --set '.nestedVirtualization=true' template:ubuntu-24.04
+limactl shell burner
+```
+
+then the same `curl ... | sh` in there. on an M1 or M2 there's no kvm inside the VM, so no burner. on windows 11, WSL2 with nested virtualization should work the same way (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
 
 or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
 

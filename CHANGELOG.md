@@ -11,6 +11,9 @@
 - CRLF and split UTF-8 on a terminal
 - help text for run
 - release tarballs come with build provenance
+- `get.sh`: a one-line installer and upgrader
+- aarch64 tested: both suites pass on ubuntu 24.04 arm, and the README says how to run burner on a mac through lima
+- the crates are burnervm and burnervm-tui on crates.io, published with every release
 - ping limits per VM instead of one bucket for all of them
 - an image's defaults.toml with a typo is an error, not a quiet fallback
 - a fresh install writes a config with only what you change, so new defaults reach it
