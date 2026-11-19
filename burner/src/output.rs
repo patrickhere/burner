@@ -606,10 +606,63 @@ fn csi_allowed(body: &[u8]) -> bool {
                 b'h' | b'l' => rest == b"4", // insert mode, used by line editors
                 // ED 3 erases the caller's scrollback, outside the session
                 b'J' => matches!(rest, b"" | b"0" | b"1" | b"2"),
+                b'm' => sgr_allowed(rest),
                 _ => digits && CSI_FINALS.contains(&fin),
             }
         }
     }
+}
+
+/// SGR parameters that only set attributes and colors. not 10 to 20 (font
+/// selection): on the linux console 11 and 12 switch the charset and make it
+/// print control bytes, and SGR 0 doesn't switch them back. extended colors
+/// (38, 48, 58) only as whole groups
+fn sgr_allowed(params: &[u8]) -> bool {
+    let Ok(p) = std::str::from_utf8(params) else {
+        return false;
+    };
+    let byte = |s: Option<&str>| s.is_some_and(|s| s.parse::<u8>().is_ok());
+    let mut it = p.split(';');
+    while let Some(x) = it.next() {
+        if x.contains(':') {
+            // 4:N underline styles, 38:5:N and 38:2:[space]:R:G:B colors
+            let sub: Vec<&str> = x.split(':').collect();
+            let ok = match sub.as_slice() {
+                ["4", n] => n.parse::<u8>().is_ok_and(|n| n <= 5),
+                ["38" | "48" | "58", "5", n] => byte(Some(n)),
+                ["38" | "48" | "58", "2", rgb @ ..] if rgb.len() == 3 || rgb.len() == 4 => {
+                    let rgb = &rgb[rgb.len() - 3..];
+                    rgb.iter().all(|c| byte(Some(c)))
+                }
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+            continue;
+        }
+        let n: u32 = if x.is_empty() {
+            0
+        } else {
+            match x.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            }
+        };
+        let ok = match n {
+            0..=9 | 21..=25 | 27..=37 | 39..=47 | 49 | 59 | 90..=97 | 100..=107 => true,
+            38 | 48 | 58 => match it.next() {
+                Some("5") => byte(it.next()),
+                Some("2") => (0..3).all(|_| byte(it.next())),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -816,6 +869,37 @@ mod tests {
             assert_eq!(f.feed(ok), ok.to_vec());
         }
         for bad in [&b"\x1b[3J"[..], b"\x1b[2;3J", b"\x1b[03J"] {
+            assert_eq!(f.feed(bad), b"".to_vec(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn filter_sgr() {
+        let mut f = TermFilter::default();
+        for ok in [
+            &b"\x1b[m"[..],
+            b"\x1b[0;1;4;7;31;42m",
+            b"\x1b[38;5;208;48;2;10;20;30m",
+            b"\x1b[38:2::1:2:3m\x1b[4:3m\x1b[58:5:9m",
+            b"\x1b[22;23;24;27;39;49;59;97;107m",
+        ] {
+            assert_eq!(f.feed(ok), ok.to_vec(), "{ok:?}");
+        }
+        // fonts (the linux console's 11 and 12 most of all), unknowns, and
+        // extended colors cut short or with a value out of range
+        for bad in [
+            &b"\x1b[10m"[..],
+            b"\x1b[1;11m",
+            b"\x1b[12m",
+            b"\x1b[26m",
+            b"\x1b[60m",
+            b"\x1b[38;5m",
+            b"\x1b[38;5;256m",
+            b"\x1b[48;2;1;2m",
+            b"\x1b[38;3;1m",
+            b"\x1b[4:9m",
+            b"\x1b[11:1m",
+        ] {
             assert_eq!(f.feed(bad), b"".to_vec(), "{bad:?}");
         }
     }
