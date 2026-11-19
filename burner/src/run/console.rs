@@ -163,7 +163,8 @@ pub(super) fn stream(
         flush_held(&mut held_nl);
         out.put(&pending, None);
     }
-    if st == St::Pre {
+    // a kill during boot ends the VM before the job, that's not worth the console tail
+    if st == St::Pre && !kill_requested(cfg, id) {
         diag.put(
             b"burner: VM ended before the job started; last console lines:\n",
             None,
@@ -396,6 +397,11 @@ fn cancelled(cfg: &Config, id: &str) -> bool {
     ledger::peek_strict(&cfg.paths.state, id).map_or(true, |v| v.is_none_or(|v| v.cancel))
 }
 
+/// only an entry that says so: an unreadable one doesn't turn a finished run into a kill
+fn kill_requested(cfg: &Config, id: &str) -> bool {
+    matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(Some(v)) if v.cancel)
+}
+
 /// after the console closed: the VM must be gone before its result disk is read
 pub(super) fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id: &str) -> Outcome {
     let mut next_check = Instant::now();
@@ -418,6 +424,11 @@ pub(super) fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id:
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    // burner kill sets cancel before it kills the cgroup, so a VM that died of a
+    // kill always finds it here, even when the once a second check above missed it
+    if kill_requested(cfg, id) {
+        return Outcome::Cancelled;
+    }
     let end = Instant::now() + Duration::from_secs(5);
     while cgroup::populated(id) && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(100));

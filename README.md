@@ -1,17 +1,34 @@
-# burner
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/svg/lockup-on-dark.svg">
+    <img alt="burner" src="brand/svg/lockup-on-light.svg" width="300">
+  </picture>
+</p>
 
-[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml)
+[![ci](https://github.com/patrickhere/burner/actions/workflows/ci.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/ci.yml) [![vm suites](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml/badge.svg)](https://github.com/patrickhere/burner/actions/workflows/vm-suites.yml) [![crates.io](https://img.shields.io/crates/v/burnervm)](https://crates.io/crates/burnervm) [![site](https://img.shields.io/badge/site-burnervm.dev-fa794a)](https://burnervm.dev) [![x](https://img.shields.io/badge/x-%40burnervm-black?logo=x)](https://x.com/burnervm) [![bluesky](https://img.shields.io/badge/bluesky-%40burnervm.dev-0285FF?logo=bluesky&logoColor=white)](https://bsky.app/profile/burnervm.dev)
 
 throwaway linux VMs on your own hardware. you ask for a VM, get a root shell or run a command in it, and it's deleted when you're done. each one is a firecracker microVM with its own kernel, and it can reach the internet but not your LAN.
 
 it started as a sandbox on my homelab for running code i don't trust (install scripts, other people's repos, things agents want to run) away from the box that has my keys on it. this is the rebuild in rust so other people can install it. the homelab version stays private, so the history here starts with the rebuild.
 
-status: early. one maintainer, tested on ubuntu 26.04, ubuntu 24.04 (github's runners) and debian 13 on x86_64, and ubuntu 24.04 on aarch64 (in a VM on an apple silicon mac). nobody has audited it.
+status: early, with one maintainer. it's tested on ubuntu 24.04 and 26.04 and debian 13 on x86_64, and on arm in a linux VM on a mac. it hasn't had an outside security review yet, so read [what it protects against](#what-it-protects-against) before trusting it with anything that matters.
 
 ```
 sudo burner shell                          # root shell in a fresh VM, gone when you exit
 sudo burner run -- 'uname -a; exit 3'      # run one thing, get its output and exit code back
 ```
+
+![burner running commands in fresh VMs: a kernel and alpine version, an exit code coming back, https working, and the LAN blocked](docs/media/demo.gif)
+
+## install
+
+```
+curl -fsSL https://get.burnervm.dev | sh
+```
+
+![the installer on a fresh aarch64 machine: packages, a checksummed download, firecracker and the units, the alpine image, then a first VM](docs/media/install.gif)
+
+that's linux with kvm (x86_64 or arm), or a mac with an M3 or newer, where it sets burner up in a linux VM through homebrew. run it again later to upgrade. [install details](#install-details) has what it does step by step, the manual way, macs, building from source and making more images.
 
 ## what it does
 
@@ -28,7 +45,7 @@ tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d
 
 exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
-the image is plain alpine with git and curl, so the first example installs node itself. build your own with a Dockerfile in `images/NAME/` and `tools/build-image NAME`.
+the image is plain alpine with git and curl, so the first example installs node itself. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
 
 defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml`). an image's `defaults.toml` can change the defaults:
 
@@ -45,10 +62,21 @@ defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml
 ## how it works
 
 ```
-burner ──jailer──> firecracker VM ──tap──> nft ──nat──> internet
-                        │                   │
-                        │                   └──x──> LAN, the host, other VMs
-                        └── read-only image, scratch disk, job tar in, result tar out
+sudo burner run --net web --in tar --result tar -- cmd
+  │
+  │  jailer: its own uid, its own cgroup (cpu, memory, pids)
+  v
+┌────────────────────────────┐    tap, its own /30
+│ firecracker microVM        │───────────────────> nft ──nat──> internet
+│   its own kernel           │                      │
+│   read-only image          │                      └──x──> the host, your LAN,
+│   throwaway scratch disk   │                              other VMs, VPNs
+└──────┬──────────────┬──────┘
+       ^              │
+       │ job tar      │ result tar
+       │ (raw disk)   v (raw disk, never mounted on the host)
+     stdin       burner-parse ──> /out, rc and log as a tar on stdout
+                 (its own user, hard limits, only files and dirs)
 ```
 
 - every VM runs under firecracker's jailer as its own uid and gid, in its own cgroup with cpu, memory and pid caps. the ids come from `jail.uid_base` in the config (1900000000 up, no account behind them), so a guest that breaks out into firecracker can't open another VM's disks or signal its process. a uid stays taken until its VM is cleaned up, and `burner doctor` fails if an account, a group or a `/etc/subuid` range already uses one
@@ -84,7 +112,7 @@ i run it on a box that's only reachable over a VPN. yours might sit on a home LA
 
 what it doesn't cover: a bug in firecracker or kvm itself (keep the host kernel and burner's pinned firecracker updated), side channels between VMs on the same cpu, and anything you pipe in yourself.
 
-native on a mac (coming with the next release, see [install](#install)) it's weaker than on linux, and here's how:
+native on a mac (coming with the next release, see [install details](#install-details)) it's weaker than on linux, and here's how:
 
 - each VM is libkrun on apple's hypervisor.framework. those two and the macOS kernel are the security boundary, where on linux it's firecracker, the jailer and kvm
 - the VMM runs as you. there's no uid per VM, no jailer and no chroot, so a guest that breaks out of libkrun can do anything you can, including reading other VMs' disks. the guest gets the cpus and memory you asked for, but nothing caps the VMM's own overhead the way a cgroup does on linux, and disk io isn't capped
@@ -93,15 +121,11 @@ native on a mac (coming with the next release, see [install](#install)) it's wea
 - the result tar is still parsed in a separate process with rlimits, but as you, and without a memory cap (macOS won't set one)
 - there's no reaper timer. the VMM stops itself when burner exits or its time is up, and the next `burner run` or `burner ls` cleans up what's left
 
-## install
+## install details
 
-linux on x86_64 or aarch64 with kvm and cgroup v2. one line does it all: it downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image:
+burner needs linux on x86_64 or aarch64 with kvm and cgroup v2. the one-liner from [install](#install) downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image.
 
-```
-curl -fsSL https://get.burnervm.dev | sh
-```
-
-run it again later to upgrade. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
+piping a script to `sh` means trusting it, so read it first if you'd rather: `curl -fsSL https://get.burnervm.dev | less`, or it's `get.sh` in this repo. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
 ```
 sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
@@ -135,7 +159,7 @@ burner run -- 'uname -m'         # no sudo, VMs run as you
 
 the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` doesn't know about the mac yet.
 
-or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on.
+or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on. the crates are on crates.io as `burnervm` and `burnervm-tui` (the commands are still `burner` and `burner-tui`), but `cargo install` alone isn't enough: burner also needs the firecracker, jailer, guest kernel and units that `install.sh` sets up.
 
 an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
 
@@ -199,3 +223,5 @@ both VM suites run on github's kvm runners on every push to main, and on a dedic
 ## license
 
 MIT or Apache-2.0, your pick. see `LICENSE-MIT` and `LICENSE-APACHE`. security reports: `SECURITY.md`.
+
+the logo and the rest of `brand/` are cc-by-4.0, and the name and the `>]` mark come with a short trademark note. both are in `brand/README.md`.
