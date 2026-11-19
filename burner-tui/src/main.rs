@@ -275,6 +275,10 @@ fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String>
         io::stdout().flush()?;
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
+        // ctrl-d ends the line without echoing a newline
+        if !line.ends_with('\n') {
+            println!();
+        }
     }
     default(libc::SIGINT);
     default(libc::SIGQUIT);
