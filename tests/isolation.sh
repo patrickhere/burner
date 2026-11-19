@@ -273,6 +273,28 @@ grep -q 'shell-42' "$T/shell.out" && ! grep -q 'reboot:\|BURNER-' "$T/shell.out"
   && ok "shell exit shows no kernel reboot line" \
   || bad "shell exit" "$(tr -d '\r' < "$T/shell.out" | tail -n 4 | tr '\n' ' ')"
 
+# 25 a shell passes on its exit code, poweroff -f in it ends it right away (not
+# at the ttl), and a guest kernel panic under it is a sandbox error
+sh_end() {
+    ( sleep 8; printf '%s\r' "$1"; sleep 6 ) \
+      | script -qfec "sudo burner shell --net none --ttl 30s alpine" "$T/sh-$2.out" >/dev/null 2>&1
+    echo $?
+}
+s=$(date +%s)
+r1=$(sh_end 'exit 3' a); r2=$(sh_end 'poweroff -f' b); r3=$(sh_end 'echo c > /proc/sysrq-trigger' c)
+e=$(date +%s)
+[ "$r1" = 3 ] && [ "$r2" = 0 ] && grep -q 'powered off' "$T/sh-b.out" && ! grep -q 'reboot:' "$T/sh-b.out" \
+  && [ "$r3" = 125 ] && grep -q 'crash' "$T/sh-c.out" \
+  && ok "shell exit code 3, poweroff -f ends it, a panic is 125 ($((e - s))s)" \
+  || bad "shell endings" "exit3=$r1 poweroff=$r2 panic=$r3 $(tr -d '\r' < "$T/sh-b.out" | tail -n 2 | tr '\n' ' ')"
+
+# 26 ctrl-c while a shell's VM is set up or boots stops it, instead of reaching
+# a guest console with nothing on it yet. early: a fast box boots in under 1s
+( sleep 0.3; printf '\003'; sleep 6 ) | script -qfec "sudo burner shell --net none --tag bootcc alpine" "$T/cc.out" >/dev/null 2>&1; rc=$?
+[ "$rc" = 130 ] && ! sudo burner ls | grep -q ' bootcc ' && grep -q 'interrupted' "$T/cc.out" && ! grep -q 'burner:.*#' "$T/cc.out" \
+  && ok "ctrl-c during a shell's boot stops it (rc $rc)" \
+  || bad "ctrl-c during boot" "rc=$rc $(tr -d '\r' < "$T/cc.out" | tail -n 3 | tr '\n' ' ')"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]

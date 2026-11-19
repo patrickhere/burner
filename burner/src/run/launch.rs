@@ -17,11 +17,11 @@ use serde_json::json;
 #[cfg(target_os = "macos")]
 use super::admin::VM_DIRS;
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
-use super::console::{deliver, print_rest, relay, stream, supervise};
+use super::console::{Ended, ShellIo, deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
-    is_interrupted, usage,
+    is_interrupted, signals, usage,
 };
 use crate::cgroup;
 use crate::config::{self, Config};
@@ -81,10 +81,18 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
             return ExitCode::from(EXIT_USAGE);
         }
     }
+    // boot mode from the start: keys typed during setup wait for the VM and
+    // ctrl-c works. the terminal comes back however main returns
+    let _tty = a
+        .shell
+        .then(|| sys::ShellTty::take(crate::output::TERM_RESET));
     let t0 = Instant::now();
     let code = match run(cfg, &a) {
         Ok(code) => code,
         Err(e) => {
+            if a.shell {
+                sys::restore_saved_tty();
+            }
             eprintln!("burner: {e:#}");
             match e.downcast_ref::<Exit>() {
                 Some(Exit(code, _)) => *code,
@@ -200,25 +208,56 @@ fn run_vm(
     {
         return Err(Exit(EXIT_SANDBOX, "not enough disk to build the job disk".into()).into());
     }
-    build_job(&job, &p.cmd, a.input, spool.as_deref())?;
+    // a shell has no job: its job disk carries the caller's terminal size
+    let size = sys::term_size(1).unwrap_or((24, 80));
+    if p.shell {
+        tty_disk(&job, size)?;
+    } else {
+        build_job(&job, &p.cmd, a.input, spool.as_deref())?;
+    }
 
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     *held = Some(());
 
-    let saved_tty = p.shell.then(sys::save_tty).flatten();
     let Vmm {
         mut child,
         log: vmm_log,
         raw: raw_fd,
         token,
         deadline,
+        tty_rec,
         // macnet goes with the VMM's group; this only waits for it at the end
         #[cfg(target_os = "macos")]
             net: _net,
-    } = launch(cfg, p, id, &job, net_slot, uid)?;
+    } = launch(cfg, p, id, &job, net_slot, uid, size)?;
     if p.shell {
-        let outcome = relay(&mut child, &token, deadline, cfg, id);
-        sys::restore_tty(saved_tty.as_ref());
+        // an image built with another guest init doesn't say when its shell
+        // is ready for keys
+        let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
+            .ok()
+            .as_deref()
+            != Some(crate::doctor::GUEST_INIT);
+        if legacy {
+            diag.put(
+                format!(
+                    "burner: image {} was built with a different guest init, rebuild it: tools/build-image {}\n",
+                    p.img, p.img
+                )
+                .as_bytes(),
+                None,
+            );
+        }
+        let io = ShellIo {
+            legacy,
+            tty_rec,
+            size,
+        };
+        let sh = relay(&mut child, &token, deadline, cfg, id, io);
+        // a signal since the relay stopped stops any wait on the caller's
+        // terminal, the relay's own drain included
+        let seen = sh.seen;
+        sys::restore_saved_tty();
+        let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {
             // the VM's dir and its log are gone after teardown
             let tail = tail_of(&vmm_log, 1500);
@@ -229,25 +268,55 @@ fn run_vm(
         }
         teardown(cfg, id, Some(&mut child));
         *held = None;
-        log_line(&format!(
-            "end {id} tag={} secs={:.1} shell",
-            p.tag,
-            t0.elapsed().as_secs_f64()
-        ));
-        return Ok(match outcome {
-            Outcome::Done => {
-                set_status("exited", None);
-                0
-            }
+        let (code, msg) = match outcome {
+            // guest init passes on the shell's exit code. a VM that stopped
+            // without saying so crashed or was reset under the shell
+            Outcome::Done => match sh.end {
+                Some(Ended::Exit(rc)) => {
+                    set_status("exited", Some(i32::from(rc)));
+                    (rc, None)
+                }
+                Some(Ended::Legacy) => {
+                    set_status("exited", Some(0));
+                    (0, None)
+                }
+                Some(Ended::PowerOff) => {
+                    set_status("exited", Some(0));
+                    (0, Some("the VM was powered off".into()))
+                }
+                Some(Ended::Reboot) => {
+                    set_status("exited", Some(0));
+                    (0, Some("the VM was rebooted, which ends it".into()))
+                }
+                Some(Ended::NoStart) => {
+                    set_status("sandbox_error", None);
+                    (EXIT_SANDBOX, Some("the guest shell couldn't start".into()))
+                }
+                Some(Ended::Lost) => {
+                    set_status("sandbox_error", None);
+                    (
+                        EXIT_SANDBOX,
+                        Some("the guest shell ended without an exit code".into()),
+                    )
+                }
+                None => {
+                    set_status("sandbox_error", None);
+                    (
+                        EXIT_SANDBOX,
+                        Some("the VM stopped without the shell ending (a crash or a reset)".into()),
+                    )
+                }
+            },
             Outcome::Detached => {
                 set_status("detached", None);
-                eprintln!("burner: left the shell, VM stopped");
-                0
+                (0, Some("left the shell, VM stopped".into()))
             }
             Outcome::Failed => {
                 set_status("sandbox_error", None);
-                eprintln!("burner: the VM stopped with an error, see the system log");
-                EXIT_SANDBOX
+                (
+                    EXIT_SANDBOX,
+                    Some("the VM stopped with an error, see the system log".into()),
+                )
             }
             Outcome::Timeout => {
                 set_status("timeout", None);
@@ -256,19 +325,37 @@ fn run_vm(
                 } else {
                     format!("{}s", p.ttl)
                 };
-                eprintln!("burner: shell closed at the {limit} limit");
-                EXIT_TIMEOUT
+                (
+                    EXIT_TIMEOUT,
+                    Some(format!("shell closed at the {limit} limit")),
+                )
             }
             Outcome::Cancelled => {
                 set_status("killed", None);
-                eprintln!("burner: killed by burner kill");
-                EXIT_INTERRUPTED
+                (EXIT_INTERRUPTED, Some("killed by burner kill".into()))
             }
             Outcome::Interrupted => {
                 set_status("interrupted", None);
-                EXIT_INTERRUPTED
+                (EXIT_INTERRUPTED, Some("interrupted, VM stopped".into()))
             }
-        });
+        };
+        log_line(&format!(
+            "end {id} tag={} secs={:.1} shell code={code}",
+            p.tag,
+            t0.elapsed().as_secs_f64()
+        ));
+        // the terminal reset goes out before any message. a caller's terminal
+        // that stalled gets it once it reads again, the VM is gone by then. a
+        // signal stops the wait, and then nothing more is written to it
+        let give_up = || signals() > seen;
+        sh.screen.wait_last(give_up);
+        if let Some(m) = msg
+            && !give_up()
+        {
+            diag.put(format!("burner: {m}\n").as_bytes(), None);
+            diag.settle(give_up);
+        }
+        return Ok(code);
     }
     let mut stdout = child.stdout.take().context("no console pipe")?;
 
@@ -415,6 +502,9 @@ struct Vmm {
     raw: File,
     token: String,
     deadline: Deadline,
+    /// a shell's job disk, opened for writing before the VM could touch it:
+    /// relay writes the terminal size there
+    tty_rec: Option<File>,
     #[cfg(target_os = "macos")]
     net: Option<crate::macnet::Proc>,
 }
@@ -428,6 +518,7 @@ fn launch(
     job: &Path,
     net_slot: Option<u32>,
     uid: u32,
+    size: (u16, u16),
 ) -> Result<Vmm> {
     let jail = cfg.paths.root.join("jail").join("firecracker").join(id);
     let root = jail.join("root");
@@ -465,6 +556,12 @@ fn launch(
     )
     .context(same_fs)?;
     fs::rename(job, root.join("job.tar"))?;
+    // opened before anything runs as the VM's uid, like the result disk
+    let tty_rec = if p.shell {
+        Some(OpenOptions::new().write(true).open(root.join("job.tar"))?)
+    } else {
+        None
+    };
     chown(root.join("job.tar"), Some(uid), Some(uid))?;
     let scratch = root.join("scratch.ext4");
     reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
@@ -503,7 +600,7 @@ fn launch(
         );
     }
     if p.shell {
-        boot += &shell_args();
+        boot += &shell_args(size);
     }
     let drive = |id: &str, path: &str, ro: bool, mbps: u64, ops: u64| {
         json!({"drive_id": id, "path_on_host": path, "is_root_device": id == "rootfs", "is_read_only": ro,
@@ -599,6 +696,7 @@ fn launch(
         raw: raw_fd,
         token,
         deadline,
+        tty_rec,
     })
 }
 
@@ -613,6 +711,7 @@ fn launch(
     job: &Path,
     net_slot: Option<u32>,
     _uid: u32,
+    size: (u16, u16),
 ) -> Result<Vmm> {
     let vms = cfg.paths.root.join(VM_DIRS);
     let dir = vms.join(id);
@@ -638,6 +737,11 @@ fn launch(
     }
     let job_disk = dir.join("job.tar");
     fs::rename(job, &job_disk)?;
+    let tty_rec = if p.shell {
+        Some(OpenOptions::new().write(true).open(&job_disk)?)
+    } else {
+        None
+    };
     let scratch = dir.join("scratch.ext4");
     reserve(cfg, &scratch, u64::from(p.disk_gib) << 30)?;
     prep_ok(cfg, id)?;
@@ -675,7 +779,7 @@ fn launch(
         None => None,
     };
     if p.shell {
-        boot += &shell_args();
+        boot += &shell_args(size);
     }
 
     let deadline = Deadline::in_secs(p.ttl);
@@ -768,13 +872,13 @@ fn launch(
         raw: raw_fd,
         token,
         deadline,
+        tty_rec,
         net,
     })
 }
 
 /// what guest init needs to run a shell on the caller's terminal
-fn shell_args() -> String {
-    let (rows, cols) = sys::term_size(1).unwrap_or((24, 80));
+fn shell_args((rows, cols): (u16, u16)) -> String {
     let term = std::env::var("TERM").ok().filter(|t| {
         !t.is_empty()
             && t.len() <= 32
@@ -782,9 +886,7 @@ fn shell_args() -> String {
                 .all(|b| b.is_ascii_alphanumeric() || b".+-".contains(&b))
     });
     format!(
-        " burner.shell=1 burner.tty={}x{} burner.term={}",
-        rows.min(500),
-        cols.min(1000),
+        " burner.shell=1 burner.tty={rows}x{cols} burner.term={}",
         term.as_deref().unwrap_or("xterm")
     )
 }
@@ -856,6 +958,16 @@ fn spool_input(path: &Path, mode: Input, idle: Duration) -> Result<Option<PathBu
         f.write_all(&buf[..got])?;
     }
     Ok(Some(path.to_path_buf()))
+}
+
+/// a shell's job disk: its first line is the caller's terminal size, which
+/// relay rewrites when the terminal is resized and guest init polls
+fn tty_disk(path: &Path, size: (u16, u16)) -> Result<()> {
+    let f = File::create(path)?;
+    f.set_len(1 << 20)?;
+    super::console::write_size(&f, 0, size)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 fn build_job(job: &Path, cmd: &str, mode: Input, spool: Option<&Path>) -> Result<()> {
@@ -1052,7 +1164,10 @@ fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
 }
 
 fn mkfs(path: &Path, cfg: &Config, id: &str) -> Result<()> {
+    // its own process group: a ctrl-c is burner's to handle (prep_ok stops
+    // mkfs), not a mkfs failure
     let mut c = Command::new(mkfs_bin())
+        .process_group(0)
         .args([
             "-q",
             "-F",
