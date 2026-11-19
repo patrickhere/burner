@@ -85,4 +85,11 @@ the fonts aren't in the repo. put these in `src/fonts/` first, both are under th
 
 ## license
 
-[decide: the logo files are either cc-by-4.0 or all rights reserved. either way, the mark refers to burner and isn't for forks or implied endorsement.]
+the logo files in `brand/` are licensed under [cc-by-4.0](https://creativecommons.org/licenses/by/4.0/): you can use, share and adapt them, as long as you credit burner (patrick hart). `src/` is code, under burner's own MIT or Apache-2.0 license, and the fonts it uses keep their own sil open font license.
+
+that's a copyright license, not a trademark one. the name "burner" and the `>]` mark identify this project, so:
+
+- use them to refer to burner: in articles, talks, package listings, a "works with burner" note, a link to the project
+- don't use them as the name or logo of a fork, another product or a service, and don't use them in a way that suggests this project endorses you when it doesn't. a fork is welcome, it just needs its own name and logo
+
+not sure if your use is fine? email patrick@burnervm.dev.

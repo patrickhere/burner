@@ -201,4 +201,4 @@ both VM suites run on github's kvm runners on every push to main, and on a dedic
 
 MIT or Apache-2.0, your pick. see `LICENSE-MIT` and `LICENSE-APACHE`. security reports: `SECURITY.md`.
 
-the logo and the rest of `brand/` (the `>]` mark, favicons, social images) have their own terms in `brand/README.md`.
+the logo and the rest of `brand/` are cc-by-4.0, and the name and the `>]` mark come with a short trademark note. both are in `brand/README.md`.
