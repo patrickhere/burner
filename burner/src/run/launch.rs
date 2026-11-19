@@ -1111,7 +1111,8 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32
             }
         }
         if start.elapsed() > QUEUE_WAIT {
-            anyhow::bail!("no free slot after 10 min");
+            set_status("busy", None);
+            return Err(Exit(EXIT_SANDBOX, "no free slot after 10 min".into()).into());
         }
         std::thread::sleep(Duration::from_secs(2));
     }

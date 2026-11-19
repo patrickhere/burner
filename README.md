@@ -170,7 +170,7 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
 
 - exit codes: the command's own, 124 when it hit the time limit, 125 when the sandbox itself failed, 2 for bad arguments, 130 when interrupted (ctrl-c, SIGTERM, SIGHUP) or killed with `burner kill`
 - `--status-fd N` writes one JSON line when the run ends, so a command that exits 124 itself isn't mistaken for a timeout. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error` or `usage`. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
-- when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up with 125 after 10 min. `--no-wait` fails right away instead, with 125 and outcome `busy`
+- when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up after 10 min. `--no-wait` fails right away instead. both end with 125 and outcome `busy`
 - `sudo burner ls --json` prints `{"vms": [...], "max_vms", "total_mem", "used_mem"}`. each VM has `id`, `tag`, `img`, `vcpus`, `mem`, `disk`, `net`, `status` (`preparing`, `running` or `cleanup-failed`), `owner`, `age`, `ttl` and `ttl_left`. `--tag` on a run makes yours easy to find
 - anything the command leaves running in the background (a server started with `&`, a daemon, even one that called setsid) is killed when the command exits, and the run ends there. if the tests need a server, start it and stop it inside the same command
 
