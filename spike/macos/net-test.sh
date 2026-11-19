@@ -2,13 +2,14 @@
 # boots one guest with spike-net and burner-macnet, runs JOB (a shell script)
 # inside it, then checks the network process went away with the VM.
 #   net-test.sh JOB [MACNET ARGS]
-# needs spike-net built and signed in this dir, macnet/ built with --release,
+# needs spike-net built and signed in this dir, MACNET pointing at a script that
+# runs exec burner macnet "$@",
 # and SPIKE pointing at a dir with vmlinux, rootfs.ext4, scratch.ext4, result.raw
 set -u
 job=$1; shift
 here=$(cd "$(dirname "$0")" && pwd)
 spike=${SPIKE:-$HOME/burner-spike}
-macnet=${MACNET:-$here/../../macnet/target/release/burner-macnet}
+macnet=${MACNET:?point MACNET at a script that runs burner macnet}
 work=$(mktemp -d "${TMPDIR:-/tmp}/burner-net.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 

@@ -182,11 +182,7 @@ impl Default for Net {
 }
 
 // open (any port but mail) is something you opt into
-#[cfg(target_os = "linux")]
 const DEFAULT_NET: &str = "web";
-// VMs on macOS have no network yet
-#[cfg(target_os = "macos")]
-const DEFAULT_NET: &str = "none";
 
 impl Default for Limits {
     fn default() -> Self {

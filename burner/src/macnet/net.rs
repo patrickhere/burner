@@ -20,8 +20,8 @@ use smoltcp::wire::{
 };
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::Args;
-use crate::policy::Policy;
+use super::policy::Policy;
+use super::{Link, SOCK_RCVBUF, SOCK_SNDBUF, setopt};
 
 /// ethernet header plus a 1500 mtu. libkrun gets no offload features, so the
 /// guest never sends more than this
@@ -36,9 +36,6 @@ const DNS_IDLE: StdDuration = StdDuration::from_secs(10);
 const GUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const TX_QUEUE: usize = 1024;
 const RX_BATCH: usize = 256;
-/// macos sizes a unix datagram socket's buffers tiny by default: a few frames
-const SOCK_RCVBUF: libc::c_int = 4 << 20;
-const SOCK_SNDBUF: libc::c_int = 64 << 10;
 
 /// guest port, destination, destination port
 type Key = (u16, Ipv4Addr, u16);
@@ -156,7 +153,7 @@ enum Who {
 }
 
 struct Gw<'a> {
-    args: &'a Args,
+    args: &'a Link,
     pol: Policy,
     vm: RawFd,
     iface: Interface,
@@ -173,7 +170,7 @@ struct Gw<'a> {
     tx_blocked: bool,
 }
 
-pub fn run(args: &Args, pol: Policy) -> io::Result<()> {
+pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
     let vm = args.fd;
     let mut ty: libc::c_int = 0;
     let mut len = size_of::<libc::c_int>() as libc::socklen_t;
@@ -297,7 +294,7 @@ pub fn run(args: &Args, pol: Policy) -> io::Result<()> {
 impl Gw<'_> {
     fn log(&self, msg: std::fmt::Arguments) {
         if self.args.verbose {
-            eprintln!("burner-macnet: {msg}");
+            eprintln!("burner net: {msg}");
         }
     }
 
@@ -601,7 +598,7 @@ impl Gw<'_> {
             let s = sockets.get::<tcp::Socket>(c.handle);
             if matches!(s.state(), tcp::State::Closed | tcp::State::TimeWait) {
                 if args.verbose {
-                    eprintln!("burner-macnet: tcp {}:{} closed", k.1, k.2);
+                    eprintln!("burner net: tcp {}:{} closed", k.1, k.2);
                 }
                 sockets.remove(c.handle);
                 false
@@ -779,22 +776,6 @@ fn dns_socket(dst: Ipv4Addr) -> io::Result<UdpSocket> {
     u.connect(SocketAddrV4::new(dst, 53))?;
     u.set_nonblocking(true)?;
     Ok(u)
-}
-
-fn setopt(fd: RawFd, opt: libc::c_int, val: libc::c_int) -> io::Result<()> {
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            opt,
-            &val as *const _ as *const _,
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if r != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 fn seed() -> u64 {

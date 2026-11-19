@@ -141,14 +141,10 @@ pub fn host_nets() -> Option<Vec<(Ipv4Addr, u8)>> {
         if let Some(m) = sockaddr_v4(ifa.ifa_netmask) {
             out.push((ip, u32::from(m).leading_ones() as u8));
         }
-        if ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0 {
-            #[cfg(target_os = "macos")]
-            let dst = ifa.ifa_dstaddr;
-            #[cfg(not(target_os = "macos"))]
-            let dst = ifa.ifa_ifu;
-            if let Some(d) = sockaddr_v4(dst) {
-                out.push((d, 32));
-            }
+        if ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0
+            && let Some(d) = sockaddr_v4(ifa.ifa_dstaddr)
+        {
+            out.push((d, 32));
         }
     }
     unsafe { libc::freeifaddrs(head) };

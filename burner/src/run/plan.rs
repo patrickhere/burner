@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use serde::Deserialize;
 
+#[cfg(target_os = "linux")]
 use super::admin::reaper_alive;
 use super::launch::main;
 use super::{EXIT_SANDBOX, EXIT_USAGE, Exit, usage};
@@ -271,21 +272,22 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         }
         net = ceiling;
     }
-    #[cfg(target_os = "macos")]
     if net != net::Mode::None {
-        if !a.net_default {
-            return Err(usage("VMs on macOS have no network yet, only --net none"));
-        }
-        net = net::Mode::None;
-    }
-    if net != net::Mode::None {
+        // no filter to keep current on macOS: macnet reads the host's
+        // addresses and routes for every connection itself
+        #[cfg(target_os = "linux")]
         reaper_alive(cfg)?;
+        #[cfg(target_os = "linux")]
+        let logs = "journalctl -t burner";
+        #[cfg(target_os = "macos")]
+        let logs = "log show --predicate 'process == \"burner\"'";
         if cfg.net.block_public_ip && net::public_ip(cfg).is_none() {
             return Err(Exit(
                 EXIT_SANDBOX,
-                "net.block_public_ip is on but no public address has been found yet \
-                 (journalctl -t burner), refusing a VM with a network. --net none still works"
-                    .into(),
+                format!(
+                    "net.block_public_ip is on but no public address has been found yet \
+                     ({logs}), refusing a VM with a network. --net none still works"
+                ),
             )
             .into());
         }

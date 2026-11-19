@@ -19,8 +19,11 @@ use crate::sys;
 const KERNEL_FORMAT_RAW: u32 = 0;
 const DISK_FORMAT_RAW: u32 = 0;
 const LOG_LEVEL_ERROR: u32 = 1;
-// NET_FEATURE_CSUM | GUEST_CSUM | GUEST_TSO4 | GUEST_UFO | HOST_TSO4 | HOST_UFO
-const COMPAT_NET_FEATURES: u32 = 1 | 1 << 1 | 1 << 7 | 1 << 10 | 1 << 11 | 1 << 14;
+// macnet takes plain checksummed frames of at most 1514 bytes: no offloads
+const NET_FEATURES: u32 = 0;
+const NET_FLAGS: u32 = 0;
+// each VM is alone on its wire with macnet, so every guest can have the same one
+const GUEST_MAC: [u8; 6] = [0x06, 0x00, 0xac, 0x1d, 0x00, 0x02];
 
 // linked by build.rs
 unsafe extern "C" {
@@ -74,7 +77,7 @@ pub struct VmmArgs {
     mem: u32,
     #[arg(long)]
     cmdline: String,
-    /// a unixgram socket to the network proxy, already connected
+    /// a unixgram socket to burner macnet, already connected
     #[arg(long)]
     net_fd: Option<i32>,
     /// copy stdin into the console (burner shell)
@@ -174,17 +177,15 @@ fn start(a: &VmmArgs) -> io::Result<std::convert::Infallible> {
             )?;
         }
         if let Some(fd) = a.net_fd {
-            // TODO: the proxy decides the mac, features and flags it wants
-            let mac = [0x06, 0x00, 0xac, 0x1d, 0x00, 0x02];
             check(
                 "net",
                 krun_add_net_unixgram(
                     ctx,
                     std::ptr::null(),
                     fd,
-                    mac.as_ptr(),
-                    COMPAT_NET_FEATURES,
-                    0,
+                    GUEST_MAC.as_ptr(),
+                    NET_FEATURES,
+                    NET_FLAGS,
                 ),
             )?;
         }

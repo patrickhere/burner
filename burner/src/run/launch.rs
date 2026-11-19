@@ -1,5 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::chown;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -122,6 +124,10 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     if sys::is_root() {
         return Err(usage("on macOS burner runs as you, without sudo"));
     }
+    // no reaper timer on macOS: each run first cleans up after dead ones, and
+    // looks up the public address for net.block_public_ip before plan wants it
+    #[cfg(target_os = "macos")]
+    let _ = super::admin::reap(cfg);
     let p = plan(cfg, a)?;
     // the parser reads what a VM wrote, so it must never share an id with one
     #[cfg(target_os = "linux")]
@@ -135,9 +141,6 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
             );
         }
     }
-    // no reaper timer on macOS: each run first cleans up after dead ones
-    #[cfg(target_os = "macos")]
-    let _ = super::admin::reap(cfg);
     let runs = cfg.paths.root.join("run");
     fs::create_dir_all(&runs)?;
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
@@ -209,6 +212,9 @@ fn run_vm(
         raw: raw_fd,
         token,
         deadline,
+        // macnet goes with the VMM's group; this only waits for it at the end
+        #[cfg(target_os = "macos")]
+            net: _net,
     } = launch(cfg, p, id, &job, net_slot, uid)?;
     if p.shell {
         let outcome = relay(&mut child, &token, deadline, cfg, id);
@@ -409,6 +415,8 @@ struct Vmm {
     raw: File,
     token: String,
     deadline: Deadline,
+    #[cfg(target_os = "macos")]
+    net: Option<crate::macnet::Proc>,
 }
 
 /// set up the jail and start firecracker under the jailer
@@ -603,7 +611,7 @@ fn launch(
     p: &Plan,
     id: &str,
     job: &Path,
-    _net_slot: Option<u32>,
+    net_slot: Option<u32>,
     _uid: u32,
 ) -> Result<Vmm> {
     let vms = cfg.paths.root.join(VM_DIRS);
@@ -658,6 +666,22 @@ fn launch(
     if !p.shell {
         boot += &format!(" burner.limit={}", guest_limit(p.ttl));
     }
+    // the same addresses as on linux, though each VM is alone on its wire
+    let net = match net_slot {
+        Some(i) => {
+            let s = net::slot(cfg, i)?;
+            let dns: Vec<String> = cfg.net.resolvers.iter().map(|r| r.to_string()).collect();
+            boot += &format!(
+                " ip={}::{}:255.255.255.252:burner:eth0:off burner.dns={}",
+                s.guest,
+                s.host,
+                dns.join(",")
+            );
+            let (vm_end, net_end) = crate::macnet::pair().context("the VM's network socket")?;
+            Some((s, vm_end, net_end))
+        }
+        None => None,
+    };
     if p.shell {
         boot += &shell_args();
         boot +=
@@ -678,9 +702,13 @@ fn launch(
     // and so kill takes the group
     vmm.process_group(0);
     let me = std::process::id() as libc::pid_t;
-    // SAFETY: join_from_child only calls getppid
+    let vm_fd = net.as_ref().map(|(_, v, _)| v.as_raw_fd());
+    // SAFETY: join_from_child only calls getppid, inherit only fcntl
     unsafe {
-        vmm.pre_exec(move || cgroup::join_from_child(&procs, me));
+        vmm.pre_exec(move || {
+            cgroup::join_from_child(&procs, me)?;
+            vm_fd.map_or(Ok(()), crate::macnet::inherit)
+        });
     }
     let mut child = vmm
         .arg("vmm-krun")
@@ -700,6 +728,11 @@ fn launch(
         // the VMM's own backstop, when the reaper would have stopped it on linux
         .args(["--until", &format!("{:.1}", deadline.0 + 5.0)])
         .args(p.shell.then_some("--stdin"))
+        .args(
+            vm_fd
+                .iter()
+                .flat_map(|fd| ["--net-fd".to_string(), fd.to_string()]),
+        )
         .stdin(if p.shell {
             Stdio::piped()
         } else {
@@ -717,12 +750,29 @@ fn launch(
         let _ = child.wait();
         return Err(e).context("recording the VMM");
     }
+    let net = match net {
+        Some((s, vm_end, net_end)) => {
+            // the VMM holds its end now. ours has to go, or macnet would never
+            // see it close when the VM stops
+            drop(vm_end);
+            match crate::macnet::spawn(cfg, p.net, &s, net_end, child.id()) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e).context("starting the VM's network");
+                }
+            }
+        }
+        None => None,
+    };
     Ok(Vmm {
         child,
         log,
         raw: raw_fd,
         token,
         deadline,
+        net,
     })
 }
 

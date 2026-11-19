@@ -6,6 +6,8 @@ mod doctor;
 #[cfg(target_os = "macos")]
 mod krun;
 mod ledger;
+#[cfg(target_os = "macos")]
+mod macnet;
 mod net;
 mod output;
 mod result;
@@ -63,6 +65,10 @@ enum Cmd {
     #[cfg(target_os = "macos")]
     #[command(name = "vmm-krun", hide = true)]
     VmmKrun(krun::VmmArgs),
+    /// the network for one VM, started by burner run
+    #[cfg(target_os = "macos")]
+    #[command(hide = true)]
+    Macnet(macnet::MacnetArgs),
 }
 
 fn main() -> ExitCode {
@@ -79,8 +85,10 @@ fn main() -> ExitCode {
         return result::child_main(emit == "1");
     }
     #[cfg(target_os = "macos")]
-    if let Cmd::VmmKrun(a) = cli.cmd {
-        return krun::main(a);
+    match cli.cmd {
+        Cmd::VmmKrun(a) => return krun::main(a),
+        Cmd::Macnet(a) => return macnet::main(a),
+        _ => {}
     }
     match run(cli) {
         Ok(code) => code,
@@ -109,7 +117,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
         #[cfg(target_os = "macos")]
         Cmd::Net { .. } => {
-            anyhow::bail!("VMs on macOS have no network yet, so there's nothing to set up")
+            anyhow::bail!(
+                "on macOS each VM's network is a process of its own, there's nothing to set up"
+            )
         }
         #[cfg(target_os = "linux")]
         Cmd::Net { action } => match action.as_str() {
@@ -142,6 +152,6 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Reap => run::reap(&cfg),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
-        Cmd::VmmKrun(_) => unreachable!("handled before the config loads"),
+        Cmd::VmmKrun(_) | Cmd::Macnet(_) => unreachable!("handled before the config loads"),
     }
 }

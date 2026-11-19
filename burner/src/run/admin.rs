@@ -6,10 +6,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use serde_json::json;
 
-use super::{EXIT_SANDBOX, EXIT_USAGE, Exit};
+use super::EXIT_USAGE;
+#[cfg(target_os = "linux")]
+use super::{EXIT_SANDBOX, Exit};
 use crate::cgroup;
 use crate::config::Config;
 use crate::ledger::{self, Ident, Ledger, Status, valid_id};
+#[cfg(target_os = "linux")]
 use crate::net;
 use crate::sys;
 
@@ -17,6 +20,7 @@ use crate::sys;
 /// a VM with a network could outlive its wrapper or sit behind a stale filter,
 /// so networked runs wait for it to be running
 const REAPED: &str = "reaped";
+#[cfg(target_os = "linux")]
 const REAPER_MAX_AGE: Duration = Duration::from_secs(120);
 
 /// each VM's own dir under paths.root: its disks, its VMM's log
@@ -35,6 +39,7 @@ fn cgroup_dir() -> PathBuf {
     cgroup::dir()
 }
 
+#[cfg(target_os = "linux")]
 pub(super) fn reaper_alive(cfg: &Config) -> Result<()> {
     match reaper_age(cfg) {
         Some(a) if a <= REAPER_MAX_AGE => Ok(()),
@@ -49,6 +54,7 @@ pub(super) fn reaper_alive(cfg: &Config) -> Result<()> {
 }
 
 /// when the reaper last finished a pass, for doctor
+#[cfg(target_os = "linux")]
 pub fn reaper_age(cfg: &Config) -> Option<Duration> {
     fs::metadata(cfg.paths.state.join(REAPED))
         .and_then(|m| m.modified())
@@ -73,7 +79,7 @@ pub(super) fn remove_tree(path: &Path) -> bool {
 pub(super) enum Slot {
     /// it never had one
     None,
-    Tap(u32),
+    Tap(#[cfg_attr(target_os = "macos", allow(dead_code))] u32),
     /// its ledger entry can't be read: leave the tap and report it unfinished
     Unknown,
     /// the orphan tap sweep frees it
@@ -106,7 +112,11 @@ pub(super) fn release(cfg: &Config, id: &str, slot: Slot, wait: Duration) -> Rel
     // the slow parts (subprocesses, deleting files) happen without the ledger lock
     let tap_gone = match slot {
         Slot::None | Slot::Swept => true,
+        #[cfg(target_os = "linux")]
         Slot::Tap(i) => net::tap_down(cfg, i),
+        // no tap on macOS: the network is macnet, and it went with the VMM's group
+        #[cfg(target_os = "macos")]
+        Slot::Tap(_) => true,
         Slot::Unknown => false,
     };
     let jail_gone = remove_tree(&cfg.paths.root.join(VM_DIRS).join(id));
