@@ -195,26 +195,46 @@ fn find_at_line_start(hay: &[u8], needle: &[u8], first_is_line: bool) -> Option<
     None
 }
 
+/// how a shell session went
+pub(super) struct Shell {
+    pub(super) outcome: Outcome,
+    /// what guest init said about the shell's end. None when it said nothing:
+    /// the VM crashed or was reset under the shell
+    pub(super) end: Option<Ended>,
+    /// the terminal reset is queued last on it, to wait on before printing
+    pub(super) screen: Out,
+}
+
+pub(super) struct Ended {
+    pub(super) rc: u8,
+}
+
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
 /// ways. keystrokes go to the VM as they are; what the VM prints goes through a
-/// filter so it can't set titles, the clipboard or anything else on the terminal.
-/// the terminal reset is queued last on the returned Out, which the caller
-/// waits on before it prints anything
+/// filter so it can't set titles, the clipboard or anything else on the terminal
 pub(super) fn relay(
     child: &mut Child,
     token: &str,
     deadline: Deadline,
     cfg: &Config,
     id: &str,
-) -> (Outcome, Out) {
+) -> Shell {
     let screen = Out::new_unescaped(Dest::Stdout);
     let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
-        return (Outcome::Failed, screen);
+        return Shell {
+            outcome: Outcome::Failed,
+            end: None,
+            screen,
+        };
     };
     let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
     // blocking pipes would let a stuck VM freeze the loop that enforces the ttl
     if sys::set_nonblocking(vin_fd).is_err() || sys::set_nonblocking(vout_fd).is_err() {
-        return (Outcome::Failed, screen);
+        return Shell {
+            outcome: Outcome::Failed,
+            end: None,
+            screen,
+        };
     }
     let mut vin = Some(vin);
     sys::restore_tty_on_panic(crate::output::TERM_RESET); // saves the tty before it goes raw
@@ -312,16 +332,26 @@ pub(super) fn relay(
     // that has stopped reading would leave the reset stuck behind it
     screen.drain(Instant::now() + Duration::from_secs(2));
     screen.finish(&filter.reset());
-    (outcome, screen)
+    Shell {
+        outcome,
+        end: end.ended.then(|| Ended {
+            rc: end.rc().unwrap_or(0),
+        }),
+        screen,
+    }
 }
 
-/// watches the shell's console for guest init's end marker. what comes after it
-/// (the guest kernel's reboot line) never reaches the caller's terminal. bytes
-/// that could be the start of the marker wait until it's clear they aren't
+/// watches the shell's console for guest init's end marker, `BURNER-<token>-END`
+/// followed by the shell's exit code and `;` (an image built before that sends
+/// none). what comes after it (the guest kernel's reboot line) never reaches
+/// the caller's terminal. bytes that could be the start of the marker wait
+/// until it's clear they aren't
 struct ShellEnd {
     marker: Vec<u8>,
     held: Vec<u8>,
     ended: bool,
+    /// what came after the marker, up to the `;`
+    tail: Vec<u8>,
 }
 
 impl ShellEnd {
@@ -330,12 +360,14 @@ impl ShellEnd {
             marker: format!("BURNER-{token}-END").into_bytes(),
             held: Vec::new(),
             ended: false,
+            tail: Vec::new(),
         }
     }
 
     /// what can go to the screen now
     fn feed(&mut self, b: &[u8]) -> Vec<u8> {
         if self.ended {
+            self.keep_tail(b);
             return Vec::new();
         }
         let mut buf = std::mem::take(&mut self.held);
@@ -345,6 +377,7 @@ impl ShellEnd {
             .position(|w| w == self.marker)
         {
             self.ended = true;
+            self.keep_tail(&buf[i + self.marker.len()..]);
             buf.truncate(i);
             return buf;
         }
@@ -359,6 +392,22 @@ impl ShellEnd {
     /// nothing more came, so what was held back wasn't the marker
     fn flush(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.held)
+    }
+
+    fn keep_tail(&mut self, b: &[u8]) {
+        if !self.tail.contains(&b';') {
+            let room = 8usize.saturating_sub(self.tail.len());
+            self.tail.extend(b.iter().take(room));
+        }
+    }
+
+    /// the shell's exit code from after the marker, if it sent one
+    fn rc(&self) -> Option<u8> {
+        let n = self.tail.iter().take_while(|b| b.is_ascii_digit()).count();
+        if n == 0 || self.tail.get(n) != Some(&b';') {
+            return None;
+        }
+        std::str::from_utf8(&self.tail[..n]).ok()?.parse().ok()
     }
 }
 
@@ -552,6 +601,29 @@ mod tests {
             b"BURNER-xyz-END\r\n".to_vec()
         );
         assert!(!e.ended);
+    }
+
+    #[test]
+    fn shell_end_exit_code() {
+        let all = b"exit 3\r\nBURNER-abc-END3;[ 1.0] reboot: Restarting system\r\n";
+        for i in 0..=all.len() {
+            let mut e = ShellEnd::new("abc");
+            let mut got = e.feed(&all[..i]);
+            got.extend(e.feed(&all[i..]));
+            assert_eq!(got, b"exit 3\r\n".to_vec(), "split at {i}");
+            assert_eq!(e.rc(), Some(3), "split at {i}");
+        }
+        let rc = |s: &[u8]| {
+            let mut e = ShellEnd::new("abc");
+            e.feed(s);
+            (e.ended, e.rc())
+        };
+        assert_eq!(rc(b"BURNER-abc-END0;"), (true, Some(0)));
+        assert_eq!(rc(b"BURNER-abc-END255;"), (true, Some(255)));
+        // an older guest init sends no code
+        assert_eq!(rc(b"BURNER-abc-END[ 1.0] reboot"), (true, None));
+        assert_eq!(rc(b"BURNER-abc-END256;"), (true, None));
+        assert_eq!(rc(b"BURNER-abc-END12"), (true, None));
     }
 
     #[test]

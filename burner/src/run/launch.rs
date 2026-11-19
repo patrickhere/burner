@@ -376,8 +376,9 @@ fn run_vm(
         .spawn()
         .context("starting the jailer")?;
     if p.shell {
-        let (outcome, screen) = relay(&mut child, &token, deadline, cfg, id);
+        let sh = relay(&mut child, &token, deadline, cfg, id);
         sys::restore_tty(saved_tty.as_ref());
+        let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {
             // the jail and its firecracker.log are gone after teardown
             let tail = tail_of(&jail.join("firecracker.log"), 1500);
@@ -388,30 +389,32 @@ fn run_vm(
         }
         teardown(cfg, id, Some(&mut child));
         *held = None;
-        log_line(&format!(
-            "end {id} tag={} secs={:.1} shell",
-            p.tag,
-            t0.elapsed().as_secs_f64()
-        ));
-        // the terminal reset goes out before any message. a caller's terminal
-        // that stalled gets it once it reads again, the VM is gone by then; a
-        // second signal stops the wait
-        interrupted().store(false, Ordering::Relaxed);
-        screen.wait_last(is_interrupted);
-        return Ok(match outcome {
-            Outcome::Done => {
-                set_status("exited", None);
-                0
-            }
+        let (code, msg) = match outcome {
+            // guest init passes on the shell's exit code. a VM that stopped
+            // without saying so crashed or was reset under the shell
+            Outcome::Done => match sh.end {
+                Some(e) => {
+                    set_status("exited", Some(i32::from(e.rc)));
+                    (e.rc, None)
+                }
+                None => {
+                    set_status("sandbox_error", None);
+                    (
+                        EXIT_SANDBOX,
+                        Some("the VM stopped without the shell ending (a crash or a reset)".into()),
+                    )
+                }
+            },
             Outcome::Detached => {
                 set_status("detached", None);
-                eprintln!("burner: left the shell, VM stopped");
-                0
+                (0, Some("left the shell, VM stopped".into()))
             }
             Outcome::Failed => {
                 set_status("sandbox_error", None);
-                eprintln!("burner: the VM stopped with an error, see the system log");
-                EXIT_SANDBOX
+                (
+                    EXIT_SANDBOX,
+                    Some("the VM stopped with an error, see the system log".into()),
+                )
             }
             Outcome::Timeout => {
                 set_status("timeout", None);
@@ -420,20 +423,34 @@ fn run_vm(
                 } else {
                     format!("{}s", p.ttl)
                 };
-                eprintln!("burner: shell closed at the {limit} limit");
-                EXIT_TIMEOUT
+                (
+                    EXIT_TIMEOUT,
+                    Some(format!("shell closed at the {limit} limit")),
+                )
             }
             Outcome::Cancelled => {
                 set_status("killed", None);
-                eprintln!("burner: killed by burner kill");
-                EXIT_INTERRUPTED
+                (EXIT_INTERRUPTED, Some("killed by burner kill".into()))
             }
             Outcome::Interrupted => {
                 set_status("interrupted", None);
-                eprintln!("burner: interrupted, VM stopped");
-                EXIT_INTERRUPTED
+                (EXIT_INTERRUPTED, Some("interrupted, VM stopped".into()))
             }
-        });
+        };
+        log_line(&format!(
+            "end {id} tag={} secs={:.1} shell code={code}",
+            p.tag,
+            t0.elapsed().as_secs_f64()
+        ));
+        // the terminal reset goes out before any message. a caller's terminal
+        // that stalled gets it once it reads again, the VM is gone by then; a
+        // second signal stops the wait
+        interrupted().store(false, Ordering::Relaxed);
+        sh.screen.wait_last(is_interrupted);
+        if let Some(m) = msg {
+            eprintln!("burner: {m}");
+        }
+        return Ok(code);
     }
     let mut stdout = child.stdout.take().context("no console pipe")?;
 

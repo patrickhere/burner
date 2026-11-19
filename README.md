@@ -32,7 +32,7 @@ that's linux with kvm (x86_64 or arm), or a mac with an M3 or newer, where it se
 
 ## what it does
 
-- `burner shell [image]` -> a login shell on the VM's console, your terminal size passed in. 60 min by default. `~.` after enter leaves and stops the VM, like ssh
+- `burner shell [image]` -> a login shell on the VM's console, your terminal size passed in. 60 min by default. exits with the shell's exit code, 125 if the VM crashed under it. `~.` after enter leaves and stops the VM, like ssh
 - `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https plus dns and ping only, or any port but mail. the LAN, the host and other VMs are always blocked
