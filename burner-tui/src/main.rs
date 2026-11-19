@@ -260,6 +260,14 @@ fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String>
     default(libc::SIGINT);
     default(libc::SIGQUIT);
     enter()?;
+    // keys that came in the same read as the launching enter were parsed into
+    // crossterm's queue before the shell started; they'd act on the TUI at the
+    // next key. they, and anything typed since, are dropped
+    // SAFETY: tcflush on fd 0 only discards its pending input
+    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+    while event::poll(KEY_POLL)? {
+        let _ = event::read()?;
+    }
     term.clear()?;
     let what = match mode {
         Mode::Shell => "shell",
