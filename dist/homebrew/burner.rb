@@ -6,7 +6,7 @@ class Burner < Formula
   # against the tagged commit or the release's build provenance, not taken
   # from what github serves
   url "https://github.com/patrickhere/burner/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "6a8c7f0a3bb95b20a7d04b746ae540109ac334db43fe524e893b72b3eaa69ded"
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/patrickhere/burner.git", branch: "main"
 
@@ -30,7 +30,7 @@ class Burner < Formula
   resource "alpine-image" do
     url "https://github.com/patrickhere/burner/releases/download/v0.2.0/alpine-aarch64.ext4.gz",
         using: :nounzip
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    sha256 "58819cf6982ebdb208531c8a6814e110b0f920fa968f4ffad190dfb5c080783b"
   end
 
   def install
