@@ -152,11 +152,16 @@ impl Out {
     }
 
     pub fn drain(&self, until: Instant) {
+        self.drain_or(until, || false)
+    }
+
+    /// drain, cut short by `give_up`
+    pub fn drain_or(&self, until: Instant, give_up: impl Fn() -> bool) {
         if self.tty && !self.broken.load(Ordering::Relaxed) {
             let mut esc = self.esc.lock().unwrap_or_else(|e| e.into_inner());
             self.send(esc.finish(), Some(until));
         }
-        while Instant::now() < until {
+        while Instant::now() < until && !give_up() {
             if self.queued.load(Ordering::Relaxed) == 0 || self.broken.load(Ordering::Relaxed) {
                 return;
             }

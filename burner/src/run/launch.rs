@@ -414,9 +414,9 @@ fn run_vm(
             size,
         };
         let sh = relay(&mut child, &token, deadline, cfg, id, io);
-        // shutting down from here on: a signal after this point stops any
-        // wait on the caller's terminal
-        let seen = signals();
+        // a signal since the relay stopped stops any wait on the caller's
+        // terminal, the relay's own drain included
+        let seen = sh.seen;
         sys::restore_saved_tty();
         let outcome = sh.outcome;
         if matches!(outcome, Outcome::Failed) {

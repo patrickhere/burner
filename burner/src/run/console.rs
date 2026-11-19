@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdout};
 use std::time::{Duration, Instant};
 
-use super::{Deadline, Outcome, is_interrupted};
+use super::{Deadline, Outcome, is_interrupted, signals};
 use crate::cgroup;
 use crate::config::Config;
 use crate::ledger;
@@ -223,6 +223,9 @@ pub(super) struct Shell {
     pub(super) end: Option<Ended>,
     /// the terminal reset is queued last on it, to wait on before printing
     pub(super) screen: Out,
+    /// the signal count when the session was over: any signal past it stops
+    /// every wait on the caller's terminal from there on
+    pub(super) seen: usize,
 }
 
 /// `burner shell`: the caller's terminal goes raw and burner copies bytes both
@@ -249,21 +252,23 @@ pub(super) fn relay(
         size: sent,
     } = io;
     let screen = Out::new_screen();
-    let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
-        return Shell {
+    let failed = |screen: Out| {
+        let seen = signals();
+        screen.finish_reset();
+        Shell {
             outcome: Outcome::Failed,
             end: None,
             screen,
-        };
+            seen,
+        }
+    };
+    let (Some(vin), Some(mut vout)) = (child.stdin.take(), child.stdout.take()) else {
+        return failed(screen);
     };
     let (vin_fd, vout_fd) = (vin.as_raw_fd(), vout.as_raw_fd());
     // blocking pipes would let a stuck VM freeze the loop that enforces the ttl
     if sys::set_nonblocking(vin_fd).is_err() || sys::set_nonblocking(vout_fd).is_err() {
-        return Shell {
-            outcome: Outcome::Failed,
-            end: None,
-            screen,
-        };
+        return failed(screen);
     }
     let mut vin = Some(vin);
     let started = Instant::now();
@@ -447,6 +452,8 @@ pub(super) fn relay(
             screen.put(&filter.feed(&halt.release()), None);
         }
     };
+    // shutting down from here on
+    let seen = signals();
     // what the guest printed is shown, unless it was the halt line of a guest
     // that did halt
     if !halted {
@@ -459,7 +466,7 @@ pub(super) fn relay(
     };
     // output still queued goes out if the terminal takes it soon; a terminal
     // that has stopped reading would leave the reset stuck behind it
-    screen.drain(Instant::now() + Duration::from_secs(2));
+    screen.drain_or(Instant::now() + Duration::from_secs(2), || signals() > seen);
     screen.finish_reset();
     let end = if halted {
         Some(Ended::PowerOff)
@@ -470,6 +477,7 @@ pub(super) fn relay(
         outcome,
         end,
         screen,
+        seen,
     }
 }
 
