@@ -624,11 +624,25 @@ fn vcpus_asleep(pid: u32) -> Option<u64> {
         if stat.rsplit_once(')')?.1.split_whitespace().next()? != "S" {
             return None;
         }
-        let sched = std::fs::read_to_string(p.join("schedstat")).ok()?;
-        let runs: u64 = sched.split_whitespace().nth(2)?.parse().ok()?;
+        let runs = sched_runs(&std::fs::read_to_string(p.join("schedstat")).ok()?)?;
         total = Some(total.unwrap_or(0) + runs);
     }
     total
+}
+
+/// the run count from a schedstat line, `ns-on-cpu ns-waiting runs`. a
+/// kernel with scheduler accounting off gives 0 0 0 for every thread, and a
+/// count that never moves would look like a halt, so that's no count at all
+fn sched_runs(line: &str) -> Option<u64> {
+    let v: Vec<u64> = line
+        .split_whitespace()
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    match v.as_slice() {
+        [0, 0, 0] => None,
+        [_, _, runs] => Some(*runs),
+        _ => None,
+    }
 }
 
 /// watches the shell's console for guest init's markers and keeps them off the
@@ -1006,6 +1020,14 @@ mod tests {
         let got = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(got.lines().next(), Some("burner-tty 12 9 7 12"));
+    }
+
+    #[test]
+    fn schedstat_lines() {
+        assert_eq!(sched_runs("2187231 30210 42\n"), Some(42));
+        // accounting off
+        assert_eq!(sched_runs("0 0 0\n"), None);
+        assert_eq!(sched_runs("12 0\n"), None);
     }
 
     #[test]
