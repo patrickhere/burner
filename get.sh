@@ -80,13 +80,10 @@ not_linux() {
     case "$(uname -s)" in
         Darwin)
             die "burner runs on linux with kvm, so on a mac it runs inside a linux VM." \
-                "on an M3 or newer with macOS 15 or later:" \
+                "on an M3 or newer with macOS 15 or later, homebrew sets that up:" \
                 "" \
-                "  brew install lima" \
-                "  limactl start --name=burner --vm-type=vz --set '.nestedVirtualization=true' template:ubuntu-24.04" \
-                "  limactl shell burner" \
-                "" \
-                "then run this installer again in there."
+                "  brew install burnervm/tap/burner" \
+                "  burner setup"
             ;;
         MINGW* | MSYS* | CYGWIN* | Windows*)
             die "burner runs on linux with kvm. on windows 11, run this installer inside WSL2" \
