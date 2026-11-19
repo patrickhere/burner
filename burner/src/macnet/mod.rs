@@ -119,6 +119,12 @@ fn nofile(want: libc::rlim_t) {
 /// a running macnet. dropping it stops it and waits for it
 pub struct Proc(Child);
 
+impl Proc {
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
 impl Drop for Proc {
     fn drop(&mut self) {
         let _ = self.0.kill();

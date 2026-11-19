@@ -745,7 +745,9 @@ fn launch(
             // the VMM holds its end now. ours has to go, or macnet would never
             // see it close when the VM stops
             drop(vm_end);
-            match crate::macnet::spawn(cfg, p.net, &s, net_end, child.id()) {
+            let started = crate::macnet::spawn(cfg, p.net, &s, net_end, child.id())
+                .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
+            match started {
                 Ok(n) => Some(n),
                 Err(e) => {
                     let _ = child.kill();
