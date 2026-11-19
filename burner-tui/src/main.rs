@@ -3,27 +3,27 @@
 
 mod app;
 mod burner;
+mod keys;
 mod ui;
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::FromRawFd;
 use std::process::{Command, ExitCode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::KeyEvent;
 use crossterm::{cursor, execute, terminal};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use app::{Action, App, Screen};
 use burner::{Burner, Mode};
+use keys::Keys;
 
 const REFRESH: Duration = Duration::from_secs(2);
-/// crossterm's poll-based source (use-dev-tty) never looks at the tty for a
-/// zero timeout, buffered keys included, so the shortest real one
-const KEY_POLL: Duration = Duration::from_millis(1);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -40,8 +40,18 @@ extern "C" fn on_hup(_: libc::c_int) {
 
 extern "C" fn ignore(_: libc::c_int) {}
 
+/// the write end of the pipe a resize wakes the input poll through
+static WINCH: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_winch(_: libc::c_int) {
+    let fd = WINCH.load(Ordering::Relaxed);
+    // SAFETY: write is async-signal-safe; a full pipe already has a wakeup in it
+    unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
+}
+
 fn handle(sig: libc::c_int, f: extern "C" fn(libc::c_int)) {
-    // SAFETY: the handlers only touch an atomic, call _exit or do nothing
+    // SAFETY: the handlers only touch an atomic, write to a pipe, call _exit or
+    // do nothing
     unsafe { libc::signal(sig, f as libc::sighandler_t) };
 }
 
@@ -50,35 +60,81 @@ fn default(sig: libc::c_int) {
     unsafe { libc::signal(sig, libc::SIG_DFL) };
 }
 
+/// the tty's input and resizes, through one poll: a key, a resize and a
+/// hangup all end the same wait, and no key waits in a queue the poll can't see
+struct Input {
+    keys: Keys,
+    winch: i32,
+}
+
 enum Tty {
-    Input,
+    Keys(Vec<KeyEvent>),
+    /// nothing to read, or the size changed: the next draw picks that up
     Quiet,
     Gone,
 }
 
-/// waits for keys on the tty. crossterm is only asked once there's something
-/// to read, because its own poll spins forever if the tty hangs up meanwhile
-fn wait_tty(ms: i32) -> Tty {
-    let mut p = libc::pollfd {
-        fd: 0,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd
-    let n = unsafe { libc::poll(&mut p, 1, ms) };
-    if n < 0 {
-        return match io::Error::last_os_error().kind() {
-            io::ErrorKind::Interrupted => Tty::Quiet,
-            _ => Tty::Gone,
-        };
+impl Input {
+    fn new() -> io::Result<Input> {
+        let mut p = [0; 2];
+        // SAFETY: a valid array for the two fds
+        if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        WINCH.store(p[1], Ordering::Relaxed);
+        handle(libc::SIGWINCH, on_winch);
+        Ok(Input {
+            keys: Keys::default(),
+            winch: p[0],
+        })
     }
-    if p.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
-        Tty::Gone
-    } else if p.revents & libc::POLLIN != 0 {
-        Tty::Input
-    } else {
-        Tty::Quiet
+
+    fn wait(&mut self, ms: i32) -> Tty {
+        let mut p = [0, self.winch].map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        // SAFETY: two valid pollfds
+        let n = unsafe { libc::poll(p.as_mut_ptr(), 2, ms) };
+        if n < 0 {
+            return match io::Error::last_os_error().kind() {
+                io::ErrorKind::Interrupted => Tty::Quiet,
+                _ => Tty::Gone,
+            };
+        }
+        if p[1].revents & libc::POLLIN != 0 {
+            let mut sink = [0u8; 64];
+            // SAFETY: reads into a local buffer from our own nonblocking pipe
+            while unsafe { libc::read(self.winch, sink.as_mut_ptr().cast(), sink.len()) } > 0 {}
+        }
+        if p[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Tty::Gone;
+        }
+        if p[0].revents & libc::POLLIN == 0 {
+            return Tty::Quiet;
+        }
+        let mut buf = [0u8; 1024];
+        match tty().read(&mut buf) {
+            Ok(0) => Tty::Gone,
+            Ok(n) => Tty::Keys(self.keys.feed(&buf[..n])),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => Tty::Quiet,
+            Err(_) => Tty::Gone,
+        }
     }
+
+    /// everything typed so far is dropped, half a key sequence included
+    fn flush(&mut self) {
+        self.keys.clear();
+        // SAFETY: tcflush on fd 0 only discards its pending input
+        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+    }
+}
+
+/// fd 0 without std's stdin buffer, which would keep what it read ahead
+fn tty() -> std::mem::ManuallyDrop<std::fs::File> {
+    // SAFETY: fd 0 is open (main checked it's a tty) and is never closed here
+    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) })
 }
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
@@ -164,6 +220,7 @@ fn run() -> io::Result<()> {
     handle(libc::SIGTERM, on_stop);
     handle(libc::SIGHUP, on_hup);
 
+    let mut input = Input::new()?;
     let _restore = Restore;
     enter()?;
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -203,19 +260,12 @@ fn run() -> io::Result<()> {
             });
         }
         term.draw(|f| ui::draw(f, &app))?;
-        match wait_tty(200) {
+        let keys = match input.wait(200) {
             Tty::Gone => break,
             Tty::Quiet => continue,
-            Tty::Input => {}
-        }
-        // one read can hold several keys, crossterm keeps the rest buffered
-        while event::poll(KEY_POLL)? {
-            let Event::Key(k) = event::read()? else {
-                continue;
-            };
-            if k.kind != KeyEventKind::Press {
-                continue;
-            }
+            Tty::Keys(k) => k,
+        };
+        for k in keys {
             match app.key(k) {
                 Action::Nothing => {}
                 Action::Quit => break 'main,
@@ -227,7 +277,7 @@ fn run() -> io::Result<()> {
                     });
                 }
                 Action::Launch(argv, mode) => {
-                    app.status = hand_over(&mut term, &argv, mode)?;
+                    app.status = hand_over(&mut term, &mut input, &argv, mode)?;
                     last_ls = None;
                     continue 'main;
                 }
@@ -245,7 +295,12 @@ fn run() -> io::Result<()> {
 const MODES_RESET: &[u8] = b"\x1b7\x1b[?1049l\x1b[r\x1b8\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b(B\x1b)B\x1b[?2004l\x1b[?7h\x1b[4l\x1b[?12l\r\n";
 
 /// gives the real terminal to burner shell or run and takes it back after
-fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String> {
+fn hand_over(
+    term: &mut Term,
+    input: &mut Input,
+    argv: &[String],
+    mode: Mode,
+) -> io::Result<String> {
     leave();
     // burner puts the terminal back when it ends, unless it's killed outright
     // SAFETY: zeroed termios is a valid out-parameter for tcgetattr on fd 0
@@ -275,24 +330,25 @@ fn hand_over(term: &mut Term, argv: &[String], mode: Mode) -> io::Result<String>
     if mode == Mode::Run || !res.as_ref().is_ok_and(|s| s.success()) {
         print!("\n[{msg}, enter goes back to burner-tui] ");
         io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
+        // the tty is canonical again, so one read is one line
+        let mut line = [0u8; 4096];
+        let n = loop {
+            match tty().read(&mut line) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                r => break r?,
+            }
+        };
         // ctrl-d ends the line without echoing a newline
-        if !line.ends_with('\n') {
+        if !line[..n].ends_with(b"\n") {
             println!();
         }
     }
     default(libc::SIGINT);
     default(libc::SIGQUIT);
     enter()?;
-    // keys that came in the same read as the launching enter were parsed into
-    // crossterm's queue before the shell started; they'd act on the TUI at the
-    // next key. they, and anything typed since, are dropped
-    // SAFETY: tcflush on fd 0 only discards its pending input
-    unsafe { libc::tcflush(0, libc::TCIFLUSH) };
-    while event::poll(KEY_POLL)? {
-        let _ = event::read()?;
-    }
+    // keys typed while burner had the terminal, and any that came in the same
+    // read as the launching enter, would act on the TUI: they're dropped
+    input.flush();
     term.clear()?;
     let what = match mode {
         Mode::Shell => "shell",
