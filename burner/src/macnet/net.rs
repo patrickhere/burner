@@ -36,6 +36,10 @@ const DNS_IDLE: StdDuration = StdDuration::from_secs(10);
 const GUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const TX_QUEUE: usize = 1024;
 const RX_BATCH: usize = 256;
+/// replies to what the guest sent may run past TX_QUEUE by one read's worth
+/// and no further: past TX_QUEUE nothing more is read from the VM, and past
+/// this smoltcp gets no more of what was
+const TX_HARD: usize = TX_QUEUE + RX_BATCH;
 
 /// guest port, destination, destination port
 type Key = (u16, Ipv4Addr, u16);
@@ -68,6 +72,9 @@ impl Device for Dev {
     type TxToken<'a> = TxTok<'a>;
 
     fn receive(&mut self, _: Instant) -> Option<(RxTok, TxTok<'_>)> {
+        if self.tx.len() >= TX_HARD {
+            return None;
+        }
         let f = self.rx.pop_front()?;
         Some((RxTok(f), TxTok(&mut self.tx)))
     }
@@ -189,6 +196,7 @@ impl Rate {
 
 enum Verdict {
     Pass,
+    Arp,
     Drop,
     Syn(Key),
 }
@@ -216,6 +224,8 @@ struct Gw<'a> {
     // web mode and 50, burst 100 in open mode, and 20 dns packets a second, burst 50
     new_conns: Bucket,
     dns_rate: Bucket,
+    // the guest only needs the gateway's address, now and then
+    arp_rate: Bucket,
     // guest to host and host to guest
     up: Rate,
     down: Rate,
@@ -294,6 +304,7 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         dns: Vec::new(),
         new_conns,
         dns_rate: Bucket::new(20.0, 50.0),
+        arp_rate: Bucket::new(20.0, 50.0),
         up: Rate::new(args.rate),
         down: Rate::new(args.rate),
         tx_blocked: false,
@@ -372,7 +383,12 @@ impl Gw<'_> {
             events,
             revents: 0,
         };
-        let mut ev = libc::POLLIN;
+        // a guest that doesn't read what it gets is heard again once it does
+        let mut ev = if self.dev.tx.len() < TX_QUEUE {
+            libc::POLLIN
+        } else {
+            0
+        };
         if !self.dev.tx.is_empty() && !self.tx_blocked {
             ev |= libc::POLLOUT;
         }
@@ -407,7 +423,7 @@ impl Gw<'_> {
     }
 
     fn timeout(&mut self) -> libc::c_int {
-        if !self.dev.rx.is_empty() {
+        if !self.dev.rx.is_empty() && self.dev.tx.len() < TX_HARD {
             return 0;
         }
         let now = StdInstant::now();
@@ -430,6 +446,9 @@ impl Gw<'_> {
 
     /// false when the VM's end is gone
     fn read_vm(&mut self, buf: &mut [u8]) -> io::Result<bool> {
+        if self.dev.tx.len() >= TX_QUEUE {
+            return Ok(true);
+        }
         for _ in 0..RX_BATCH {
             let n = unsafe { libc::recv(self.vm, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
             if n > 0 {
@@ -480,7 +499,8 @@ impl Gw<'_> {
     fn ingress(&mut self, frame: &[u8]) {
         match self.classify(frame) {
             Verdict::Pass => self.dev.rx.push_back(frame.to_vec()),
-            Verdict::Drop => {}
+            Verdict::Arp if self.arp_rate.take() => self.dev.rx.push_back(frame.to_vec()),
+            Verdict::Arp | Verdict::Drop => {}
             Verdict::Syn(key) => self.syn(key, frame),
         }
     }
@@ -494,7 +514,7 @@ impl Gw<'_> {
             return Verdict::Drop;
         };
         match eth.ethertype() {
-            EthernetProtocol::Arp => return Verdict::Pass,
+            EthernetProtocol::Arp => return Verdict::Arp,
             EthernetProtocol::Ipv4 => {}
             _ => return Verdict::Drop,
         }
