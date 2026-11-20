@@ -124,6 +124,8 @@ jobs:
           [ "$(uname -m)" = arm64 ]
           rustup toolchain install stable --profile minimal
           rustup default stable
+          # runners ship with brew's auto update off and an older formula list
+          brew update --quiet
           brew install libkrun
       - run: cargo build --locked --release
       - name: package
