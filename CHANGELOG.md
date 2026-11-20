@@ -3,6 +3,7 @@
 ## 0.2.1
 
 - `burner setup` on a mac takes the kernel and image homebrew fetched again. it refused them because homebrew's Cellar is writable by the admin group, whose members can become root anyway. a directory only you, root or the admin group can write counts as safe now, world write and other groups still don't
+- on a mac, the check that the kernel, image and config are safe to use follows symlinks to the real file and checks every directory above that, not the ones above the link
 - homebrew installs a mac build of burner from the release instead of building it, so `brew install` no longer pulls in rust, llvm and z3. `burner-tui` comes with it
 - `poweroff -f`, `halt -f` or `reboot -f` in a run ends it right away, with the output and `/out` up to then, exit 125 and outcome `poweroff` or `reboot`. it used to sit there until the time limit
 - an `--in tar` that doesn't unpack in the VM ends with 125 and outcome `input_error`, not as a command that exited 125

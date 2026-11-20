@@ -394,7 +394,10 @@ pub fn trusted_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid can't fail
     let me = unsafe { libc::getuid() };
-    for p in path.ancestors() {
+    // the directories above the real file, not above a symlink to it: a
+    // trusted path can point into a tree someone else can write
+    let real = fs::canonicalize(path).with_context(|| format!("checking {}", path.display()))?;
+    for p in real.ancestors() {
         let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
         let others_write = mode_lets_others_write(m.mode(), m.gid())
             || acl::lets_others_write(p, me)
@@ -562,6 +565,36 @@ mod mac_tests {
             assert!(in_admin.is_ok(), "{in_admin:?}");
         }
         assert!(world.is_err());
+    }
+
+    #[test]
+    fn trusted_follows_symlinks_to_the_real_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "burner-link-{}",
+            crate::sys::random_hex(6).unwrap()
+        ));
+        let open = base.join("open");
+        let inner = open.join("inner");
+        let safe = base.join("safe");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(inner.join("f"), b"x").unwrap();
+        for (d, m) in [
+            (&base, 0o700),
+            (&safe, 0o700),
+            (&inner, 0o700),
+            (&open, 0o777),
+        ] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(m)).unwrap();
+        }
+        std::os::unix::fs::symlink(&inner, safe.join("link")).unwrap();
+        // the link sits in a safe dir and its target dir is private, but the
+        // dir above the target is world writable
+        let r = super::trusted_file(&safe.join("link").join("f"));
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(r.is_err(), "{r:?}");
     }
 }
 
