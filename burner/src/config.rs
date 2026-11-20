@@ -375,8 +375,20 @@ fn trusted_mac(path: &Path) -> Result<()> {
     }
 }
 
+/// the admin group on macOS. its members can already become root, so a
+/// directory they can write is no weaker than one only root can. homebrew
+/// makes its prefix and Cellar group admin and group writable
+#[cfg(target_os = "macos")]
+const ADMIN_GID: u32 = 80;
+
+/// whether a mode lets anyone but the owner, root or the admin group write
+#[cfg(target_os = "macos")]
+fn mode_lets_others_write(mode: u32, gid: u32) -> bool {
+    mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != ADMIN_GID)
+}
+
 /// a file and every directory above it owned by you or root and writable by
-/// nobody else, by its mode or by an ACL
+/// nobody else but the admin group, by its mode or by an ACL
 #[cfg(target_os = "macos")]
 pub fn trusted_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -384,7 +396,7 @@ pub fn trusted_file(path: &Path) -> Result<()> {
     let me = unsafe { libc::getuid() };
     for p in path.ancestors() {
         let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
-        let others_write = m.mode() & 0o022 != 0
+        let others_write = mode_lets_others_write(m.mode(), m.gid())
             || acl::lets_others_write(p, me)
                 .with_context(|| format!("reading the ACL of {}", p.display()))?;
         if (m.uid() != me && m.uid() != 0) || others_write {
@@ -410,6 +422,7 @@ mod acl {
     const ACL_NEXT_ENTRY: c_int = -1;
     const ACL_EXTENDED_ALLOW: c_int = 1;
     const ID_TYPE_UID: c_int = 0;
+    const ID_TYPE_GID: c_int = 1;
     /// write and append data (add file and subdirectory on a dir), delete,
     /// delete child, write attributes, extended attributes and the ACL, chown
     const WRITES: u64 = 1 << 2 | 1 << 4 | 1 << 5 | 1 << 6 | 1 << 8 | 1 << 10 | 1 << 12 | 1 << 13;
@@ -424,7 +437,8 @@ mod acl {
         fn mbr_uuid_to_id(uu: *const u8, id: *mut libc::id_t, ty: *mut c_int) -> c_int;
     }
 
-    /// true when an allow entry gives anyone but `me` or root any kind of write
+    /// true when an allow entry gives anyone but `me`, root or the admin group
+    /// any kind of write
     pub fn lets_others_write(path: &Path, me: u32) -> io::Result<bool> {
         let p = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
         // SAFETY: a NUL-terminated path; the ACL and each qualifier are freed
@@ -459,8 +473,11 @@ mod acl {
                 if !q.is_null() {
                     acl_free(q);
                 }
-                // a group can hold others, so only a user entry for you or root is fine
-                found = !(ok && ty == ID_TYPE_UID && (who == me || who == 0));
+                // a group can hold others, so only a user entry for you or root
+                // is fine, and the admin group, whose members can become root
+                let fine = (ty == ID_TYPE_UID && (who == me || who == 0))
+                    || (ty == ID_TYPE_GID && who == super::ADMIN_GID);
+                found = !(ok && fine);
             }
             acl_free(acl);
             Ok(found)
@@ -498,7 +515,53 @@ mod acl {
             assert!(with_acl("everyone allow append"));
             assert!(with_acl("group:staff allow writeattr"));
             assert!(with_acl("user:nobody allow delete"));
+            assert!(!with_acl("group:admin allow write"));
+            assert!(with_acl("group:everyone allow write"));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod mac_tests {
+    #[test]
+    fn group_admin_may_write() {
+        use super::mode_lets_others_write as w;
+        // homebrew's Cellar: drwxrwxr-x you:admin
+        assert!(!w(0o40775, super::ADMIN_GID));
+        assert!(!w(0o40755, 20));
+        assert!(w(0o40775, 20));
+        assert!(w(0o40757, super::ADMIN_GID));
+        assert!(w(0o40777, super::ADMIN_GID));
+        assert!(w(0o100664, 0));
+    }
+
+    #[test]
+    fn trusted_under_group_admin() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "burner-trust-{}",
+            crate::sys::random_hex(6).unwrap()
+        ));
+        let f = d.join("f");
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(&f, b"x").unwrap();
+        let mode = |m| std::fs::set_permissions(&d, std::fs::Permissions::from_mode(m)).unwrap();
+        // only where the test runs as a member of admin, as on a mac's first user
+        let admin = std::process::Command::new("chgrp")
+            .arg("admin")
+            .arg(&d)
+            .status()
+            .is_ok_and(|s| s.success());
+        mode(0o775);
+        let in_admin = super::trusted_file(&f);
+        mode(0o777);
+        let world = super::trusted_file(&f);
+        mode(0o700);
+        std::fs::remove_dir_all(&d).unwrap();
+        if admin {
+            assert!(in_admin.is_ok(), "{in_admin:?}");
+        }
+        assert!(world.is_err());
     }
 }
 
