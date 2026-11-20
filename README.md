@@ -139,9 +139,9 @@ tools/build-image alpine         # an image to boot, uses sudo, no docker
 sudo burner doctor
 ```
 
-releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`.
+releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`. the same goes for the mac build homebrew installs, `burner-v*-aarch64-macos.tar.gz`, from 0.2.1 on.
 
-on a mac, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework, no linux VM in between. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. the same `curl ... | sh` line does it for you when it sees a mac, or by hand with homebrew, which builds burner, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs:
+on a mac, burner runs VMs itself with [libkrun](https://github.com/containers/libkrun) on hypervisor.framework, no linux VM in between. that works on any apple silicon mac, M1 and newer, with macOS 15 or later. intel macs aren't supported. the same `curl ... | sh` line does it for you when it sees a mac, or by hand with homebrew, which installs burner as the release workflow built it, signs it for hypervisor.framework and pulls in libkrun and e2fsprogs. no rust needed:
 
 ```
 brew install burnervm/tap/burner

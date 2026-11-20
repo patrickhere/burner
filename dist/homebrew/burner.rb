@@ -1,16 +1,21 @@
 class Burner < Formula
   desc "Throwaway Linux VMs on your own hardware"
   homepage "https://burnervm.dev"
-  # the first release with the macOS port. at release, tools/formula-shas TAG
-  # COMMIT prints the urls and the three sha256s for this file, each checked
-  # against the tagged commit or the release's build provenance, not taken
-  # from what github serves
-  url "https://github.com/patrickhere/burner/archive/refs/tags/v0.2.0.tar.gz"
-  sha256 "6a8c7f0a3bb95b20a7d04b746ae540109ac334db43fe524e893b72b3eaa69ded"
+  # burner and burner-tui as the release workflow built them for apple
+  # silicon, so installing doesn't need rust. at release, tools/formula-shas
+  # TAG COMMIT prints the urls and the three sha256s for this file, each
+  # checked against the release's build provenance or the tagged commit, not
+  # taken from what github serves
+  url "https://github.com/patrickhere/burner/releases/download/v0.2.1/burner-v0.2.1-aarch64-macos.tar.gz"
+  version "0.2.1"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license any_of: ["MIT", "Apache-2.0"]
-  head "https://github.com/patrickhere/burner.git", branch: "main"
 
-  depends_on "rust" => :build
+  head do
+    url "https://github.com/patrickhere/burner.git", branch: "main"
+    depends_on "rust" => :build
+  end
+
   # libkrun only runs guests on apple silicon
   depends_on arch: :arm64
   # mkfs.ext4 for each VM's scratch disk
@@ -22,15 +27,15 @@ class Burner < Formula
   # the release afterwards don't get past brew. the kernel is the one
   # install.sh pins
   resource "guest-kernel" do
-    url "https://github.com/patrickhere/burner/releases/download/v0.2.0/vmlinux-aarch64",
+    url "https://github.com/patrickhere/burner/releases/download/v0.2.1/vmlinux-aarch64",
         using: :nounzip
     sha256 "7e7f3c7073c36e334e33e8a74ae744cea06c914f0ab9303b9e557e4106840da4"
   end
 
   resource "alpine-image" do
-    url "https://github.com/patrickhere/burner/releases/download/v0.2.0/alpine-aarch64.ext4.gz",
+    url "https://github.com/patrickhere/burner/releases/download/v0.2.1/alpine-aarch64.ext4.gz",
         using: :nounzip
-    sha256 "58819cf6982ebdb208531c8a6814e110b0f920fa968f4ffad190dfb5c080783b"
+    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   end
 
   def install
@@ -41,11 +46,20 @@ class Burner < Formula
     if Formula["libkrun"].version < libkrun_min
       odie "burner needs libkrun #{libkrun_min} or newer: brew upgrade libkrun"
     end
-    ENV["LIBKRUN_LIB_DIR"] = formula_opt_lib("libkrun")
-    system "cargo", "install", *std_cargo_args(path: "burner")
+    libkrun = "#{formula_opt_lib("libkrun")}/libkrun.1.dylib"
+    if build.head?
+      ENV["LIBKRUN_LIB_DIR"] = formula_opt_lib("libkrun")
+      system "cargo", "install", *std_cargo_args(path: "burner")
+      entitlements = "dist/macos/burner.entitlements"
+    else
+      bin.install "burner", "burner-tui"
+      entitlements = "burner.entitlements"
+      # built against libkrun in /opt/homebrew, brew's prefix on apple silicon
+      built = "/opt/homebrew/opt/libkrun/lib/libkrun.1.dylib"
+      system "install_name_tool", "-change", built, libkrun, bin/"burner" if built != libkrun
+    end
     # hypervisor.framework only makes VMs for a binary signed with this entitlement
-    system "codesign", "--force", "--sign", "-",
-           "--entitlements", "dist/macos/burner.entitlements", bin/"burner"
+    system "codesign", "--force", "--sign", "-", "--entitlements", entitlements, bin/"burner"
     resource("guest-kernel").stage { pkgshare.install "vmlinux-aarch64" }
     resource("alpine-image").stage { pkgshare.install "alpine-aarch64.ext4.gz" }
   end
@@ -61,6 +75,7 @@ class Burner < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/burner --version")
+    assert_match version.to_s, shell_output("#{bin}/burner-tui --version") unless build.head?
     assert_match "com.apple.security.hypervisor",
                  shell_output("codesign -d --entitlements - --xml #{bin}/burner 2>/dev/null")
     assert_match "https:// or file://", shell_output("#{bin}/burner setup --from ftp://example.com 2>&1", 1)

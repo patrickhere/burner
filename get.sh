@@ -105,7 +105,7 @@ mac() {
         run "upgrading with homebrew" brew upgrade burnervm/tap/burner
         ok "homebrew" "burnervm/tap/burner, up to date"
     else
-        run "installing with homebrew, it builds burner, a few minutes" brew install burnervm/tap/burner
+        run "installing with homebrew" brew install burnervm/tap/burner
         ok "homebrew" "burnervm/tap/burner, with libkrun"
     fi
     run "installing the guest kernel and alpine image" burner setup

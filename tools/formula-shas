@@ -4,12 +4,12 @@
 # just what github serves right now:
 # - the tag has to point at the commit you name, the one you tagged yourself:
 #   a tag fetched from github would only check github against itself
-# - the source tarball has to unpack to exactly what git archive makes of that
-#   commit in this checkout
+# - the mac build, the kernel and the image need build provenance from this
+#   repo's release workflow, run for that tag at that commit (gh attestation
+#   verify, needs gh)
+# - the mac build has to be burner and burner-tui for that tag
 # - the kernel has to be the one install.sh pins at that commit
-# - the kernel and the image need build provenance from this repo's release
-#   workflow, run for that tag (gh attestation verify, needs gh)
-#   tools/formula-shas v0.2.0 COMMIT
+#   tools/formula-shas v0.2.1 COMMIT
 set -eu
 usage="usage: tools/formula-shas TAG COMMIT"
 tag="${1:?$usage}"
@@ -30,30 +30,25 @@ have=$(git -C "$src" rev-parse -q --verify "refs/tags/$tag^{commit}") || die "no
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-tarball="https://github.com/$repo/archive/refs/tags/$tag.tar.gz"
-get "$tarball" "$work/src.tar.gz"
-mkdir "$work/github" "$work/tag"
-tar -xzf "$work/src.tar.gz" -C "$work/github"
-git -C "$src" archive --prefix=src/ "$want" | tar -xf - -C "$work/tag"
-set -- "$work"/github/*
-if [ $# != 1 ] || [ ! -d "$1" ]; then
-    die "github's tarball for $tag isn't one directory"
-fi
-diff -r "$1" "$work/tag/src" >/dev/null || die "github's tarball for $tag doesn't match the tag here"
-
 base="https://github.com/$repo/releases/download/$tag"
-for f in vmlinux-aarch64 alpine-aarch64.ext4.gz; do
+mac="burner-$tag-aarch64-macos"
+for f in "$mac.tar.gz" vmlinux-aarch64 alpine-aarch64.ext4.gz; do
     get "$base/$f" "$work/$f"
     gh attestation verify "$work/$f" -R "$repo" \
         --signer-workflow "$repo/.github/workflows/release.yml" \
         --source-ref "refs/tags/$tag" --source-digest "$want" >/dev/null ||
         die "$f has no build provenance from $repo's release workflow for $tag"
 done
+list=$(tar -tzf "$work/$mac.tar.gz") || die "$mac.tar.gz doesn't unpack"
+for f in burner burner-tui burner.entitlements; do
+    printf '%s\n' "$list" | grep -qx "$mac/$f" || die "$mac.tar.gz has no $mac/$f"
+done
 pin=$(git -C "$src" show "$want:install.sh" | sed -n '/^    aarch64)/,/;;/s/.*KERNEL_SHA=\([0-9a-f]*\).*/\1/p')
 [ "$(sha "$work/vmlinux-aarch64")" = "$pin" ] || die "the release's kernel isn't the one install.sh pins at $tag"
 
-echo "url     $tarball"
-echo "sha256  $(sha "$work/src.tar.gz")"
+echo "url     $base/$mac.tar.gz"
+echo "version ${tag#v}"
+echo "sha256  $(sha "$work/$mac.tar.gz")"
 echo
 echo "resource \"guest-kernel\""
 echo "url     $base/vmlinux-aarch64"
