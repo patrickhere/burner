@@ -1,5 +1,18 @@
 # changelog
 
+## 0.2.1
+
+- `burner setup` on a mac takes the kernel and image homebrew fetched again. it refused them because homebrew's Cellar is writable by the admin group, whose members can become root anyway. a directory only you, root or the admin group can write counts as safe now, world write and other groups still don't
+- homebrew installs a mac build of burner from the release instead of building it, so `brew install` no longer pulls in rust, llvm and z3. `burner-tui` comes with it
+- `poweroff -f`, `halt -f` or `reboot -f` in a run ends it right away, with the output and `/out` up to then, exit 125 and outcome `poweroff` or `reboot`. it used to sit there until the time limit
+- an `--in tar` that doesn't unpack in the VM ends with 125 and outcome `input_error`, not as a command that exited 125
+- a config that doesn't load ends a run with 125 and a `--status-fd` line, where it was 1 and no line
+- giving up after 10 min waiting for a slot is outcome `busy`, the same as `--no-wait`
+- `burner net` on a mac exits 2, there's nothing for it to set up there
+- the test suites got stricter: the memory bomb has to grow under any awk, and a network probe whose tool is missing fails instead of counting as blocked
+- the release tarballs no longer carry the lima wrapper from 0.1.x
+- images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
+
 ## 0.2.0
 
 - native on apple silicon: any M1 or newer with macOS 15 or later. no linux VM in between, burner boots each VM itself with libkrun on hypervisor.framework and runs as you, no sudo
