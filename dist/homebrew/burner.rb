@@ -8,7 +8,7 @@ class Burner < Formula
   # taken from what github serves
   url "https://github.com/patrickhere/burner/releases/download/v0.2.1/burner-v0.2.1-aarch64-macos.tar.gz"
   version "0.2.1"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  sha256 "3d237045f640331817b81c2cb790372b199762f71c5e4d7ef188aac9f8ee1e13"
   license any_of: ["MIT", "Apache-2.0"]
 
   head do
@@ -35,7 +35,7 @@ class Burner < Formula
   resource "alpine-image" do
     url "https://github.com/patrickhere/burner/releases/download/v0.2.1/alpine-aarch64.ext4.gz",
         using: :nounzip
-    sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+    sha256 "aeaed32e8bb66834f894bdc1789cc27048476570921e2c6c5afd6bacb80756e1"
   end
 
   def install
