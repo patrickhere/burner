@@ -251,7 +251,7 @@ fn run_vm(
             net: _net,
     } = launch(cfg, p, id, &job, net_slot, uid, size)?;
     // an image built with another guest init doesn't say when its shell is
-    // ready for keys, and never writes result/fail itself
+    // ready for keys, and never writes result/fail or result/ended itself
     let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
         .ok()
         .as_deref()
@@ -477,6 +477,21 @@ fn run_vm(
                     },
                     None,
                 );
+            }
+            // the command powered off or rebooted the VM before it exited. its
+            // rc of 125 is for burners that don't read result/ended
+            let ended = match meta.ended.as_deref() {
+                Some("poweroff") => Some(("poweroff", "powered the VM off")),
+                Some("reboot") => Some(("reboot", "rebooted the VM")),
+                _ => None,
+            };
+            if let (Some(_), Some((outcome, what)), false) = (meta.rc, ended, legacy) {
+                diag.put(
+                    format!("burner: the command {what} before it exited\n").as_bytes(),
+                    None,
+                );
+                code = EXIT_SANDBOX;
+                set_status(outcome, None);
             }
             if meta.timed_out {
                 diag.put(

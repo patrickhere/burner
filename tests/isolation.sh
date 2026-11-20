@@ -77,7 +77,9 @@ for i in range(3): add(f"out/deep/{'x' * 200}/{i}", b"y")
 ti = tarfile.TarInfo("out/nan"); ti.size = 0; ti.pax_headers = {"mtime": "nan"}; t.addfile(ti, io.BytesIO(b""))
 t.close()
 EOF
-sudo burner run --in stdin --result tar -- 'cat > /dev/vdd; sync; reboot -f' < "$T/evil.tar" > "$T/res.tar" 2>"$T/res.err"; rc=$?
+# sysrq b stops the kernel itself: reboot -f in the job ends only the job's
+# pid namespace, and guest init would then write a real result over this one
+sudo burner run --in stdin --result tar -- 'cat > /dev/vdd; sync; echo b > /proc/sysrq-trigger' < "$T/evil.tar" > "$T/res.tar" 2>"$T/res.err"; rc=$?
 list=$(tar -tvf "$T/res.tar" 2>&1)
 if echo "$list" | grep -q 'out/fine.txt' && ! echo "$list" | grep -qE 'escape|evil|up\.txt|link|hard|dev|^-rws|^c|^l|^h'; then
   ok "hostile result tar: only safe entries passed through (rc=$rc)"
@@ -85,7 +87,7 @@ else bad "hostile result tar" "rc=$rc list=$(echo "$list" | tr '\n' ';')"; fi
 ls /tmp/escape.txt /escape.txt /etc/evil.txt /up.txt 2>/dev/null && bad "hostile tar wrote on host" "files exist"
 
 # 7 garbage in the result disk
-sudo burner run -- 'head -c 5000000 /dev/urandom > /dev/vdd; sync; reboot -f' </dev/null >/dev/null 2>"$T/g.err"; rc=$?
+sudo burner run -- 'head -c 5000000 /dev/urandom > /dev/vdd; sync; echo b > /proc/sysrq-trigger' </dev/null >/dev/null 2>"$T/g.err"; rc=$?
 [ "$rc" = 125 ] && ok "random bytes on the result disk -> clean sandbox error" || bad "garbage result" "rc=$rc $(cat "$T/g.err")"
 
 # 8 big output: first 64K live, the rest from the log, last 16M kept
@@ -289,6 +291,26 @@ e=$(date +%s)
   && [ "$r3" = 125 ] && grep -q 'crash' "$T/sh-c.out" \
   && ok "shell exit code 3, poweroff -f ends it, a panic is 125 ($((e - s))s)" \
   || bad "shell endings" "exit3=$r1 poweroff=$r2 panic=$r3 $(tr -d '\r' < "$T/sh-b.out" | tail -n 2 | tr '\n' ' ')"
+
+# 25b poweroff -f, halt -f and reboot -f in a run end it right away (not at the
+# ttl) with their own outcome and 125, with the output and /out up to then. a
+# mount the job made on /out still comes back, and a command's own exit 130
+# isn't taken for a poweroff
+s=$(date +%s)
+sudo burner run --ttl 60s --result tar --status-fd 2 -- 'echo before; mount -t tmpfs t /out; echo kept > /out/f; poweroff -f; echo after' \
+  </dev/null > "$T/off.tar" 2>"$T/off.err"; r1=$?
+sudo burner run --ttl 60s --status-fd 2 -- 'halt -f' </dev/null >/dev/null 2>"$T/halt.err"; r2=$?
+o3=$(sudo burner run --ttl 60s --status-fd 2 -- 'echo before; reboot -f; echo after' </dev/null 2>"$T/rb.err"); r3=$?
+o4=$(sudo burner run --ttl 60s --status-fd 2 -- 'echo own; exit 130' </dev/null 2>"$T/own.err"); r4=$?
+e=$(date +%s)
+st() { tail -n 1 "$1" | grep -o '"outcome":"[a-z_]*"' | cut -d'"' -f4; }
+[ "$r1" = 125 ] && [ "$(st "$T/off.err")" = poweroff ] && grep -q 'powered the VM off' "$T/off.err" \
+  && [ "$(tar -xOf "$T/off.tar" out/f 2>/dev/null)" = kept ] && [ "$(tar -xOf "$T/off.tar" log.txt 2>/dev/null)" = before ] \
+  && [ "$r2" = 125 ] && [ "$(st "$T/halt.err")" = poweroff ] \
+  && [ "$r3" = 125 ] && [ "$(st "$T/rb.err")" = reboot ] && [ "$o3" = before ] \
+  && [ "$r4" = 130 ] && [ "$(st "$T/own.err")" = exited ] && [ "$o4" = own ] && [ $((e - s)) -le 40 ] \
+  && ok "poweroff, halt and reboot -f end a run right away, /out comes back ($((e - s))s)" \
+  || bad "run poweroff" "off=$r1:$(st "$T/off.err") halt=$r2:$(st "$T/halt.err") reboot=$r3:$(st "$T/rb.err"):$o3 own=$r4:$(st "$T/own.err") secs=$((e - s)) $(tr '\n' ' ' < "$T/off.err" | head -c 200)"
 
 # 26 ctrl-c while a shell's VM is set up or boots stops it, instead of reaching
 # a guest console with nothing on it yet. early: a fast box boots in under 1s

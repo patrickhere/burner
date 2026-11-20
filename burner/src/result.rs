@@ -46,6 +46,10 @@ pub struct Meta {
     /// result/fail: the command never ran
     #[serde(default)]
     pub fail: Option<String>,
+    /// how the command ended when it didn't exit: poweroff or reboot, from
+    /// result/ended
+    #[serde(default)]
+    pub ended: Option<String>,
 }
 
 /// reads exactly `left` bytes or fails: a member whose body runs past the end
@@ -180,12 +184,14 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
             .map(|c| if c.is_control() { '?' } else { c })
             .collect()
     });
-    meta.fail = meta.fail.map(|f| {
+    let word = |f: String| {
         f.chars()
             .filter(char::is_ascii_lowercase)
             .take(16)
             .collect()
-    });
+    };
+    meta.fail = meta.fail.map(word);
+    meta.ended = meta.ended.map(word);
     if meta.rc.is_none() && !meta.fatal {
         meta.fatal = true;
         meta.problem
@@ -412,6 +418,9 @@ fn walk(
             "result/proto" if size <= 8 => meta.proto = read_small(&mut e)?.trim().parse().ok(),
             "result/timed_out" => meta.timed_out = true,
             "result/fail" if size <= 16 => meta.fail = Some(read_small(&mut e)?.trim().to_string()),
+            "result/ended" if size <= 16 => {
+                meta.ended = Some(read_small(&mut e)?.trim().to_string())
+            }
             "result/log_skipped" if size <= 20 => {
                 meta.skipped = read_small(&mut e)?.trim().parse().unwrap_or(0)
             }
@@ -574,7 +583,18 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!((fail.rc, fail.fail.as_deref()), (Some(125), Some("input")));
-        assert_eq!(ok.fail, None);
+        assert_eq!((ok.fail, ok.ended), (None, None));
+        let off = walk_bytes(&tar_of(&[
+            ("result/rc", b"125\n"),
+            ("result/ended", b"poweroff\n"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            (off.rc, off.ended.as_deref()),
+            (Some(125), Some("poweroff"))
+        );
+        let big = walk_bytes(&tar_of(&[("result/ended", &[b'a'; 17])])).unwrap();
+        assert_eq!(big.ended, None);
     }
 
     fn with_type(t: tar::EntryType, size: u64) -> Vec<u8> {

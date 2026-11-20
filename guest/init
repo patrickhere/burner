@@ -69,6 +69,18 @@ if [ "${1:-}" = shellns ]; then
     exit 0
 fi
 
+# pid 1 of a run job's own pid namespace, the job its child. poweroff, halt
+# and reboot with -f end only the namespace, and init still sends back the
+# log and /out. the job's exit code goes in result/jobrc, since unshare
+# passes a pid 1 that reboot(2) ended on as SIGINT or SIGHUP, which looks
+# like a command's 130 or 129
+if [ "${1:-}" = jobns ]; then
+    exec 2>&3 3>&-
+    /bin/sh /job/run.sh
+    echo $? > /result/jobrc
+    exit 0
+fi
+
 if [ "${1:-}" != stage2 ]; then
     mount -t proc proc /proc
     mount -t devtmpfs dev /dev 2>/dev/null
@@ -260,6 +272,40 @@ strays() {
     done
 }
 
+# signal $1 to the job's process group $2, all but unshare at its head and pid
+# 1 of the job's namespace: either one going would end the job's namespace
+# before the job had its say
+jobkill() {
+    for d in /proc/[0-9]*; do
+        p=${d#/proc/}
+        st=$(cat "$d/stat" 2>/dev/null) || continue
+        st=${st##*) }
+        # state ppid pgrp ...
+        # shellcheck disable=SC2086
+        set -- "$1" "$2" $st
+        if [ "$5" = "$2" ] && [ "$p" != "$2" ] && [ "$4" != "$2" ]; then
+            kill "-$1" "$p" 2>/dev/null
+        fi
+    done
+}
+
+# how the job in its namespace ended, from unshare's exit code $1: what the
+# job exited with, or poweroff or reboot in result/ended. those two get rc
+# 125 for burners that don't read result/ended
+jobend() {
+    rm -f /result/ended
+    if [ -s /result/jobrc ]; then
+        cat /result/jobrc > /result/rc
+    else
+        case $1 in
+            130) echo poweroff > /result/ended; echo 125 > /result/rc ;;
+            129) echo reboot > /result/ended; echo 125 > /result/rc ;;
+            *) echo "$1" > /result/rc ;;
+        esac
+    fi
+    rm -f /result/jobrc
+}
+
 if [ "$want" != "$PROTO" ]; then
     fail proto "this image's guest init speaks protocol $PROTO and burner wants ${want:-none}, rebuild the image with tools/build-image"
 elif ! tar -x -C /job -f /dev/vdc 2>/dev/null || [ ! -f /job/run.sh ]; then
@@ -271,6 +317,14 @@ else
     stdin=/dev/null; [ -f /job/stdin ] && stdin=/job/stdin
     cd /work || cd /
     export HOME=/root TERM=dumb LANG=C.UTF-8 BURNER=1
+    # the job gets a pid namespace of its own where it can, so poweroff -f in
+    # it doesn't stop the kernel under burner. / is shared first, so what the
+    # job mounts (on /out, say) is still there for init to send back
+    jobns=""
+    if mount --make-rshared / 2>/dev/null \
+        && unshare -m -p -f --propagation shared --mount-proc true 2>/dev/null; then
+        jobns=1
+    fi
     echo "BURNER-$token-BEGIN"
     # the serial console is slow (nested virt), so only the first 64K goes out live.
     # the log goes back on the result disk and the host prints the rest
@@ -282,12 +336,25 @@ else
             : > /result/timed_out
             pg=$(cat /result/jobpid 2>/dev/null)
             [ -n "$pg" ] || exit 0
-            kill -TERM -"$pg" 2>/dev/null; sleep 3; kill -KILL -"$pg" 2>/dev/null
+            if [ -n "$jobns" ]; then
+                jobkill TERM "$pg"; sleep 3; jobkill KILL "$pg"; sleep 1
+            else
+                kill -TERM -"$pg" 2>/dev/null; sleep 3
+            fi
+            kill -KILL -"$pg" 2>/dev/null
         ) &
         watchdog=$!
     fi
-    # shellcheck disable=SC2016
-    { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec /bin/sh /job/run.sh' < "$stdin"; echo $? > /result/rc; strays; } 2>&1 | capture
+    if [ -n "$jobns" ]; then
+        # the job's stderr goes in on fd 3 and pid 1 there puts it back. this
+        # shell says Hangup on the stderr it gives unshare when a reboot -f
+        # ends the namespace, so that one goes nowhere
+        # shellcheck disable=SC2016
+        { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec unshare -m -p -f --propagation shared --mount-proc /bin/sh /sbin/burner-init jobns' < "$stdin" 3>&2 2>/dev/null; jobend $?; strays; } 2>&1 | capture
+    else
+        # shellcheck disable=SC2016
+        { setsid /bin/sh -c 'echo $$ > /result/jobpid; exec /bin/sh /job/run.sh' < "$stdin"; echo $? > /result/rc; strays; } 2>&1 | capture
+    fi
     [ -n "${watchdog:-}" ] && kill "$watchdog" 2>/dev/null
     live=$(wc -c < /result/head 2>/dev/null || echo 0)
     read -r total n < /result/total 2>/dev/null || { total=0; n=0; }
