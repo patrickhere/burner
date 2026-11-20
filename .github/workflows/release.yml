@@ -1,8 +1,8 @@
 # a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
 # and what it needs, and publishes them with SHA256SUMS and build provenance as a
-# github release. for burner on apple silicon, which builds its own binary, the
-# release also carries the arm guest kernel, a ready alpine image and the list
-# of packages in that image
+# github release. for burner on apple silicon the release also carries a mac
+# build for the homebrew formula, the arm guest kernel, a ready alpine image
+# and the list of packages in that image
 name: release
 
 on:
@@ -108,8 +108,49 @@ jobs:
             out/alpine-aarch64.packages
           if-no-files-found: error
 
+  # burner and burner-tui for apple silicon, linked against homebrew's
+  # libkrun, so the formula doesn't need rust (and llvm) to build them. not
+  # signed: the formula signs burner with the hypervisor entitlement when it
+  # installs it
+  macos-build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: toolchain and libkrun
+        run: |
+          [ "$(uname -m)" = arm64 ]
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          brew install libkrun
+      - run: cargo build --locked --release
+      - name: package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          name="burner-$TAG-aarch64-macos"
+          d="pkg/$name"
+          mkdir -p "$d"
+          install -m 0755 target/release/burner target/release/burner-tui "$d/"
+          cp dist/macos/burner.entitlements README.md LICENSE-MIT LICENSE-APACHE SECURITY.md "$d/"
+          chmod -R u=rwX,go=rX "$d"
+          for b in burner burner-tui; do
+            file "$d/$b" | tee /dev/stderr | grep -q 'Mach-O 64-bit executable arm64'
+            "$d/$b" --version
+          done
+          otool -L "$d/burner" | tee /dev/stderr | grep -q "$(brew --prefix)/opt/libkrun/lib/libkrun"
+          COPYFILE_DISABLE=1 tar -C pkg --uid 0 --gid 0 --uname root --gname wheel -cf - "$name" | gzip -9n > "$name.tar.gz"
+          tar -tzvf "$name.tar.gz"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: burner-macos-build
+          path: burner-*-aarch64-macos.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [build, macos-assets]
+    needs: [build, macos-assets, macos-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -127,10 +168,13 @@ jobs:
           path: out
           merge-multiple: true
       - name: checksums
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           cd out
           tarballs=(burner-*.tar.gz)
-          [ "${#tarballs[@]}" = 2 ] || { echo "expected 2 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
+          [ "${#tarballs[@]}" = 3 ] || { echo "expected 3 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
+          [ -f "burner-$TAG-aarch64-macos.tar.gz" ] || { echo "no mac build" >&2; exit 1; }
           sha256sum burner-*.tar.gz vmlinux-aarch64 alpine-aarch64.ext4.gz alpine-aarch64.packages > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
