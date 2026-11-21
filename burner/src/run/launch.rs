@@ -38,11 +38,11 @@ const STDIN_TOTAL: Duration = Duration::from_secs(600);
 const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(target_os = "linux")]
-const VMM: &str = "firecracker";
+pub const VMM: &str = "firecracker";
 #[cfg(target_os = "macos")]
-const VMM: &str = "libkrun";
+pub const VMM: &str = "libkrun";
 /// the guest init protocol this burner speaks (guest/init has the same number)
-const GUEST_PROTO: u32 = 1;
+pub const GUEST_PROTO: u32 = 1;
 
 /// how long the guest lets the job run: a little under the VM's limit, so a job
 /// that runs long still gets its log and /out written before the host kills it

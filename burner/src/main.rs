@@ -49,6 +49,8 @@ enum Cmd {
     Kill { id: String },
     /// list installed images
     Images,
+    /// this burner's version, backend and the json and guest protocol it speaks
+    Version,
     /// fetch the guest kernel and alpine image from a release and install them
     #[cfg(target_os = "macos")]
     Setup(setup::SetupArgs),
@@ -133,6 +135,7 @@ impl Cmd {
             Cmd::Ls => "ls",
             Cmd::Kill { .. } => "kill",
             Cmd::Images => "images",
+            Cmd::Version => "version",
             #[cfg(target_os = "macos")]
             Cmd::Setup(_) => "setup",
             Cmd::Reap => "reap",
@@ -199,13 +202,24 @@ fn command_word(args: &[String]) -> Option<&'static str> {
     };
     [
         "config", "doctor", "run", "shell", "net up", "net down", "net show", "ls", "kill",
-        "images", "setup",
+        "images", "setup", "version",
     ]
     .into_iter()
     .find(|c| *c == full)
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    // needs no config: what a remote burner asks first
+    if let Cmd::Version = cli.cmd {
+        let v = json::Version::this();
+        if !cli.json {
+            println!(
+                "burner {} ({}, {} {}, json schema {}, guest protocol {})",
+                v.version, v.backend, v.os, v.arch, v.schema, v.guest_proto
+            );
+        }
+        return Ok(json::reply("version", 0, Some(v)));
+    }
     let t0 = Instant::now();
     // a shell is a run with the caller's terminal from here on
     let run_args = match &cli.cmd {
@@ -304,6 +318,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reap => run::reap(&cfg),
+        Cmd::Version => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),

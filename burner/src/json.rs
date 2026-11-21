@@ -99,6 +99,30 @@ impl<'a, T: Serialize> Envelope<'a, T> {
     }
 }
 
+/// what another burner needs to know about this one before it sends it work
+#[derive(Serialize)]
+pub struct Version {
+    pub version: &'static str,
+    pub schema: u32,
+    pub guest_proto: u32,
+    pub backend: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+}
+
+impl Version {
+    pub fn this() -> Version {
+        Version {
+            version: env!("CARGO_PKG_VERSION"),
+            schema: SCHEMA,
+            guest_proto: crate::run::GUEST_PROTO,
+            backend: crate::run::VMM,
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        }
+    }
+}
+
 static ON: OnceLock<bool> = OnceLock::new();
 static NOTED: Mutex<(Vec<Problem>, Vec<Problem>)> = Mutex::new((Vec::new(), Vec::new()));
 
@@ -204,6 +228,17 @@ mod tests {
             e.line(),
             r#"{"schema":1,"burner":"0.3.0","command":"kill","host":null,"exit":1,"ok":false,"result":null,"errors":[{"kind":"not_found","message":"no VM with that id"}],"warnings":[]}"#.to_string() + "\n"
         );
+    }
+
+    #[test]
+    fn version_json() {
+        let v = serde_json::to_value(Version::this()).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            ["arch", "backend", "guest_proto", "os", "schema", "version"]
+        );
+        assert_eq!(v["schema"], SCHEMA);
     }
 
     #[test]
