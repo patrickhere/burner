@@ -1,8 +1,8 @@
 # a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
 # and what it needs, and publishes them with SHA256SUMS and build provenance as a
-# github release. for burner on apple silicon the release also carries a mac
-# build for the homebrew formula, the arm guest kernel, a ready alpine image
-# and the list of packages in that image
+# github release. the release also carries the debian image for both arches, and
+# for burner on apple silicon a mac build for the homebrew formula, the arm guest
+# kernel and a ready alpine image. each image comes with the list of packages in it
 name: release
 
 on:
@@ -65,30 +65,46 @@ jobs:
           path: burner-*.tar.gz
           if-no-files-found: error
 
-  # what burner setup fetches on a mac: the kernel install.sh pins, and the alpine
-  # image from tools/build-image, both for aarch64
-  macos-assets:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 20
+  # the images, built with tools/build-image on each arch: debian for both,
+  # and what burner setup fetches on a mac, the kernel install.sh pins and
+  # the alpine image for aarch64
+  images:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      ARCH: ${{ matrix.arch }}
+      BURNER_ROOT: ${{ runner.temp }}/burner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: mmdebstrap
+        run: |
+          [ "$(uname -m)" = "$ARCH" ]
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mmdebstrap
+          mkdir -p out
       - name: guest kernel
+        if: matrix.arch == 'aarch64'
         run: |
           build=$(sed -n 's/^KERNEL_BUILD=//p' install.sh)
           ver=$(sed -n 's/^KERNEL_VERSION=//p' install.sh)
           sha=$(sed -n '/^    aarch64)/,/;;/s/.*KERNEL_SHA=\([0-9a-f]*\).*/\1/p' install.sh)
           [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "no aarch64 kernel sha256 in install.sh" >&2; exit 1; }
-          mkdir -p out
           curl -fsSL --proto =https --retry 3 -o out/vmlinux-aarch64 \
             "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$build/aarch64/vmlinux-$ver"
           echo "$sha  out/vmlinux-aarch64" | sha256sum -c -
       - name: alpine image
-        env:
-          BURNER_ROOT: ${{ runner.temp }}/burner
+        if: matrix.arch == 'aarch64'
         run: |
-          [ "$(uname -m)" = aarch64 ]
           tools/build-image alpine
           gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > out/alpine-aarch64.ext4.gz
           # apk installs whatever the mirror has today, so this is the record of
@@ -97,14 +113,18 @@ jobs:
           cp "$BURNER_ROOT/images/alpine/packages" out/alpine-aarch64.packages
           grep -q '^apk-tools ' out/alpine-aarch64.packages || { echo "no package list from the image" >&2; exit 1; }
           cat out/alpine-aarch64.packages
+      - name: debian image
+        run: |
+          # fails unless the packages match images/debian/lock-$ARCH
+          tools/build-image debian
+          gzip -9n -c "$BURNER_ROOT/images/debian/rootfs.ext4" > "out/debian-$ARCH.ext4.gz"
+          cp "$BURNER_ROOT/images/debian/packages" "out/debian-$ARCH.packages"
+          cmp "out/debian-$ARCH.packages" "images/debian/lock-$ARCH"
           ls -l out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: burner-macos
-          path: |
-            out/vmlinux-aarch64
-            out/alpine-aarch64.ext4.gz
-            out/alpine-aarch64.packages
+          name: burner-images-${{ matrix.arch }}
+          path: out/*
           if-no-files-found: error
 
   # burner and burner-tui for apple silicon, linked against homebrew's
@@ -151,7 +171,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build, macos-assets, macos-build]
+    needs: [build, images, macos-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -176,15 +196,21 @@ jobs:
           tarballs=(burner-*.tar.gz)
           [ "${#tarballs[@]}" = 3 ] || { echo "expected 3 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
           [ -f "burner-$TAG-aarch64-macos.tar.gz" ] || { echo "no mac build" >&2; exit 1; }
-          sha256sum burner-*.tar.gz vmlinux-aarch64 alpine-aarch64.ext4.gz alpine-aarch64.packages > SHA256SUMS
+          # a missing image fails the release instead of shipping without it
+          for f in vmlinux-aarch64 {alpine-aarch64,debian-x86_64,debian-aarch64}.{ext4.gz,packages}; do
+            [ -f "$f" ] || { echo "no $f" >&2; exit 1; }
+          done
+          images=(*.ext4.gz)
+          [ "${#images[@]}" = 3 ] || { echo "expected 3 images, got: ${images[*]}" >&2; exit 1; }
+          sha256sum burner-*.tar.gz vmlinux-aarch64 *.ext4.gz *.packages > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             out/burner-*.tar.gz
             out/vmlinux-aarch64
-            out/alpine-aarch64.ext4.gz
-            out/alpine-aarch64.packages
+            out/*.ext4.gz
+            out/*.packages
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -193,8 +219,8 @@ jobs:
         run: |
           # the CHANGELOG.md section for this version, empty if there is none
           awk -v h="## ${TAG#v}" '$0 == h { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notes.md 2>/dev/null || true
-          gh release create "$TAG" out/burner-*.tar.gz out/vmlinux-aarch64 out/alpine-aarch64.ext4.gz \
-            out/alpine-aarch64.packages out/SHA256SUMS \
+          gh release create "$TAG" out/burner-*.tar.gz out/vmlinux-aarch64 out/*.ext4.gz \
+            out/*.packages out/SHA256SUMS \
             --verify-tag --title "$TAG" --notes-file notes.md
 
   # the crates are burnervm and burnervm-tui (burner was taken on crates.io), the
@@ -217,12 +243,15 @@ jobs:
             v=$(sed -n 's/^version = "\(.*\)"/\1/p' "$c/Cargo.toml" | head -n 1)
             [ "v$v" = "$TAG" ] || { echo "$c/Cargo.toml says $v, the tag is $TAG" >&2; exit 1; }
           done
-      # build.rs reads the kernel pin from install.sh only for macOS, so a
-      # crate without it would build here and fail on every mac
-      - name: the crate carries install.sh
+      # build.rs reads the kernel pin from install.sh and setup.rs the images'
+      # defaults only for macOS, so a crate without them would build here and
+      # fail on every mac
+      - name: the crate carries install.sh and the image defaults
         run: |
           cargo package --locked --list -p burnervm > "$RUNNER_TEMP/files"
-          grep -qx install.sh "$RUNNER_TEMP/files" || { echo "install.sh isn't in the burnervm crate" >&2; exit 1; }
+          for f in install.sh alpine-defaults.toml debian-defaults.toml; do
+            grep -qx "$f" "$RUNNER_TEMP/files" || { echo "$f isn't in the burnervm crate" >&2; exit 1; }
+          done
           grep -q '^    aarch64)' burner/install.sh
       - name: publish
         env:
