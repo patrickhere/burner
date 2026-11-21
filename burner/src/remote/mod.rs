@@ -4,3 +4,4 @@
 //! a compromised host shouldn't get to drive your terminal or your tar -x
 
 pub mod hosts;
+pub mod quote;
