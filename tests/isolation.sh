@@ -355,6 +355,14 @@ jq_is "$jl" '.command == "ls" and (.result.vms | type) == "array" and .result.ma
   && ok "--json: ls, kill, images, doctor, config" \
   || bad "--json commands" "kill=$rk $(printf '%s' "$jk" | head -c 200)"
 
+# 29 the json's fd has to be open for writing before a VM starts: a stdout or
+# stderr opened read-only is a usage error, not a run whose json goes nowhere
+sudo burner run --tag rofd --json -- 'sleep 20' </dev/null 1</dev/null 2>"$T/ro1.err"; r1=$?
+sudo burner run --tag rofd --json-fd 2 -- 'sleep 20' </dev/null >/dev/null 2</dev/null; r2=$?
+[ "$r1" = 2 ] && grep -q 'stdout open for writing' "$T/ro1.err" && [ "$r2" = 2 ] && ! sudo burner ls | grep -q ' rofd ' \
+  && ok "--json and --json-fd refuse an fd that isn't writable" \
+  || bad "json fd not writable" "json=$r1 json-fd=$r2 $(head -c 200 "$T/ro1.err")"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]

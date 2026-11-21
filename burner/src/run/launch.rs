@@ -71,11 +71,20 @@ fn json_target(a: &RunArgs) -> Option<i32> {
     if quiet() { Some(1) } else { a.json_fd }
 }
 
-/// 2, or an open fd above 2, now close-on-exec so it never reaches the VM's
-/// processes (stderr is passed explicitly anyway)
+/// open for writing, so the line at the end isn't lost after the VM ran
+fn writable(fd: i32) -> bool {
+    // SAFETY: F_GETFL only reads the fd's flags, a bad fd gives -1
+    let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    fl != -1 && matches!(fl & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
+}
+
+/// 2, or a writable fd above 2, now close-on-exec so it never reaches the
+/// VM's processes (stderr is passed explicitly anyway)
 fn fd_ok(fd: i32) -> bool {
     // SAFETY: fcntl only inspects and flags the fd
-    fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0)
+    fd >= 2
+        && writable(fd)
+        && (fd == 2 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0)
 }
 
 /// the fds and the flags that write to stdout, checked before the config
@@ -83,25 +92,31 @@ fn fd_ok(fd: i32) -> bool {
 /// Some(exit) when the run can't go ahead
 pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     let status_ok = a.status_fd.is_none_or(fd_ok);
-    let json_ok = a.json_fd.is_none_or(|fd| fd == 1 || fd_ok(fd));
+    let json_ok = match json_target(a) {
+        Some(1) => writable(1),
+        Some(fd) => fd_ok(fd),
+        None => true,
+    };
     let tar_out = "--result tar writes the tar to stdout, use --json-fd 2 for the json";
     let msg = match (a.status_fd, a.json_fd) {
         _ if a.shell && quiet() => {
             "burner shell has the terminal, use --json-fd N for the json".into()
         }
         (Some(fd), _) if !status_ok => {
-            format!("--status-fd {fd} isn't an open file descriptor (2, or above 2)")
+            format!("--status-fd {fd} isn't open for writing (2, or above 2)")
         }
         (_, Some(fd)) if !json_ok => {
-            format!("--json-fd {fd} isn't an open file descriptor (1, 2, or above 2)")
+            format!("--json-fd {fd} isn't open for writing (1, 2, or above 2)")
         }
+        (_, None) if !json_ok => "--json needs stdout open for writing".into(),
         (_, Some(_)) if quiet() => {
             "--json writes to stdout, --json-fd to another fd: pick one".into()
         }
         _ if a.result.is_some() && json_target(a) == Some(1) => tar_out.into(),
         _ => return None,
     };
-    if !quiet() {
+    // with nowhere to put the json, stderr is all that's left
+    if !quiet() || !json_ok {
         eprintln!("burner: {msg}");
     }
     let why = Problem {
@@ -1488,6 +1503,30 @@ fn tail_of(path: &Path, n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_fds_must_be_writable() {
+        let mut p = [0; 2];
+        // SAFETY: a fresh pipe moved to fds no other test thread gets (new
+        // fds take the lowest free number), all closed below
+        let (r, w) = unsafe {
+            assert_eq!(libc::pipe(p.as_mut_ptr()), 0);
+            assert_eq!(libc::dup2(p[0], 901), 901);
+            assert_eq!(libc::dup2(p[1], 902), 902);
+            libc::close(p[0]);
+            libc::close(p[1]);
+            (901, 902)
+        };
+        assert!(fd_ok(w) && writable(w));
+        assert!(!fd_ok(r) && !writable(r), "the read end");
+        // SAFETY: closing the fds made above
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        assert!(!fd_ok(w) && !writable(w), "a closed fd");
+        assert!(!fd_ok(0) && !fd_ok(1), "only 2 and up for fd_ok");
+    }
 
     #[test]
     fn guest_names_stay_out_of_messages() {

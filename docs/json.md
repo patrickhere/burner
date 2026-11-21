@@ -56,7 +56,7 @@ where it goes:
 | `--result tar --json-fd 2` | the tar | the command's output, burner's lines, then the json | stderr |
 | `--result tar --json` | refused, exit 2: the tar has stdout, use `--json-fd 2` | | |
 
-sudo closes fds above 2, so through sudo use `--json-fd 2`. `shell` refuses `--json` (the terminal has stdout) and takes `--json-fd`. with `--status-fd` on the same fd, the status line comes first and the json last.
+sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked before a VM starts: one that isn't open for writing (stdout or stderr redirected from a file included) is exit 2, kind `usage`. `shell` refuses `--json` (the terminal has stdout) and takes `--json-fd`. with `--status-fd` on the same fd, the status line comes first and the json last.
 
 `result` is null for a usage error (bad flags, unknown image, not root, no terminal) and when burner failed before the run had an id (a config that didn't load, the reaper not running). otherwise:
 
