@@ -12,6 +12,8 @@ pub mod doctor;
 #[doc(hidden)]
 pub mod exit;
 #[doc(hidden)]
+pub mod json;
+#[doc(hidden)]
 #[cfg(target_os = "macos")]
 pub mod krun;
 #[doc(hidden)]
