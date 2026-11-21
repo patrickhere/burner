@@ -220,6 +220,8 @@ pub(super) struct ShellIo {
     pub(super) tty_rec: Option<File>,
     /// the size written there before the VM started
     pub(super) size: (u16, u16),
+    /// ~. leaves. off for burner -H, where the client handles it
+    pub(super) escape: bool,
 }
 
 /// how a shell session went
@@ -259,6 +261,7 @@ pub(super) fn relay(
         legacy,
         tty_rec,
         size: sent,
+        escape: escapes,
     } = io;
     let screen = Out::new_screen();
     let failed = |screen: Out| {
@@ -397,7 +400,9 @@ pub(super) fn relay(
                 Ok(n) => {
                     let mut keys = Vec::new();
                     escape.bracketed = screen.screen().is_some_and(|s| s.paste());
-                    if escape.feed(&buf[..n], &mut keys) {
+                    if !escapes {
+                        keys.extend_from_slice(&buf[..n]);
+                    } else if escape.feed(&buf[..n], &mut keys) {
                         break Outcome::Detached;
                     }
                     if console_open && ended_at.is_none() {

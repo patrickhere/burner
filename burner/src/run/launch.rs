@@ -66,9 +66,24 @@ fn quiet() -> bool {
     json::on()
 }
 
-/// where the json goes, if anywhere
+/// where the json goes, if anywhere. for burner -H it goes back to the
+/// client as a record instead
 fn json_target(a: &RunArgs) -> Option<i32> {
-    if quiet() { Some(1) } else { a.json_fd }
+    if a.remote.is_some() {
+        None
+    } else if quiet() {
+        Some(1)
+    } else {
+        a.json_fd
+    }
+}
+
+/// a line for the burner -H client on the far end of ssh, on stderr. sudo
+/// closes every other fd, and stdout is the command's
+fn to_client(a: &RunArgs, kind: &str, body: &str) {
+    if let Some(n) = &a.remote {
+        json::write_fd(2, &format!("burner-{n} {kind} {}\n", body.trim_end()));
+    }
 }
 
 /// open for writing, so the line at the end isn't lost after the VM ran
@@ -127,9 +142,11 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     if let (true, Some(fd)) = (status_ok, a.status_fd) {
         json::write_fd(fd, &f.status_line());
     }
+    let env = envelope(a, f);
     if let (true, Some(fd)) = (json_ok, json_target(a)) {
-        json::write_fd(fd, &envelope(a, f));
+        json::write_fd(fd, &env);
     }
+    to_client(a, "status", &env);
     Some(ExitCode::from(EXIT_USAGE))
 }
 
@@ -162,9 +179,11 @@ fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
     if let Some(fd) = a.status_fd {
         json::write_fd(fd, &f.status_line());
     }
+    let env = envelope(a, f);
     if let Some(fd) = json_target(a) {
-        json::write_fd(fd, &envelope(a, f));
+        json::write_fd(fd, &env);
     }
+    to_client(a, "status", &env);
     ExitCode::from(code)
 }
 
@@ -181,6 +200,9 @@ fn envelope(a: &RunArgs, f: record::Finished) -> String {
 /// the caller checked the fds with check_fds
 pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
     interrupted();
+    if a.remote.is_some() {
+        super::watch_peer();
+    }
     // boot mode from the start: keys typed during setup wait for the VM and
     // ctrl-c works. the terminal comes back however main returns
     let _tty = a
@@ -256,6 +278,9 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
     let (id, run_dir) = alloc_id(&runs)?;
     record::set_id(&id);
+    // nothing else has been written to stderr yet, so this can't land in
+    // the middle of another line
+    to_client(a, "start", &serde_json::json!({ "id": id }).to_string());
     let mut vm = None;
     let res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
     if vm.is_some() {
@@ -373,6 +398,7 @@ fn run_vm(
             legacy,
             tty_rec,
             size,
+            escape: a.remote.is_none(),
         };
         let sh = relay(&mut child, &token, deadline, cfg, id, io);
         if let Some(t) = sh.ready {

@@ -329,6 +329,24 @@ pub fn poll_read(fds: &[i32], timeout: Duration) -> Vec<i32> {
     p.iter().filter(|x| x.revents != 0).map(|x| x.fd).collect()
 }
 
+/// whether any of `fds` hung up: a pipe or socket whose other end is gone,
+/// a terminal that was hung up. macOS only says so when asked about writing
+pub fn hung_up(fds: &[i32]) -> bool {
+    let mut p: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: p is a valid array of p.len() pollfds
+    let n = unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, 0) };
+    n > 0
+        && p.iter()
+            .any(|x| x.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+}
+
 /// fire-and-forget to the system log. never blocks, so it's safe under a lock
 #[cfg(target_os = "linux")]
 pub fn syslog(msg: &str) {
@@ -805,6 +823,19 @@ pub fn private_dir(path: &std::path::Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hang_ups() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe(2) fills two fds
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(!hung_up(&[fds[1]]));
+        // SAFETY: closing the read end we just made
+        unsafe { libc::close(fds[0]) };
+        assert!(hung_up(&[fds[1]]));
+        // SAFETY: and the write end
+        unsafe { libc::close(fds[1]) };
+    }
 
     #[test]
     fn remove_tree_stays_inside() {

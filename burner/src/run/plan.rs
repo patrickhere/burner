@@ -55,6 +55,10 @@ pub struct RunArgs {
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
+    /// burner -H on the far end of ssh: how it ended goes to stderr as a
+    /// marked line, and a closed stdout or stderr stops the run
+    #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
+    pub(super) remote: Option<String>,
     /// one argument runs as a shell string; several are quoted as they are
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
@@ -89,6 +93,33 @@ pub struct ShellArgs {
     /// through sudo use 2
     #[arg(long, value_name = "FD")]
     json_fd: Option<i32>,
+    /// burner -H on the far end of ssh, see run. the ~ escape is the client's
+    #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
+    remote: Option<String>,
+}
+
+/// the remote protocol this burner speaks
+pub const REMOTE_PROTO: u32 = 1;
+
+/// `1:` and 32 lowercase hex digits. a client asking for a protocol this
+/// burner doesn't know is refused before anything starts
+fn remote_nonce(s: &str) -> Result<String, String> {
+    let (proto, nonce) = s.split_once(':').unwrap_or(("", s));
+    if proto != REMOTE_PROTO.to_string() {
+        return Err(format!(
+            "this burner ({}) speaks remote protocol {REMOTE_PROTO}, the caller asked for {}",
+            env!("CARGO_PKG_VERSION"),
+            if proto.is_empty() { "none" } else { proto }
+        ));
+    }
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("the nonce is 32 lowercase hex digits".into());
+    }
+    Ok(nonce.into())
 }
 
 /// a shell is a run with the caller's terminal and no command
@@ -106,6 +137,7 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         status_fd: None,
         json_fd: a.json_fd,
         no_wait: false,
+        remote: a.remote.clone(),
         net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
@@ -425,6 +457,22 @@ mod tests {
         assert!(parse_ttl("1h", 1800).is_err());
         assert!(parse_ttl("5s", 1800).is_err());
         assert!(parse_ttl("x", 1800).is_err());
+    }
+
+    #[test]
+    fn remote_flag() {
+        let n = "0123456789abcdef0123456789abcdef";
+        assert_eq!(remote_nonce(&format!("1:{n}")).as_deref(), Ok(n));
+        let two = remote_nonce(&format!("2:{n}")).unwrap_err();
+        assert!(two.contains("speaks remote protocol 1, the caller asked for 2"));
+        for bad in [
+            n.to_string(),
+            format!("1:{}", &n[1..]),
+            format!("1:{}", n.to_uppercase()),
+            format!("1:{n}0"),
+        ] {
+            assert!(remote_nonce(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

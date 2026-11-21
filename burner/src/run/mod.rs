@@ -79,6 +79,25 @@ fn signals() -> usize {
     SIGNALS.load(Ordering::Relaxed)
 }
 
+/// burner -H on the far end: when sshd loses the client it closes the
+/// session's pipes but sends the command no signal (a shell has a pty, whose
+/// hangup does). so a stdout or stderr that hung up counts as a SIGHUP, and
+/// the run stops as it would on ctrl-c
+pub(crate) fn watch_peer() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        std::thread::spawn(|| {
+            loop {
+                if sys::hung_up(&[1, 2]) {
+                    SIGNALS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    });
+}
+
 pub(crate) fn is_interrupted() -> bool {
     signals() > 0
 }
