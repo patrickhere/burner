@@ -54,3 +54,6 @@ jobs:
       # worth running even when isolation failed, as long as there's an image
       - if: always() && steps.image.outcome == 'success'
         run: sudo bash tests/network.sh
+      # burner -H to this runner over ssh, the real burner on the far end
+      - if: always() && steps.image.outcome == 'success'
+        run: bash tests/remote.sh
