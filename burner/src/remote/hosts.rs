@@ -54,12 +54,6 @@ pub struct Host {
     pub known: Vec<String>,
 }
 
-#[derive(Debug, PartialEq)]
-pub enum Target {
-    Local,
-    Remote(Host),
-}
-
 /// $XDG_CONFIG_HOME/burner/hosts.toml, else ~/.config/burner/hosts.toml, on
 /// macOS too: it's the file you'd keep in dotfiles for every machine
 pub fn path() -> PathBuf {
@@ -253,17 +247,6 @@ pub fn lookup(value: &str, hosts: &BTreeMap<String, Entry>) -> Result<Host> {
         configured: false,
         known,
     })
-}
-
-/// -H, then BURNER_HOST, then here. hosts.toml is only read when there's a
-/// host to look up, so a plain local run never touches it
-pub fn resolve(flag: Option<&str>) -> Result<Target> {
-    let env = std::env::var("BURNER_HOST").ok();
-    let Some(v) = pick(flag, env.as_deref()) else {
-        return Ok(Target::Local);
-    };
-    let hosts = load(&path())?;
-    Ok(Target::Remote(lookup(&v, &hosts)?))
 }
 
 #[cfg(test)]

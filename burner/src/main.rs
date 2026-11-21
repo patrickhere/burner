@@ -226,7 +226,7 @@ fn command_word(args: &[String]) -> Option<&'static str> {
 /// -H or BURNER_HOST: the command goes to that host over ssh, and nothing
 /// here is loaded. None when it runs here
 fn remote(cli: &Cli) -> Option<ExitCode> {
-    use remote::hosts::{self, Target};
+    use remote::hosts;
     use remote::ssh::Mode;
     let name = cli.cmd.name();
     // the far end of -H always runs here. the wrapper drops BURNER_HOST, and
@@ -234,12 +234,18 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     match &cli.cmd {
         Cmd::Run(a) if a.is_remote() => return None,
         Cmd::Shell(a) if a.is_remote() => return None,
-        Cmd::ParseResult { .. } | Cmd::Reap | Cmd::Hosts { .. } => return None,
+        Cmd::ParseResult { .. } | Cmd::Hosts { .. } => return None,
         _ => {}
     }
-    let host = match hosts::resolve(cli.host.as_deref()) {
-        Ok(Target::Local) => return None,
-        Ok(Target::Remote(h)) => h,
+    let env = std::env::var("BURNER_HOST").ok();
+    let value = hosts::pick(cli.host.as_deref(), env.as_deref())?;
+    let usage = |msg: String| Some(json::fail(name, exit::EXIT_USAGE, Kind::Usage, msg));
+    // before hosts.toml is read: as root it would be someone else's file
+    if let Some(why) = remote::client::refuse_here() {
+        return usage(why);
+    }
+    let host = match hosts::load(&hosts::path()).and_then(|h| hosts::lookup(&value, &h)) {
+        Ok(h) => h,
         Err(e) => {
             return Some(json::fail(
                 name,
@@ -249,10 +255,6 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
             ));
         }
     };
-    let usage = |msg: String| Some(json::fail(name, exit::EXIT_USAGE, Kind::Usage, msg));
-    if let Some(why) = remote::client::refuse_here() {
-        return usage(why);
-    }
     let config = cli
         .config
         .as_ref()
