@@ -693,8 +693,12 @@ impl Gw<'_> {
                 Ok(u) => Verdict::Refuse(Proto::Udp, ip.dst_addr(), u.src_port(), u.dst_port()),
                 _ => Verdict::Drop,
             },
-            // ping included: macnet carries tcp and dns only
-            IpProtocol::Icmp => Verdict::Refuse(Proto::Icmp, ip.dst_addr(), 0, 0),
+            // ping included: macnet carries tcp and dns only. the guest's own
+            // errors (a port unreachable for a late dns answer) are only
+            // dropped, as on linux, where they're no new connection either
+            IpProtocol::Icmp if ip.payload().first() == Some(&8) => {
+                Verdict::Refuse(Proto::Icmp, ip.dst_addr(), 0, 0)
+            }
             _ => Verdict::Drop,
         }
     }
