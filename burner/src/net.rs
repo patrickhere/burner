@@ -1081,7 +1081,7 @@ pub fn taps_present(cfg: &Config) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
