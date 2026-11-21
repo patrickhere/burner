@@ -5,3 +5,4 @@
 
 pub mod hosts;
 pub mod quote;
+pub mod ssh;
