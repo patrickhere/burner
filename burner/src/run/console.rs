@@ -5,9 +5,11 @@ use std::path::Path;
 use std::process::{Child, ChildStdout};
 use std::time::{Duration, Instant};
 
+use super::record::{self, Mark};
 use super::{Deadline, Outcome, is_interrupted, signals};
 use crate::cgroup;
 use crate::config::Config;
+use crate::json::{self, Kind};
 use crate::ledger;
 use crate::output::{Out, escape_controls};
 use crate::result;
@@ -115,6 +117,7 @@ pub(super) fn stream(
             St::Pre => {
                 pre.extend_from_slice(data);
                 if let Some(i) = find_at_line_start(&pre, &begin, pre_line) {
+                    record::mark(Mark::Begun);
                     st = St::Body;
                     pending = pre.split_off(i + begin.len());
                     pre.truncate(i);
@@ -167,7 +170,9 @@ pub(super) fn stream(
             flush_held(&mut held_nl);
             out.put(&pending, None);
             pending.clear();
-            diag.put(b"burner: console over 1M, live output stopped\n", None);
+            let msg = "console over 1M, live output stopped";
+            json::note_warning(Kind::Output, msg, false);
+            diag.put(format!("burner: {msg}\n").as_bytes(), None);
             st = St::Capped;
         }
     }
@@ -177,6 +182,8 @@ pub(super) fn stream(
     }
     // a kill during boot ends the VM before the job, that's not worth the console tail
     if st == St::Pre && !kill_requested(cfg, id) {
+        // the console lines are the guest's, they stay out of the json
+        json::note_warning(Kind::Vmm, "VM ended before the job started", false);
         diag.put(
             b"burner: VM ended before the job started; last console lines:\n",
             None,
@@ -223,6 +230,8 @@ pub(super) struct Shell {
     pub(super) end: Option<Ended>,
     /// the terminal reset is queued last on it, to wait on before printing
     pub(super) screen: Out,
+    /// when guest init said the shell was ready
+    pub(super) ready: Option<Instant>,
     /// the signal count when the session was over: any signal past it stops
     /// every wait on the caller's terminal from there on
     pub(super) seen: usize,
@@ -259,6 +268,7 @@ pub(super) fn relay(
             outcome: Outcome::Failed,
             end: None,
             screen,
+            ready: None,
             seen,
         }
     };
@@ -478,6 +488,7 @@ pub(super) fn relay(
         outcome,
         end,
         screen,
+        ready: ready_at,
         seen,
     }
 }
@@ -1014,15 +1025,13 @@ pub(super) fn print_rest(meta: &result::Meta, log: &Path, out: &Out, diag: &Out,
         0 => LIVE_BYTES,
         s if s <= LIVE_BYTES => LIVE_BYTES - s,
         s => {
-            diag.put(
-                format!(
-                    "burner: output was {} bytes; the {} bytes after the first 64K are not kept, showing the last 16M\n",
-                    s + size,
-                    s - LIVE_BYTES
-                )
-                .as_bytes(),
-                None,
+            let msg = format!(
+                "output was {} bytes; the {} bytes after the first 64K are not kept, showing the last 16M",
+                s + size,
+                s - LIVE_BYTES
             );
+            json::note_warning(Kind::Output, &msg, false);
+            diag.put(format!("burner: {msg}\n").as_bytes(), None);
             0
         }
     };

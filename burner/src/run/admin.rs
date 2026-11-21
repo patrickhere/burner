@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::EXIT_USAGE;
 #[cfg(target_os = "linux")]
-use super::{EXIT_SANDBOX, Exit};
+use super::{EXIT_SANDBOX, exit};
 use crate::cgroup;
 use crate::config::Config;
 use crate::exit::EXIT_FAILED;
@@ -44,13 +44,12 @@ fn cgroup_dir() -> PathBuf {
 pub(super) fn reaper_alive(cfg: &Config) -> Result<()> {
     match reaper_age(cfg) {
         Some(a) if a <= REAPER_MAX_AGE => Ok(()),
-        _ => Err(Exit(
+        _ => Err(exit(
             EXIT_SANDBOX,
+            Kind::NoReaper,
             "the reaper hasn't run in the last 2 min (systemctl status burner-reap.timer), \
-             refusing a VM with a network. --net none still works"
-                .into(),
-        )
-        .into()),
+             refusing a VM with a network. --net none still works",
+        )),
     }
 }
 

@@ -2,7 +2,7 @@
 //! reader that stops reading can't stall the main loop (and with it the ttl).
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,8 @@ pub struct Out {
     skip: Arc<AtomicBool>,
     last_done: Arc<AtomicBool>,
     dropped: AtomicBool,
+    /// bytes handed to put, before any escaping
+    taken: AtomicU64,
     tty: bool,
     esc: Mutex<TtyEscape>,
 }
@@ -99,6 +101,7 @@ impl Out {
             skip,
             last_done,
             dropped: AtomicBool::new(false),
+            taken: AtomicU64::new(0),
             tty,
             esc: Mutex::new(TtyEscape::default()),
         }
@@ -109,6 +112,7 @@ impl Out {
         if b.is_empty() || self.broken.load(Ordering::Relaxed) {
             return;
         }
+        self.taken.fetch_add(b.len() as u64, Ordering::Relaxed);
         if !self.tty {
             return self.send(b.to_vec(), wait_until);
         }
@@ -136,6 +140,10 @@ impl Out {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.taken.load(Ordering::Relaxed)
     }
 
     pub fn dropped(&self) -> bool {

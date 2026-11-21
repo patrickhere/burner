@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
 use super::admin::reaper_alive;
 use super::launch::main;
-use super::{EXIT_SANDBOX, EXIT_USAGE, Exit, usage};
+use super::{EXIT_SANDBOX, EXIT_USAGE, exit, usage};
 use crate::config::Config;
 use crate::json::{self, Kind};
 use crate::net;
@@ -208,10 +208,19 @@ fn image_defaults(cfg: &Config, img: &str) -> Result<ImageDefaults> {
         .join(img)
         .join("defaults.toml");
     match fs::read_to_string(&path) {
-        Ok(t) => toml::from_str(&t)
-            .map_err(|e| Exit(EXIT_SANDBOX, format!("{}: {}", path.display(), e.message())).into()),
+        Ok(t) => toml::from_str(&t).map_err(|e| {
+            exit(
+                EXIT_SANDBOX,
+                Kind::Config,
+                format!("{}: {}", path.display(), e.message()),
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ImageDefaults::default()),
-        Err(e) => Err(Exit(EXIT_SANDBOX, format!("{}: {e}", path.display())).into()),
+        Err(e) => Err(exit(
+            EXIT_SANDBOX,
+            Kind::Config,
+            format!("{}: {e}", path.display()),
+        )),
     }
 }
 
@@ -271,7 +280,11 @@ pub(super) struct Plan {
 
 pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     if !valid_name(&a.img) || !images(cfg).contains(&a.img) {
-        return Err(usage(format!("unknown image {:?} (burner images)", a.img)));
+        return Err(exit(
+            EXIT_USAGE,
+            Kind::UnknownImage,
+            format!("unknown image {:?} (burner images)", a.img),
+        ));
     }
     let d = image_defaults(cfg, &a.img)?;
     let l = &cfg.limits;
@@ -323,14 +336,14 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         #[cfg(target_os = "macos")]
         let logs = "log show --predicate 'process == \"burner\"'";
         if cfg.net.block_public_ip && net::public_ip(cfg).is_none() {
-            return Err(Exit(
+            return Err(exit(
                 EXIT_SANDBOX,
+                Kind::NoPublicIp,
                 format!(
                     "net.block_public_ip is on but no public address has been found yet \
                      ({logs}), refusing a VM with a network. --net none still works"
                 ),
-            )
-            .into());
+            ));
         }
     }
     let tag = a.tag.clone().unwrap_or_else(|| "-".into());

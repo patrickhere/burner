@@ -8,10 +8,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use serde_json::json;
 
 #[cfg(target_os = "macos")]
@@ -19,12 +19,14 @@ use super::admin::VM_DIRS;
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
 use super::console::{Ended, ShellIo, deliver, print_rest, relay, stream, supervise};
 use super::plan::{Input, Plan, RunArgs, plan};
+use super::record::{self, Mark, OutputInfo, RunOutcome, ShellEnd, TarInfo, VmInfo};
 use super::{
-    Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, interrupted,
-    is_interrupted, signals, usage,
+    Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, exit,
+    interrupted, is_interrupted, signals, usage,
 };
 use crate::cgroup;
 use crate::config::{self, Config};
+use crate::json::{self, Kind, Problem};
 use crate::ledger::{self, Ident, Ledger, Status, Vm};
 use crate::net;
 use crate::output::{Dest, Out, escape_controls};
@@ -59,16 +61,6 @@ const VMM_SOFT_MIB: u64 = 64;
 /// setup (disks, tap) has this long before the reaper stops the wrapper
 const PREP_SECS: u32 = 180;
 
-/// how the run ended, for --status-fd. set where burner decides it
-static STATUS: Mutex<Option<(&str, Option<i32>)>> = Mutex::new(None);
-static RUN_ID: OnceLock<String> = OnceLock::new();
-
-fn set_status(outcome: &'static str, rc: Option<i32>) {
-    if let Ok(mut s) = STATUS.lock() {
-        *s = Some((outcome, rc));
-    }
-}
-
 /// checked before the config loads, so a run that fails that early still
 /// writes its status line
 pub fn status_fd_ok(a: &RunArgs) -> bool {
@@ -87,27 +79,21 @@ pub fn status_fd_ok(a: &RunArgs) -> bool {
 
 /// a run whose config didn't load: no result, so 125 like any other sandbox failure
 pub fn config_failed(a: &RunArgs, e: &anyhow::Error, t0: Instant) -> ExitCode {
-    eprintln!("burner: {e:#}");
-    if let Some(fd) = a.status_fd {
-        write_status(fd, ("sandbox_error", None), EXIT_SANDBOX, t0);
-    }
-    ExitCode::from(EXIT_SANDBOX)
+    let msg = format!("{e:#}");
+    eprintln!("burner: {msg}");
+    let why = Problem {
+        kind: Kind::Config,
+        message: msg,
+    };
+    finished(a, record::finish(t0, EXIT_SANDBOX, Some(why)))
 }
 
-fn write_status(fd: i32, (outcome, rc): (&str, Option<i32>), code: u8, t0: Instant) {
-    let line = json!({"outcome": outcome, "rc": rc, "exit": code, "id": RUN_ID.get(),
-                      "secs": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0})
-    .to_string()
-        + "\n";
-    let mut b = line.as_bytes();
-    while !b.is_empty() {
-        // SAFETY: write(2) of a live buffer to an fd checked at start
-        let n = unsafe { libc::write(fd, b.as_ptr().cast(), b.len()) };
-        if n <= 0 {
-            break;
-        }
-        b = &b[n as usize..];
+/// the status line and the json, then the exit code
+fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
+    if let Some(fd) = a.status_fd {
+        json::write_fd(fd, &f.status_line());
     }
+    ExitCode::from(f.code)
 }
 
 /// the caller checked a.status_fd with status_fd_ok
@@ -119,44 +105,56 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
         .shell
         .then(|| sys::ShellTty::take(crate::output::TERM_RESET));
     let t0 = Instant::now();
-    let code = match run(cfg, &a) {
-        Ok(code) => code,
+    let (code, failed) = match run(cfg, &a) {
+        Ok(code) => (code, None),
         Err(e) => {
             if a.shell {
                 sys::restore_saved_tty();
             }
-            eprintln!("burner: {e:#}");
-            match e.downcast_ref::<Exit>() {
-                Some(Exit(code, _)) => *code,
-                None => EXIT_SANDBOX,
-            }
+            let message = format!("{e:#}");
+            eprintln!("burner: {message}");
+            let (code, kind) = match e.downcast_ref::<Exit>() {
+                Some(Exit(code, kind, _)) => (*code, *kind),
+                None => (EXIT_SANDBOX, Kind::Sandbox),
+            };
+            (code, Some(Problem { kind, message }))
         }
     };
-    if let Some(fd) = a.status_fd {
-        let status = STATUS.lock().ok().and_then(|s| *s).unwrap_or(match code {
-            EXIT_USAGE => ("usage", None),
-            EXIT_INTERRUPTED => ("interrupted", None),
-            _ => ("sandbox_error", None),
-        });
-        write_status(fd, status, code, t0);
-    }
-    ExitCode::from(code)
+    finished(&a, record::finish(t0, code, failed))
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     #[cfg(target_os = "linux")]
     if !sys::is_root() {
-        return Err(usage("burner run needs root (sudo burner run ...)"));
+        return Err(exit(
+            EXIT_USAGE,
+            Kind::NotRoot,
+            "burner run needs root (sudo burner run ...)",
+        ));
     }
     #[cfg(target_os = "macos")]
     if sys::is_root() {
-        return Err(usage("on macOS burner runs as you, without sudo"));
+        return Err(exit(
+            EXIT_USAGE,
+            Kind::Root,
+            "on macOS burner runs as you, without sudo",
+        ));
     }
     // no reaper timer on macOS: each run first cleans up after dead ones, and
     // looks up the public address for net.block_public_ip before plan wants it
     #[cfg(target_os = "macos")]
     let _ = super::admin::reap(cfg);
     let p = plan(cfg, a)?;
+    record::set_vm(VmInfo {
+        img: p.img.clone(),
+        backend: VMM,
+        vcpus: p.vcpus,
+        mem_mib: p.mem_mib,
+        disk_gib: p.disk_gib,
+        ttl_secs: p.ttl,
+        net: p.net.name(),
+        tag: Some(p.tag.clone()).filter(|t| t != "-"),
+    });
     // the parser reads what a VM wrote, so it must never share an id with one
     #[cfg(target_os = "linux")]
     {
@@ -173,14 +171,20 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     fs::create_dir_all(&runs)?;
     fs::set_permissions(&runs, fs::Permissions::from_mode(0o700))?;
     let (id, run_dir) = alloc_id(&runs)?;
-    let _ = RUN_ID.set(id.clone());
+    record::set_id(&id);
     let mut vm = None;
     let res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
     if vm.is_some() {
-        teardown(cfg, &id, None);
+        timed_teardown(cfg, &id, None);
     }
     remove_tree(&run_dir);
     res
+}
+
+fn timed_teardown(cfg: &Config, id: &str, child: Option<&mut Child>) {
+    let t = Instant::now();
+    teardown(cfg, id, child);
+    record::add_teardown(t.elapsed());
 }
 
 fn alloc_id(runs: &Path) -> Result<(String, PathBuf)> {
@@ -217,7 +221,11 @@ fn run_vm(
     let t0 = Instant::now();
 
     if a.input != Input::None && !disk_left(run_dir, 0) {
-        return Err(Exit(EXIT_SANDBOX, "not enough disk to hold the input".into()).into());
+        return Err(exit(
+            EXIT_SANDBOX,
+            Kind::DiskFull,
+            "not enough disk to hold the input",
+        ));
     }
     let idle = Duration::from_secs(u64::from(cfg.limits.stdin_idle_secs));
     let spool = spool_input(&run_dir.join("stdin"), a.input, idle)?;
@@ -226,7 +234,11 @@ fn run_vm(
     if let Some(sp) = &spool
         && !disk_left(run_dir, fs::metadata(sp)?.len())
     {
-        return Err(Exit(EXIT_SANDBOX, "not enough disk to build the job disk".into()).into());
+        return Err(exit(
+            EXIT_SANDBOX,
+            Kind::DiskFull,
+            "not enough disk to build the job disk",
+        ));
     }
     // a shell has no job: its job disk carries the caller's terminal size
     let size = sys::term_size(1).unwrap_or((24, 80));
@@ -236,7 +248,9 @@ fn run_vm(
         build_job(&job, &p.cmd, a.input, spool.as_deref())?;
     }
 
+    record::mark(Mark::Queue);
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
+    record::mark(Mark::Slot);
     *held = Some(());
 
     let Vmm {
@@ -250,6 +264,7 @@ fn run_vm(
         #[cfg(target_os = "macos")]
             net: _net,
     } = launch(cfg, p, id, &job, net_slot, uid, size)?;
+    record::mark(Mark::Launched);
     // an image built with another guest init doesn't say when its shell is
     // ready for keys, and never writes result/fail or result/ended itself
     let legacy = fs::read(cfg.paths.root.join("images").join(&p.img).join("init"))
@@ -262,14 +277,12 @@ fn run_vm(
         #[cfg(target_os = "macos")]
         let fix = "burner setup fetches one that matches";
         if legacy {
-            diag.put(
-                format!(
-                    "burner: image {} was built with a different guest init, {fix}\n",
-                    p.img
-                )
-                .as_bytes(),
-                None,
+            let msg = format!(
+                "image {} was built with a different guest init, {fix}",
+                p.img
             );
+            json::note_warning(Kind::Image, &msg, false);
+            diag.put(format!("burner: {msg}\n").as_bytes(), None);
         }
         let io = ShellIo {
             legacy,
@@ -277,6 +290,10 @@ fn run_vm(
             size,
         };
         let sh = relay(&mut child, &token, deadline, cfg, id, io);
+        if let Some(t) = sh.ready {
+            record::mark_at(Mark::Begun, t);
+        }
+        record::mark(Mark::Ended);
         // a signal since the relay stopped stops any wait on the caller's
         // terminal, the relay's own drain included
         let seen = sh.seen;
@@ -290,80 +307,91 @@ fn run_vm(
                 String::from_utf8_lossy(&escape_controls(&tail)).trim()
             ));
         }
-        teardown(cfg, id, Some(&mut child));
+        timed_teardown(cfg, id, Some(&mut child));
         *held = None;
+        if let Some(e) = sh.end {
+            record::set_shell_end(match e {
+                Ended::Exit(_) => ShellEnd::Exit,
+                Ended::PowerOff => ShellEnd::Poweroff,
+                Ended::Reboot => ShellEnd::Reboot,
+                Ended::NoStart => ShellEnd::NoStart,
+                Ended::Lost => ShellEnd::Lost,
+                Ended::Legacy => ShellEnd::Legacy,
+            });
+        }
+        let sandbox = |msg: &str| {
+            let msg = msg.to_string();
+            record::set_outcome(
+                RunOutcome::SandboxError,
+                None,
+                Some((Kind::Sandbox, msg.clone())),
+            );
+            (EXIT_SANDBOX, Some(msg))
+        };
         let (code, msg) = match outcome {
             // guest init passes on the shell's exit code. a VM that stopped
             // without saying so crashed or was reset under the shell
             Outcome::Done => match sh.end {
                 Some(Ended::Exit(rc)) => {
-                    set_status("exited", Some(i32::from(rc)));
+                    record::set_outcome(RunOutcome::Exited, Some(i32::from(rc)), None);
                     (rc, None)
                 }
                 // these end the shell fine, but the guest gave no exit code
                 Some(Ended::Legacy) => {
-                    set_status("exited", None);
+                    record::set_outcome(RunOutcome::Exited, None, None);
                     (0, None)
                 }
                 Some(Ended::PowerOff) => {
-                    set_status("exited", None);
+                    record::set_outcome(RunOutcome::Exited, None, None);
                     (0, Some("the VM was powered off".into()))
                 }
                 Some(Ended::Reboot) => {
-                    set_status("exited", None);
+                    record::set_outcome(RunOutcome::Exited, None, None);
                     (0, Some("the VM was rebooted, which ends it".into()))
                 }
-                Some(Ended::NoStart) => {
-                    set_status("sandbox_error", None);
-                    (EXIT_SANDBOX, Some("the guest shell couldn't start".into()))
-                }
-                Some(Ended::Lost) => {
-                    set_status("sandbox_error", None);
-                    (
-                        EXIT_SANDBOX,
-                        Some("the guest shell ended without an exit code".into()),
-                    )
-                }
-                None => {
-                    set_status("sandbox_error", None);
-                    (
-                        EXIT_SANDBOX,
-                        Some("the VM stopped without the shell ending (a crash or a reset)".into()),
-                    )
-                }
+                Some(Ended::NoStart) => sandbox("the guest shell couldn't start"),
+                Some(Ended::Lost) => sandbox("the guest shell ended without an exit code"),
+                None => sandbox("the VM stopped without the shell ending (a crash or a reset)"),
             },
             Outcome::Detached => {
-                set_status("detached", None);
+                record::set_outcome(RunOutcome::Detached, None, None);
                 (0, Some("left the shell, VM stopped".into()))
             }
-            Outcome::Failed => {
-                set_status("sandbox_error", None);
-                (
-                    EXIT_SANDBOX,
-                    Some("the VM stopped with an error, see the system log".into()),
-                )
-            }
+            Outcome::Failed => sandbox("the VM stopped with an error, see the system log"),
             Outcome::Timeout => {
-                set_status("timeout", None);
                 let limit = if p.ttl.is_multiple_of(60) {
                     format!("{} min", p.ttl / 60)
                 } else {
                     format!("{}s", p.ttl)
                 };
-                (
-                    EXIT_TIMEOUT,
-                    Some(format!("shell closed at the {limit} limit")),
-                )
+                let msg = format!("shell closed at the {limit} limit");
+                record::set_outcome(
+                    RunOutcome::Timeout,
+                    None,
+                    Some((Kind::Timeout, msg.clone())),
+                );
+                (EXIT_TIMEOUT, Some(msg))
             }
             Outcome::Cancelled => {
-                set_status("killed", None);
-                (EXIT_INTERRUPTED, Some("killed by burner kill".into()))
+                let msg = "killed by burner kill".to_string();
+                record::set_outcome(RunOutcome::Killed, None, Some((Kind::Killed, msg.clone())));
+                (EXIT_INTERRUPTED, Some(msg))
             }
             Outcome::Interrupted => {
-                set_status("interrupted", None);
-                (EXIT_INTERRUPTED, Some("interrupted, VM stopped".into()))
+                let msg = "interrupted, VM stopped".to_string();
+                record::set_outcome(
+                    RunOutcome::Interrupted,
+                    None,
+                    Some((Kind::Interrupted, msg.clone())),
+                );
+                (EXIT_INTERRUPTED, Some(msg))
             }
         };
+        if code == 0
+            && let Some(m) = &msg
+        {
+            json::note_warning(Kind::Shell, m, false);
+        }
         log_line(&format!(
             "end {id} tag={} secs={:.1} shell code={code}",
             p.tag,
@@ -397,27 +425,36 @@ fn run_vm(
     if matches!(outcome, Outcome::Done) {
         outcome = supervise(&mut child, deadline, cfg, id);
     }
+    record::mark(Mark::Ended);
+    let live_bytes = live.bytes();
+    // what the command wrote in all and what of it wasn't kept, when a result came
+    let (mut bytes, mut skipped) = (None, 0);
+    // burner's line on how it ended: what decides it in the json, on stderr as it was
+    let ends = |o: RunOutcome, kind: Kind, msg: String| {
+        diag.put(format!("burner: {msg}\n").as_bytes(), None);
+        record::set_outcome(o, None, Some((kind, msg)));
+    };
     let code = match outcome {
         Outcome::Timeout | Outcome::Cancelled | Outcome::Interrupted | Outcome::Detached => {
-            teardown(cfg, id, Some(&mut child));
+            timed_teardown(cfg, id, Some(&mut child));
             *held = None;
             match outcome {
                 Outcome::Timeout => {
-                    set_status("timeout", None);
-                    diag.put(
-                        format!("burner: killed at the {}s time limit\n", p.ttl).as_bytes(),
-                        None,
-                    );
+                    let msg = format!("killed at the {}s time limit", p.ttl);
+                    ends(RunOutcome::Timeout, Kind::Timeout, msg);
                     EXIT_TIMEOUT
                 }
                 Outcome::Cancelled => {
-                    set_status("killed", None);
-                    diag.put(b"burner: killed by burner kill\n", None);
+                    ends(
+                        RunOutcome::Killed,
+                        Kind::Killed,
+                        "killed by burner kill".into(),
+                    );
                     EXIT_INTERRUPTED
                 }
                 _ => {
-                    set_status("interrupted", None);
-                    diag.put(b"burner: interrupted, sandbox stopped\n", None);
+                    let msg = "interrupted, sandbox stopped".to_string();
+                    ends(RunOutcome::Interrupted, Kind::Interrupted, msg);
                     EXIT_INTERRUPTED
                 }
             }
@@ -439,15 +476,18 @@ fn run_vm(
                 Vec::new()
             };
             if meta.rc.is_none() && cgroup::oom_kills(id) > 0 {
-                diag.put(
-                    b"burner: the VM's cgroup ran out of memory and the kernel killed firecracker\n",
-                    None,
-                );
+                let msg = "the VM's cgroup ran out of memory and the kernel killed firecracker";
+                json::note_warning(Kind::Oom, msg, false);
+                diag.put(format!("burner: {msg}\n").as_bytes(), None);
             }
-            teardown(cfg, id, Some(&mut child));
+            timed_teardown(cfg, id, Some(&mut child));
             *held = None;
             let until = Instant::now() + DELIVER_TIMEOUT;
             print_rest(&meta, &log, &live, &diag, until);
+            if !meta.fatal {
+                bytes = Some(fs::metadata(&log).map_or(0, |m| m.len()) + meta.skipped);
+                skipped = meta.skipped;
+            }
             if let Some(pr) = &meta.problem {
                 diag.put(format!("burner: {pr}\n").as_bytes(), None);
             }
@@ -455,90 +495,125 @@ fn run_vm(
                 diag.put(format!("burner: {VMM}: ").as_bytes(), None);
                 diag.put(&escape_controls(&fc_tail), None);
                 diag.put(b"\n", None);
+                let tail = String::from_utf8_lossy(&escape_controls(&fc_tail)).into_owned();
+                json::note_warning(Kind::Vmm, format!("{VMM}: {}", tail.trim()), false);
             }
             let mut code = meta.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX);
-            if meta.guest_error {
-                code = EXIT_SANDBOX;
-            }
-            match meta.rc {
-                Some(rc) if !meta.guest_error => set_status("exited", Some(rc)),
-                _ => set_status("sandbox_error", None),
+            match (&meta.problem, meta.rc) {
+                // guest init's own words, kept apart from burner's
+                (Some(pr), _) if meta.guest_error => {
+                    record::set_guest_error(pr.clone());
+                    code = EXIT_SANDBOX;
+                    record::set_outcome(
+                        RunOutcome::SandboxError,
+                        None,
+                        Some((
+                            Kind::Guest,
+                            "guest init reported an error, see guest_error".into(),
+                        )),
+                    );
+                }
+                (pr, None) => record::set_outcome(
+                    RunOutcome::SandboxError,
+                    None,
+                    Some((
+                        Kind::Sandbox,
+                        pr.clone()
+                            .unwrap_or_else(|| "the VM gave no exit code".into()),
+                    )),
+                ),
+                (pr, Some(rc)) => {
+                    if let Some(pr) = pr {
+                        json::note_warning(Kind::Result, pr, false);
+                    }
+                    record::set_outcome(RunOutcome::Exited, Some(rc), None);
+                }
             }
             // the guest failed before the command ran. its rc of 125 is for
             // burners that don't read result/fail. from an older guest init
             // the file can only be the command's own
             if let (Some(_), Some(f), false) = (meta.rc, &meta.fail, legacy) {
                 code = EXIT_SANDBOX;
-                set_status(
-                    if f == "input" {
-                        "input_error"
-                    } else {
-                        "sandbox_error"
-                    },
-                    None,
-                );
+                if f == "input" {
+                    let msg = "the input didn't unpack in the VM, the command never ran";
+                    record::set_outcome(
+                        RunOutcome::InputError,
+                        None,
+                        Some((Kind::Input, msg.into())),
+                    );
+                } else {
+                    let msg = "the guest couldn't read its job, the command never ran";
+                    record::set_outcome(
+                        RunOutcome::SandboxError,
+                        None,
+                        Some((Kind::Sandbox, msg.into())),
+                    );
+                }
             }
             // the command powered off or rebooted the VM before it exited. its
             // rc of 125 is for burners that don't read result/ended
             let ended = match meta.ended.as_deref() {
-                Some("poweroff") => Some(("poweroff", "powered the VM off")),
-                Some("reboot") => Some(("reboot", "rebooted the VM")),
+                Some("poweroff") => {
+                    Some((RunOutcome::Poweroff, Kind::Poweroff, "powered the VM off"))
+                }
+                Some("reboot") => Some((RunOutcome::Reboot, Kind::Reboot, "rebooted the VM")),
                 _ => None,
             };
-            if let (Some(_), Some((outcome, what)), false) = (meta.rc, ended, legacy) {
-                diag.put(
-                    format!("burner: the command {what} before it exited\n").as_bytes(),
-                    None,
+            if let (Some(_), Some((outcome, kind, what)), false) = (meta.rc, ended, legacy) {
+                ends(
+                    outcome,
+                    kind,
+                    format!("the command {what} before it exited"),
                 );
                 code = EXIT_SANDBOX;
-                set_status(outcome, None);
             }
             if meta.timed_out {
-                diag.put(
-                    format!(
-                        "burner: stopped at the {}s time limit, the output and /out up to then are above\n",
-                        p.ttl
-                    )
-                    .as_bytes(),
-                    None,
+                let msg = format!(
+                    "stopped at the {}s time limit, the output and /out up to then are above",
+                    p.ttl
                 );
+                ends(RunOutcome::Timeout, Kind::Timeout, msg);
                 code = EXIT_TIMEOUT;
-                set_status("timeout", None);
             }
             // an image built from another burner's guest init: its results can't be trusted
             if meta.rc.is_some() && meta.proto != Some(GUEST_PROTO) {
-                diag.put(
-                    format!(
-                        "burner: image {} runs a guest init from another burner version, rebuild it: tools/build-image {}\n",
-                        p.img, p.img
-                    )
-                    .as_bytes(),
-                    None,
+                let msg = format!(
+                    "image {} runs a guest init from another burner version, rebuild it: tools/build-image {}",
+                    p.img, p.img
                 );
+                ends(RunOutcome::SandboxError, Kind::Sandbox, msg);
                 code = EXIT_SANDBOX;
-                set_status("sandbox_error", None);
             }
-            if let (Some(out), false) = (&tar_out, meta.fatal) {
+            if let Some(out) = &tar_out {
                 // a tar that didn't arrive whole is a failed run, whatever the guest said
-                if !deliver(&tar_path, out, until) || !out.complete(until) {
-                    diag.put(
-                        b"burner: result tar not fully delivered, failing the run\n",
-                        None,
-                    );
+                let delivered =
+                    !meta.fatal && deliver(&tar_path, out, until) && out.complete(until);
+                record::set_tar(TarInfo {
+                    bytes: fs::metadata(&tar_path).map_or(0, |m| m.len()),
+                    delivered,
+                });
+                if !delivered && !meta.fatal {
+                    let msg = "result tar not fully delivered, failing the run";
+                    ends(RunOutcome::SandboxError, Kind::ResultLost, msg.into());
                     code = EXIT_SANDBOX;
-                    set_status("sandbox_error", None);
                 }
             }
             code
         }
     };
     let until = Instant::now() + Duration::from_secs(30);
-    if !live.complete(until) {
-        diag.put(
-            b"burner: some live output was dropped (reader too slow)\n",
-            None,
-        );
+    let dropped = !live.complete(until);
+    if dropped {
+        let msg = "some live output was dropped (reader too slow)";
+        json::note_warning(Kind::Output, msg, false);
+        diag.put(format!("burner: {msg}\n").as_bytes(), None);
     }
+    record::set_output(OutputInfo {
+        bytes,
+        live_bytes,
+        skipped_bytes: skipped,
+        dropped,
+    });
     diag.drain(until);
     log_line(&format!(
         "end {id} tag={} secs={:.1} code={code}",
@@ -951,10 +1026,18 @@ fn go_live(cfg: &Config, id: &str, deadline: Deadline) -> Result<()> {
         let led = Ledger::open(&cfg.paths.state)?;
         let cur = led.get(id).context("ledger entry vanished")?;
         if cur.cancel {
-            return Err(Exit(EXIT_INTERRUPTED, "cancelled before start".into()).into());
+            return Err(exit(
+                EXIT_INTERRUPTED,
+                Kind::Killed,
+                "cancelled before start",
+            ));
         }
         if cur.deadline_boot.is_some_and(|d| sys::boottime() > d) {
-            return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
+            return Err(exit(
+                EXIT_SANDBOX,
+                Kind::Sandbox,
+                format!("setup took longer than {PREP_SECS}s"),
+            ));
         }
         led.update(id, |v| {
             v.status = Status::Running;
@@ -962,7 +1045,11 @@ fn go_live(cfg: &Config, id: &str, deadline: Deadline) -> Result<()> {
         })?;
     }
     if is_interrupted() {
-        return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
+        return Err(exit(
+            EXIT_INTERRUPTED,
+            Kind::Interrupted,
+            "interrupted, sandbox stopped",
+        ));
     }
     Ok(())
 }
@@ -982,7 +1069,7 @@ fn spool_input(path: &Path, mode: Input, idle: Duration) -> Result<Option<PathBu
     let mut buf = vec![0u8; 1 << 20];
     loop {
         if is_interrupted() {
-            return Err(Exit(EXIT_INTERRUPTED, "interrupted".into()).into());
+            return Err(exit(EXIT_INTERRUPTED, Kind::Interrupted, "interrupted"));
         }
         if start.elapsed() > STDIN_TOTAL {
             return Err(usage("input took longer than 10 min"));
@@ -1007,7 +1094,11 @@ fn spool_input(path: &Path, mode: Input, idle: Duration) -> Result<Option<PathBu
         }
         // spooled input counts against the same 1 GiB the VM disks keep free
         if n % (16 << 20) < got as u64 && !disk_left(path, 0) {
-            return Err(Exit(EXIT_SANDBOX, "not enough disk to hold the input".into()).into());
+            return Err(exit(
+                EXIT_SANDBOX,
+                Kind::DiskFull,
+                "not enough disk to hold the input",
+            ));
         }
         f.write_all(&buf[..got])?;
     }
@@ -1100,7 +1191,7 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32
     let mut waited = false;
     loop {
         if is_interrupted() {
-            return Err(Exit(EXIT_INTERRUPTED, "interrupted".into()).into());
+            return Err(exit(EXIT_INTERRUPTED, Kind::Interrupted, "interrupted"));
         }
         {
             let led = Ledger::open(&cfg.paths.state)?;
@@ -1139,30 +1230,28 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32
                 return Ok((vm.net_slot, uid));
             }
             if p.no_wait {
-                set_status("busy", None);
-                return Err(Exit(
+                record::set_outcome(RunOutcome::Busy, None, None);
+                return Err(exit(
                     EXIT_SANDBOX,
+                    Kind::Busy,
                     format!("no free slot ({} running) and --no-wait", busy.len()),
-                )
-                .into());
+                ));
             }
             if !waited {
                 // queued, never written while the ledger lock is held
-                diag.put(
-                    format!(
-                        "burner: waiting for a slot ({} running, {used} of {} MiB in use)\n",
-                        busy.len(),
-                        l.total_mem_mib
-                    )
-                    .as_bytes(),
-                    None,
+                let msg = format!(
+                    "waiting for a slot ({} running, {used} of {} MiB in use)",
+                    busy.len(),
+                    l.total_mem_mib
                 );
+                json::note_warning(Kind::Queued, &msg, false);
+                diag.put(format!("burner: {msg}\n").as_bytes(), None);
                 waited = true;
             }
         }
         if start.elapsed() > QUEUE_WAIT {
-            set_status("busy", None);
-            return Err(Exit(EXIT_SANDBOX, "no free slot after 10 min".into()).into());
+            record::set_outcome(RunOutcome::Busy, None, None);
+            return Err(exit(EXIT_SANDBOX, Kind::Busy, "no free slot after 10 min"));
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -1184,15 +1273,15 @@ fn reserve(cfg: &Config, path: &Path, size: u64) -> Result<()> {
     .context("the disk lock stayed busy")?;
     let free = sys::free_bytes(path.parent().unwrap_or(Path::new("/")))?;
     if free < size + (1 << 30) {
-        return Err(Exit(
+        return Err(exit(
             EXIT_SANDBOX,
+            Kind::DiskFull,
             format!(
                 "not enough disk: this VM needs {} MiB, {} MiB free",
                 size >> 20,
                 free >> 20
             ),
-        )
-        .into());
+        ));
     }
     let f = File::create(path)?;
     sys::preallocate(&f, size).context("reserving disk space")?;
@@ -1203,17 +1292,29 @@ fn reserve(cfg: &Config, path: &Path, size: u64) -> Result<()> {
 /// (set at admission) says so
 fn prep_ok(cfg: &Config, id: &str) -> Result<()> {
     if is_interrupted() {
-        return Err(Exit(EXIT_INTERRUPTED, "interrupted, sandbox stopped".into()).into());
+        return Err(exit(
+            EXIT_INTERRUPTED,
+            Kind::Interrupted,
+            "interrupted, sandbox stopped",
+        ));
     }
     let v = ledger::peek(&cfg.paths.state, id);
     if v.as_ref().is_none_or(|v| v.cancel) {
-        set_status("killed", None);
-        return Err(Exit(EXIT_INTERRUPTED, "killed by burner kill".into()).into());
+        record::set_outcome(RunOutcome::Killed, None, None);
+        return Err(exit(
+            EXIT_INTERRUPTED,
+            Kind::Killed,
+            "killed by burner kill",
+        ));
     }
     if v.is_some_and(|v| {
         v.status == Status::Preparing && v.deadline_boot.is_some_and(|d| sys::boottime() > d)
     }) {
-        return Err(Exit(EXIT_SANDBOX, format!("setup took longer than {PREP_SECS}s")).into());
+        return Err(exit(
+            EXIT_SANDBOX,
+            Kind::Sandbox,
+            format!("setup took longer than {PREP_SECS}s"),
+        ));
     }
     Ok(())
 }

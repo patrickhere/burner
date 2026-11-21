@@ -12,12 +12,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::json::Kind;
 use crate::sys;
 
 mod admin;
 mod console;
 mod launch;
 mod plan;
+pub mod record;
 
 #[cfg(target_os = "linux")]
 pub use admin::reaper_age;
@@ -31,20 +33,24 @@ pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main};
 
 pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};
 
-/// an error with the exit code it should end the run with
+/// an error with the exit code it should end the run with, and its kind
 #[derive(Debug)]
-struct Exit(u8, String);
+struct Exit(u8, Kind, String);
 
 impl fmt::Display for Exit {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.1)
+        f.write_str(&self.2)
     }
 }
 
 impl std::error::Error for Exit {}
 
+fn exit(code: u8, kind: Kind, msg: impl Into<String>) -> anyhow::Error {
+    Exit(code, kind, msg.into()).into()
+}
+
 fn usage(msg: impl Into<String>) -> anyhow::Error {
-    Exit(EXIT_USAGE, msg.into()).into()
+    exit(EXIT_USAGE, Kind::Usage, msg)
 }
 
 /// SIGINT, SIGTERM and SIGHUP so far. a count, not a flag: a wait that starts
