@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::config::{self, Config};
+use crate::json::{self, Kind};
 use crate::ledger::Ledger;
 use crate::sys;
 
@@ -69,10 +70,12 @@ pub fn main(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
             "setup stopped while it swapped in the new files, the kernel and image may not \
              match now: run it again",
         )),
-        Err(_) if crate::run::is_interrupted() => {
-            eprintln!("burner: setup interrupted, nothing was changed");
-            Ok(ExitCode::from(crate::run::EXIT_INTERRUPTED))
-        }
+        Err(_) if crate::run::is_interrupted() => Ok(json::fail(
+            "setup",
+            crate::run::EXIT_INTERRUPTED,
+            Kind::Interrupted,
+            "setup interrupted, nothing was changed",
+        )),
         r => r,
     }
 }
@@ -115,10 +118,10 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let stage = Stage::new(root)?;
     match &src {
         Source::Brew(dir) => {
-            eprintln!(
-                "burner: the guest kernel and alpine image homebrew installed with burner, from {}",
+            say(&format!(
+                "the guest kernel and alpine image homebrew installed with burner, from {}",
                 dir.display()
-            );
+            ));
             for name in [KERNEL, IMAGE] {
                 let from = dir.join(name);
                 config::trusted_file(&from)?;
@@ -128,13 +131,18 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
             }
         }
         Source::Release(base, _) => {
-            eprintln!("burner: fetching the guest kernel and the alpine image from {base}");
+            say(&format!(
+                "fetching the guest kernel and the alpine image from {base}"
+            ));
             download(base, "=https", &stage.0)?;
         }
         Source::From(base, proto) => {
-            eprintln!(
-                "burner: fetching from {base}. --from skips the kernel checksum built into \
-                 burner, both files are checked only against the SHA256SUMS there"
+            json::warn(
+                Kind::Unverified,
+                format!(
+                    "fetching from {base}. --from skips the kernel checksum built into \
+                     burner, both files are checked only against the SHA256SUMS there"
+                ),
             );
             download(base, proto, &stage.0)?;
         }
@@ -147,12 +155,13 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
                  if you meant to use another kernel, --from skips the pin"
             );
         }
-        eprintln!("burner: {KERNEL} matches the pinned sha256");
+        say(&format!("{KERNEL} matches the pinned sha256"));
     }
     if matches!(src, Source::Release(..)) {
-        eprintln!(
-            "burner: the image is checked only against the release's own SHA256SUMS, \
-             which comes from the same place. gh attestation verify checks where it was built"
+        json::warn(
+            Kind::Unverified,
+            "the image is checked only against the release's own SHA256SUMS, \
+             which comes from the same place. gh attestation verify checks where it was built",
         );
     }
 
@@ -204,10 +213,45 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     }
     drop(ledger);
 
-    println!("kernel  {}", kdir.join("vmlinux").display());
-    println!("image   {}", idir.join("rootfs.ext4").display());
-    println!("burner doctor checks the rest");
-    Ok(ExitCode::SUCCESS)
+    let res = SetupResult {
+        source: match &src {
+            Source::Brew(_) => "brew",
+            Source::Release(..) => "release",
+            Source::From(..) => "from",
+        },
+        from: match &src {
+            Source::Brew(dir) => dir.display().to_string(),
+            Source::Release(base, _) | Source::From(base, _) => base.clone(),
+        },
+        kernel_pinned: !matches!(src, Source::From(..)),
+        kernel: kdir.join("vmlinux").display().to_string(),
+        image: idir.join("rootfs.ext4").display().to_string(),
+    };
+    if !json::on() {
+        println!("kernel  {}", res.kernel);
+        println!("image   {}", res.image);
+        println!("burner doctor checks the rest");
+    }
+    Ok(json::reply("setup", 0, Some(res)))
+}
+
+#[derive(serde::Serialize)]
+pub struct SetupResult {
+    /// brew, release or from
+    pub source: &'static str,
+    /// the dir homebrew installed, or the url the files came from
+    pub from: String,
+    /// the kernel matched the sha256 built into burner (not with --from)
+    pub kernel_pinned: bool,
+    pub kernel: String,
+    pub image: String,
+}
+
+/// progress, on stderr and not in the json
+fn say(msg: &str) {
+    if !json::on() {
+        eprintln!("burner: {msg}");
+    }
 }
 
 /// the ledger, locked, when no VM is in it
@@ -280,7 +324,7 @@ fn download(base: &str, proto: &str, dir: &Path) -> Result<()> {
         if got != want {
             bail!("checksum mismatch for {name}: SHA256SUMS says {want}, the download is {got}");
         }
-        eprintln!("burner: {name} matches SHA256SUMS");
+        say(&format!("{name} matches SHA256SUMS"));
     }
     Ok(())
 }

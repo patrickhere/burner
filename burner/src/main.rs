@@ -93,7 +93,14 @@ fn main() -> ExitCode {
     let name = cli.cmd.name();
     match run(cli) {
         Ok(code) => code,
-        Err(e) => json::fail(name, exit::EXIT_FAILED, Kind::Io, format!("{e:#}")),
+        Err(e) => {
+            let kind = if name.starts_with("net ") {
+                Kind::Net
+            } else {
+                Kind::Io
+            };
+            json::fail(name, exit::EXIT_FAILED, kind, format!("{e:#}"))
+        }
     }
 }
 
@@ -227,6 +234,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     };
     #[cfg(target_os = "macos")]
     cgroup::set_dir(&cfg.paths.state);
+    let name = cli.cmd.name();
     match cli.cmd {
         Cmd::Config => {
             if !cli.json {
@@ -242,30 +250,45 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
         // not there on this OS rather than failed, like a wrong flag
         #[cfg(target_os = "macos")]
-        Cmd::Net { .. } => {
-            eprintln!(
-                "burner: on macOS each VM's network is a process of its own, there's nothing to set up"
-            );
-            Ok(ExitCode::from(run::EXIT_USAGE))
-        }
+        Cmd::Net { .. } => Ok(json::fail(
+            name,
+            run::EXIT_USAGE,
+            Kind::Unsupported,
+            "on macOS each VM's network is a process of its own, there's nothing to set up",
+        )),
         #[cfg(target_os = "linux")]
         Cmd::Net { action } => match action.as_str() {
             "show" => {
-                print!("{}", net::ruleset(&cfg)?);
-                Ok(ExitCode::SUCCESS)
+                let ruleset = net::ruleset(&cfg)?;
+                if !cli.json {
+                    print!("{ruleset}");
+                }
+                let table = format!("inet {}", net::TABLE);
+                Ok(json::reply(
+                    name,
+                    0,
+                    Some(net::ShowResult { table, ruleset }),
+                ))
             }
             "down" => {
                 let n = net::down(&cfg)?;
-                if n > 0 {
+                if n > 0 && !cli.json {
                     eprintln!("burner: stopped {n} VMs that had a network");
                 }
-                Ok(ExitCode::SUCCESS)
+                Ok(json::reply(
+                    name,
+                    0,
+                    Some(net::DownResult { stopped_vms: n }),
+                ))
             }
             _ => {
-                for note in net::up(&cfg)? {
-                    eprintln!("burner: {note}");
+                let notes = net::up(&cfg)?;
+                if !cli.json {
+                    for note in &notes {
+                        eprintln!("burner: {note}");
+                    }
                 }
-                Ok(ExitCode::SUCCESS)
+                Ok(json::reply(name, 0, Some(net::UpResult { notes })))
             }
         },
         Cmd::Ls => run::ls(&cfg),

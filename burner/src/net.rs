@@ -198,6 +198,22 @@ fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
         .collect())
 }
 
+#[derive(serde::Serialize)]
+pub struct ShowResult {
+    pub table: String,
+    pub ruleset: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct UpResult {
+    pub notes: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct DownResult {
+    pub stopped_vms: usize,
+}
+
 /// the full nft ruleset for this config
 pub fn ruleset(cfg: &Config) -> Result<String> {
     let uplink = cfg.uplink()?;
