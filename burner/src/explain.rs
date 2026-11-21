@@ -540,6 +540,8 @@ mod linux {
             });
             notes.push(if public_uplink {
                 "your public ip not blocked: this host has a public address of its own, and that's blocked as a host address".into()
+            } else if cfg.net.block_public_ip && !crate::sys::is_root() {
+                "your public ip blocked by net.block_public_ip, the address it found is only readable as root (sudo burner explain)".into()
             } else if cfg.net.block_public_ip {
                 "your public ip not looked up yet, so runs with a network are refused until the reaper finds it".into()
             } else {
