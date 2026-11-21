@@ -363,8 +363,12 @@ pub struct DownResult {
 
 /// the full nft ruleset for this config
 pub fn ruleset(cfg: &Config) -> Result<String> {
-    let uplink = cfg.uplink()?;
-    let blocked = blocked(cfg)?.join(", ");
+    Ok(ruleset_for(cfg, &cfg.uplink()?, &blocked(cfg)?))
+}
+
+/// the pure half of ruleset
+fn ruleset_for(cfg: &Config, uplink: &str, blocked: &[String]) -> String {
+    let blocked = blocked.join(", ");
     let resolvers = cfg
         .net
         .resolvers
@@ -374,7 +378,7 @@ pub fn ruleset(cfg: &Config) -> Result<String> {
         .join(", ");
     let subnet = &cfg.net.subnet;
     let t = TAP_PREFIX;
-    Ok(format!(
+    format!(
         r#"table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
@@ -383,6 +387,12 @@ table inet {TABLE} {{
     set mode_web {{ type ifname; }}
     set mode_open {{ type ifname; }}
     set tap_ip {{ type ifname . ipv4_addr; }}
+
+    # the connection log: per tap, a jump into chains that only log and
+    # return. a tap with no element here just isn't logged
+    map log_try {{ type ifname : verdict; }}
+    map log_up {{ type ifname : verdict; }}
+    map log_down {{ type ifname : verdict; }}
 
     # before defrag and conntrack (-400): spoofed, fragmented or flooding guest
     # packets never reach shared state on the host
@@ -396,11 +406,13 @@ table inet {TABLE} {{
 
     chain input {{
         type filter hook input priority filter - 10; policy accept;
+        iifname "{t}*" ct state new iifname vmap @log_try
         iifname "{t}*" drop
     }}
 
     chain forward {{
         type filter hook forward priority filter - 10; policy accept;
+        iifname "{t}*" ct state new iifname vmap @log_try
         iifname "{t}*" meta nfproto ipv6 drop
         oifname "{t}*" meta nfproto ipv6 drop
         iifname "{t}*" iifname . ip saddr != @tap_ip drop
@@ -419,6 +431,19 @@ table inet {TABLE} {{
         oifname "{t}*" ct state established,related accept
         oifname "{t}*" drop
     }}
+
+    # after forward: an accept there doesn't stop this chain, a drop does, so
+    # it only ever sees what burner let through. it logs and never decides:
+    # its returns end it like its accept policy would
+    chain log_after {{
+        type filter hook forward priority filter - 9; policy accept;
+        iifname "{t}*" udp dport 53 iifname vmap @log_up
+        iifname "{t}*" udp dport 53 return
+        iifname "{t}*" ct state new iifname vmap @log_up
+        oifname "{t}*" udp sport 53 oifname vmap @log_down
+        oifname "{t}*" udp sport 53 return
+        oifname "{t}*" ct direction reply ct status & assured == 0 oifname vmap @log_down
+    }}
 }}
 
 table ip {NAT_TABLE}
@@ -430,7 +455,7 @@ table ip {NAT_TABLE} {{
     }}
 }}
 "#
-    ))
+    )
 }
 
 fn nft(script: &str, check: bool) -> Result<()> {
@@ -604,6 +629,119 @@ pub fn up(cfg: &Config) -> Result<Vec<String>> {
     Ok(notes)
 }
 
+/// the nflog group a slot's log goes to: one each, since a group has one reader
+pub fn log_group(i: u32) -> u32 {
+    LOG_GROUP_BASE + i
+}
+
+pub const LOG_GROUP_BASE: u32 = 29217;
+/// new attempts a VM gets itemized before the rest are only counted
+const LOG_TRY_LIMIT: &str = "100/second burst 500 packets";
+const LOG_DOWN_LIMIT: &str = "200/second burst 400 packets";
+
+/// a tap's log chains and the elements that let its traffic through, as one
+/// nft transaction: the log is never missing while the tap passes traffic.
+/// safe to repeat, the chains are flushed before their rules go in. the
+/// chains only log, count and return
+fn slot_script(s: &Slot, i: u32, mode: Mode) -> String {
+    let tap = &s.tap;
+    let g = log_group(i);
+    let mut o = String::new();
+    for c in ["n", "over"] {
+        o += &format!("add counter inet {TABLE} lt_{tap}_{c}\n");
+    }
+    for (c, rules) in [
+        (
+            "lt",
+            vec![
+                format!("counter name lt_{tap}_n"),
+                format!("limit rate over {LOG_TRY_LIMIT} counter name lt_{tap}_over return"),
+                format!("udp dport 53 log prefix \"t\" group {g} snaplen 320 return"),
+                format!("log prefix \"t\" group {g} snaplen 80"),
+            ],
+        ),
+        (
+            "lu",
+            vec![
+                format!("udp dport 53 log prefix \"q\" group {g} snaplen 320 return"),
+                format!("log prefix \"o\" group {g} snaplen 80"),
+            ],
+        ),
+        (
+            "ld",
+            vec![
+                format!("limit rate over {LOG_DOWN_LIMIT} return"),
+                format!("udp sport 53 log prefix \"r\" group {g} snaplen 600 return"),
+                format!("log prefix \"a\" group {g} snaplen 80"),
+            ],
+        ),
+    ] {
+        o += &format!("add chain inet {TABLE} {c}_{tap}\nflush chain inet {TABLE} {c}_{tap}\n");
+        for r in rules {
+            o += &format!("add rule inet {TABLE} {c}_{tap} {r}\n");
+        }
+    }
+    for (map, c) in [("log_try", "lt"), ("log_up", "lu"), ("log_down", "ld")] {
+        o += &format!("add element inet {TABLE} {map} {{ \"{tap}\" : jump {c}_{tap} }}\n");
+    }
+    o += &format!(
+        "add element inet {TABLE} tap_ip {{ {tap} . {} }}\nadd element inet {TABLE} mode_{} {{ {tap} }}\n",
+        s.guest,
+        mode.name()
+    );
+    o
+}
+
+/// what removes a slot's log pieces: the elements pointing at the chains
+/// first, then the chains, then the counters their rules name
+fn slot_teardown(tap: &str) -> Vec<String> {
+    let mut o = Vec::new();
+    for map in ["log_try", "log_up", "log_down"] {
+        o.push(format!("delete element inet {TABLE} {map} {{ \"{tap}\" }}"));
+    }
+    for c in ["lt", "lu", "ld"] {
+        o.push(format!("delete chain inet {TABLE} {c}_{tap}"));
+    }
+    for c in ["n", "over"] {
+        o.push(format!("delete counter inet {TABLE} lt_{tap}_{c}"));
+    }
+    o
+}
+
+/// a slot's log counters: every new attempt, and those past the
+/// itemization limit. None when they can't be read
+pub fn log_counts(tap: &str) -> Option<(u64, u64)> {
+    let get = |c: &str| -> Option<u64> {
+        let out = helper(
+            "nft",
+            &[
+                "-j",
+                "list",
+                "counter",
+                "inet",
+                TABLE,
+                &format!("lt_{tap}_{c}"),
+            ],
+            None,
+        )
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_counter(&out.stdout)
+    };
+    Some((get("n")?, get("over")?))
+}
+
+fn parse_counter(json: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    v["nftables"]
+        .as_array()?
+        .iter()
+        .find_map(|o| o.get("counter"))?["packets"]
+        .as_u64()
+}
+
 /// put running VMs' taps back in the sets, after a reload or a fail-closed flush
 fn readd_running(cfg: &Config) -> Result<()> {
     let mut readd = String::new();
@@ -613,13 +751,7 @@ fn readd_running(cfg: &Config) -> Result<()> {
         };
         let s = slot(cfg, i)?;
         if mode != Mode::None && std::path::Path::new("/sys/class/net").join(&s.tap).exists() {
-            readd += &format!(
-                "add element inet {TABLE} tap_ip {{ {} . {} }}\nadd element inet {TABLE} mode_{} {{ {} }}\n",
-                s.tap,
-                s.guest,
-                mode.name(),
-                s.tap
-            );
+            readd += &slot_script(&s, i, mode);
         }
     }
     if !readd.is_empty() {
@@ -932,28 +1064,8 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
         "ip",
         &["addr", "add", &format!("{}/30", s.host), "dev", &s.tap],
     )?;
-    run(
-        "nft",
-        &[
-            "add",
-            "element",
-            "inet",
-            TABLE,
-            "tap_ip",
-            &format!("{{ {} . {} }}", s.tap, s.guest),
-        ],
-    )?;
-    run(
-        "nft",
-        &[
-            "add",
-            "element",
-            "inet",
-            TABLE,
-            &format!("mode_{}", mode.name()),
-            &format!("{{ {} }}", s.tap),
-        ],
-    )?;
+    // the log chains and the pass-through elements in one go
+    nft(&slot_script(&s, i, mode), false)?;
     run("ip", &["link", "set", &s.tap, "up"])?;
     Ok(s)
 }
@@ -965,6 +1077,26 @@ pub fn tap_down(cfg: &Config, i: u32) -> bool {
     let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
         return false;
     };
+    tap_down_locked(cfg, i)
+}
+
+/// tap_down for a VM's own teardown: its log counters are read first, before
+/// they go with the tap, and kept in state/netcount/<id> for the run to read
+pub fn tap_down_for(cfg: &Config, i: u32, id: &str) -> bool {
+    let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
+        return false;
+    };
+    if let Ok(s) = slot(cfg, i)
+        && let Some((n, over)) = log_counts(&s.tap)
+    {
+        let dir = cfg.paths.state.join("netcount");
+        if sys::private_dir(&dir).is_ok() {
+            let _ = std::fs::write(
+                dir.join(id),
+                serde_json::json!({"tries": n, "over": over}).to_string(),
+            );
+        }
+    }
     tap_down_locked(cfg, i)
 }
 
@@ -1000,6 +1132,11 @@ fn net_lock_for(cfg: &Config, wait: std::time::Duration) -> Result<sys::Lock> {
 }
 
 fn drop_elements(s: &Slot) {
+    // one at a time: a piece that's already gone mustn't keep the others
+    for cmd in slot_teardown(&s.tap) {
+        let args: Vec<&str> = cmd.split(' ').collect();
+        let _ = run("nft", &args);
+    }
     let _ = run(
         "nft",
         &[
@@ -1101,6 +1238,111 @@ pub(crate) mod tests {
             );
         }
         assert!(!s.contains("blocked4"), "the blocked set stays as it was");
+    }
+
+    #[test]
+    fn log_chains_never_decide() {
+        let cfg = Config::default();
+        let s = slot(&cfg, 3).unwrap();
+        let script = slot_script(&s, 3, Mode::Web);
+        for line in script.lines().filter(|l| l.starts_with("add rule")) {
+            for verdict in [
+                " accept",
+                " drop",
+                " reject",
+                " queue",
+                " jump",
+                " goto",
+                " continue",
+            ] {
+                assert!(!line.contains(verdict), "{verdict} in {line}");
+            }
+        }
+        // chains exist before the elements that point at them, and the
+        // elements that let traffic through come last, with them
+        let chain = script.find("add chain inet burner lt_bn3").unwrap();
+        let elem = script.find("add element inet burner log_try").unwrap();
+        let pass = script.find("add element inet burner tap_ip").unwrap();
+        assert!(chain < elem && elem < pass);
+        assert!(script.contains("group 29220 "));
+        assert!(script.contains("add element inet burner mode_web { bn3 }"));
+        assert!(
+            script.contains("flush chain inet burner lt_bn3"),
+            "safe to repeat"
+        );
+        // removal: elements, then chains, then counters
+        let down = slot_teardown("bn3").join("\n");
+        let e = down.find("delete element inet burner log_try").unwrap();
+        let c = down.find("delete chain inet burner lt_bn3").unwrap();
+        let n = down.find("delete counter inet burner lt_bn3_n").unwrap();
+        assert!(e < c && c < n);
+        assert_eq!(log_group(1023), 30240);
+    }
+
+    /// the rules of one chain in a ruleset, trimmed
+    fn chain<'a>(rules: &'a str, name: &str) -> Vec<&'a str> {
+        let start = rules.find(&format!("chain {name} {{")).unwrap();
+        rules[start..]
+            .lines()
+            .skip(2)
+            .take_while(|l| l.trim() != "}")
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn the_filter_itself_is_unchanged() {
+        let cfg = Config::default();
+        let r = ruleset_for(&cfg, "eth0", &["10.0.0.0/8".into()]);
+        // forward: the one new line at the top, then every rule as before
+        let fwd = chain(&r, "forward");
+        assert_eq!(fwd[0], "iifname \"bn*\" ct state new iifname vmap @log_try");
+        let before = [
+            "iifname \"bn*\" meta nfproto ipv6 drop",
+            "oifname \"bn*\" meta nfproto ipv6 drop",
+            "iifname \"bn*\" iifname . ip saddr != @tap_ip drop",
+            "iifname \"bn*\" oifname != \"eth0\" drop",
+            "iifname \"bn*\" ip daddr @blocked4 drop",
+            "iifname \"bn*\" ct state established,related accept",
+            "iifname @mode_web meta l4proto { tcp, udp } th dport 53 ip daddr @resolvers meter burner_dns_web { iifname limit rate 20/second burst 50 packets } accept",
+            "iifname @mode_open meta l4proto { tcp, udp } th dport 53 ip daddr @resolvers meter burner_dns_open { iifname limit rate 20/second burst 50 packets } accept",
+            "iifname \"bn*\" meta l4proto { tcp, udp } th dport 53 drop",
+            "iifname @mode_web icmp type echo-request meter burner_ping_web { iifname limit rate 5/second burst 10 packets } accept",
+            "iifname @mode_open icmp type echo-request meter burner_ping_open { iifname limit rate 5/second burst 10 packets } accept",
+            "iifname @mode_web tcp dport { 80, 443 } ct state new meter burner_web { iifname limit rate 20/second burst 40 packets } accept",
+            "iifname @mode_open tcp dport { 25, 465, 587 } drop",
+            "iifname @mode_open ct state new meter burner_open { iifname limit rate 50/second burst 100 packets } accept",
+            "iifname \"bn*\" drop",
+            "oifname \"bn*\" ct state established,related accept",
+            "oifname \"bn*\" drop",
+        ];
+        assert_eq!(&fwd[1..], &before[..]);
+        let input = chain(&r, "input");
+        assert_eq!(
+            input,
+            [
+                "iifname \"bn*\" ct state new iifname vmap @log_try",
+                "iifname \"bn*\" drop"
+            ]
+        );
+        // the log chain after it decides nothing: vmap jumps into chains that
+        // only return, and returns, which end it as its accept policy would
+        let after = chain(&r, "log_after");
+        assert!(r.contains("type filter hook forward priority filter - 9; policy accept;"));
+        for l in &after {
+            assert!(l.contains(" vmap @log_") || l.ends_with(" return"), "{l}");
+            for v in [" accept", " drop", " reject", " queue", " goto"] {
+                assert!(!l.contains(v), "{l}");
+            }
+        }
+        assert_eq!(after.len(), 6);
+    }
+
+    #[test]
+    fn counters() {
+        let j = br#"{"nftables":[{"metainfo":{}},{"counter":{"family":"inet","name":"lt_bn3_n","table":"burner","handle":7,"packets":42,"bytes":2520}}]}"#;
+        assert_eq!(parse_counter(j), Some(42));
+        assert_eq!(parse_counter(b"{}"), None);
     }
 
     #[test]

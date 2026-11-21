@@ -113,7 +113,7 @@ pub(super) fn release(cfg: &Config, id: &str, slot: Slot, wait: Duration) -> Rel
     let tap_gone = match slot {
         Slot::None | Slot::Swept => true,
         #[cfg(target_os = "linux")]
-        Slot::Tap(i) => net::tap_down(cfg, i),
+        Slot::Tap(i) => net::tap_down_for(cfg, i, id),
         // no tap on macOS: the network is macnet, and it went with the VMM's group
         #[cfg(target_os = "macos")]
         Slot::Tap(_) => true,
