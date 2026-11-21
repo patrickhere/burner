@@ -27,9 +27,10 @@ use crate::sys;
 
 /// keys for a far end that isn't taking them; past this they're dropped
 const TO_PTY_CAP: usize = 1 << 20;
-/// bytes held as a possible record marker go out after this much quiet: a
-/// marker never comes in pieces that far apart
-const HELD_QUIET: Duration = Duration::from_millis(50);
+/// bytes held as a possible record marker go out after this much quiet. a
+/// marker split over a slow link comes together well within it; text that
+/// only looks like the start of one waits that long to show
+const HELD_QUIET: Duration = Duration::from_secs(1);
 
 enum Ended {
     /// ssh went: the far end ended the session, or the connection did
@@ -281,6 +282,12 @@ fn stop_ssh(child: &mut Child, closed: bool) -> Option<std::process::ExitStatus>
     }
 }
 
+/// whether burner's wrapper on the far end has said anything yet
+fn answered(seen: &Arc<Mutex<Seen>>) -> bool {
+    let s = seen.lock().unwrap_or_else(|e| e.into_inner());
+    s.wrap.is_some() || s.nobin.is_some()
+}
+
 /// copies bytes both ways until ssh goes, ~. is typed or a signal comes.
 /// the master is dropped on the way out, which hangs ssh up
 fn relay(
@@ -302,6 +309,9 @@ fn relay(
     let mut buf = vec![0u8; 16384];
     let mut stdin_open = true;
     let mut last_out = Instant::now();
+    // a ctrl-c typed before burner there answered went to ssh, still
+    // connecting on a cooked pty: when ssh then goes, that was you
+    let mut early_ctrl_c = false;
     let show =
         |frames: &mut Frames, filter: &mut TermFilter, data: &[u8], seen: &Arc<Mutex<Seen>>| {
             let (mut text, mut recs) = (Vec::new(), Vec::new());
@@ -338,6 +348,9 @@ fn relay(
                     escape.bracketed = screen.screen().is_some_and(|s| s.paste());
                     if escape.feed(&buf[..n], &mut keys) {
                         break Ended::Detached;
+                    }
+                    if keys.contains(&0x03) && !answered(seen) {
+                        early_ctrl_c = true;
                     }
                     let room = TO_PTY_CAP.saturating_sub(to_pty.len());
                     to_pty.extend_from_slice(&keys[..keys.len().min(room)]);
@@ -381,6 +394,10 @@ fn relay(
             }
             break Ended::Closed;
         }
+    };
+    let ended = match ended {
+        Ended::Closed if early_ctrl_c && !answered(seen) => Ended::Interrupted,
+        e => e,
     };
     let mut text = Vec::new();
     frames.finish(&mut text);
