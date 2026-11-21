@@ -6,7 +6,7 @@
 //! exits on its own once the VM's end of the socket closes.
 
 mod net;
-mod policy;
+pub(crate) mod policy;
 pub(crate) mod route;
 pub(crate) mod sandbox;
 

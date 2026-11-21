@@ -122,6 +122,29 @@ impl Policy {
 /// the caller treats as blocked
 pub fn host_nets() -> Option<Vec<(Ipv4Addr, u8)>> {
     let mut out = Vec::new();
+    for a in host_addrs()? {
+        out.push((a.ip, 32));
+        if let Some(p) = a.prefix {
+            out.push((a.ip, p));
+        }
+        if let Some(d) = a.peer {
+            out.push((d, 32));
+        }
+    }
+    Some(out)
+}
+
+/// one ipv4 address of the host
+pub struct HostAddr {
+    pub dev: String,
+    pub ip: Ipv4Addr,
+    pub prefix: Option<u8>,
+    /// the far end of a point to point link
+    pub peer: Option<Ipv4Addr>,
+}
+
+pub fn host_addrs() -> Option<Vec<HostAddr>> {
+    let mut out = Vec::new();
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return None;
@@ -133,15 +156,19 @@ pub fn host_nets() -> Option<Vec<(Ipv4Addr, u8)>> {
         let Some(ip) = sockaddr_v4(ifa.ifa_addr) else {
             continue;
         };
-        out.push((ip, 32));
-        if let Some(m) = sockaddr_v4(ifa.ifa_netmask) {
-            out.push((ip, u32::from(m).leading_ones() as u8));
-        }
-        if ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0
-            && let Some(d) = sockaddr_v4(ifa.ifa_dstaddr)
-        {
-            out.push((d, 32));
-        }
+        let dev = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let prefix = sockaddr_v4(ifa.ifa_netmask).map(|m| u32::from(m).leading_ones() as u8);
+        let peer = (ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0)
+            .then(|| sockaddr_v4(ifa.ifa_dstaddr))
+            .flatten();
+        out.push(HostAddr {
+            dev,
+            ip,
+            prefix,
+            peer,
+        });
     }
     unsafe { libc::freeifaddrs(head) };
     Some(out)

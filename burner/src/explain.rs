@@ -602,6 +602,157 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::build;
 
+#[cfg(target_os = "macos")]
+mod mac {
+    use super::*;
+    use crate::macnet::policy::host_addrs;
+    use crate::macnet::route::{self, Gateway};
+
+    /// what macnet refuses, from the same places it reads: the mac's
+    /// addresses, the special ranges, net.block, the public address and every
+    /// route that isn't the default way out
+    pub fn sources(cfg: &Config) -> anyhow::Result<Vec<Blocked>> {
+        let mut out = Vec::new();
+        let mut add = |net: Ipv4Addr, prefix: u8, why: Why| {
+            let net = Ipv4Addr::from(u32::from(net) & crate::config::mask(prefix));
+            out.push(Blocked { net, prefix, why });
+        };
+        for s in net::SPECIAL {
+            add(s.net, s.prefix, Why::Special { label: s.label });
+        }
+        for b in &cfg.net.block {
+            let (n, p) = crate::config::parse_cidr(b)?;
+            add(n, p, Why::Config);
+        }
+        let (sub, sp) = cfg.subnet()?;
+        add(sub, sp, Why::Subnet);
+        if let Some((ip, _)) = net::public_ip(cfg) {
+            add(ip, 32, Why::PublicIp);
+        }
+        let addrs =
+            host_addrs().ok_or_else(|| anyhow::anyhow!("can't read the mac's addresses"))?;
+        for a in addrs {
+            add(a.ip, 32, Why::HostAddr { dev: a.dev.clone() });
+            if let Some(p) = a.prefix {
+                add(a.ip, p, Why::HostNet { dev: a.dev.clone() });
+            }
+            if let Some(peer) = a.peer {
+                add(peer, 32, Why::HostAddr { dev: a.dev.clone() });
+            }
+        }
+        for (r, dev) in route::dump()? {
+            let via = match r.gateway {
+                Gateway::Inet(g) => Some(g),
+                Gateway::Link => None,
+            };
+            add(
+                r.dst,
+                r.prefix,
+                Why::Route {
+                    dev,
+                    via,
+                    table: "main".into(),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    fn uplink() -> Option<Uplink> {
+        let d = route::lookup(Ipv4Addr::UNSPECIFIED, true).ok()?;
+        let addrs = host_addrs()?;
+        let mut name = None;
+        let mut ips = Vec::new();
+        for a in addrs {
+            // SAFETY: if_nametoindex reads a NUL-terminated name we made
+            let c = std::ffi::CString::new(a.dev.clone()).ok()?;
+            if unsafe { libc::if_nametoindex(c.as_ptr()) } == u32::from(d.index) {
+                ips.push(a.ip);
+                name = Some(a.dev);
+            }
+        }
+        Some(Uplink {
+            dev: name?,
+            gateway: match d.gateway {
+                Gateway::Inet(g) => Some(g),
+                Gateway::Link => None,
+            },
+            addrs: ips,
+        })
+    }
+
+    /// macnet's checks in the order it makes them, with this config's values
+    pub fn policy_words(cfg: &Config, mode: Mode) -> String {
+        let resolvers: Vec<String> = cfg.net.resolvers.iter().map(|r| r.to_string()).collect();
+        let (ports, meter) = match mode {
+            Mode::Open => ("any tcp port but 25, 465 and 587", "50 a second, burst 100"),
+            _ => ("tcp 80 and 443", "20 a second, burst 40"),
+        };
+        let rate = match cfg.net.rate {
+            0 => "no cap".to_string(),
+            r => format!("{r} bytes a second each way"),
+        };
+        format!(
+            "burner macnet, one process per VM, checks each guest packet in this order:\n\
+             1. dropped: anything not from the guest's own address, ipv6, fragments, icmp, udp that isn't to port 53\n\
+             2. refused: one of this mac's addresses or the networks it's on, read fresh for every connection\n\
+             3. refused: the special ranges, net.block, net.block_public_ip, the VM's own network\n\
+             4. refused: anything the mac doesn't route through its default route (a vpn, a tailnet, a lan route).\n\
+             \x20  what's left is connected bound to the default route's interface\n\
+             5. port 53 (udp and tcp): only to {}\n\
+             6. {ports}\n\
+             7. meters: new connections {meter}, dns 20 a second burst 50, at most 256 connections\n\
+             \x20  and 64 dns flows open, bandwidth {rate} (net.rate)\n",
+            and_list(&resolvers)
+        )
+    }
+
+    pub fn build(cfg: &Config, a: &ExplainArgs) -> anyhow::Result<Explain> {
+        let (mode, ceiling) = pick_mode(cfg, a.net.as_deref()).map_err(anyhow::Error::msg)?;
+        let up = uplink();
+        let way = match &up {
+            Some(Uplink {
+                dev,
+                gateway: Some(g),
+                ..
+            }) => format!("through {dev} (default route via {g})"),
+            Some(u) => format!("through {}", u.dev),
+            None => "through the default route (there's none right now)".into(),
+        };
+        let sources = sources(cfg)?;
+        let mut notes = Vec::new();
+        if !sources.iter().any(|b| b.why == Why::PublicIp) {
+            notes.push(if cfg.net.block_public_ip {
+                "your public ip not looked up for this network yet: burner run looks it up first".into()
+            } else {
+                "your public ip NOT blocked: VMs can reach your router's public address (often its admin page or your port forwards). set net.block_public_ip = true".into()
+            });
+        }
+        notes.push(
+            "each VM's network is its own macnet process. it reads the mac's addresses and routes\nfor every connection, so a vpn that comes up later is refused too."
+                .into(),
+        );
+        let rules = Rules {
+            text: a.rules.then(|| policy_words(cfg, mode)),
+            ..Rules::default()
+        };
+        Ok(Explain {
+            mode: mode.name(),
+            platform: "macos",
+            ceiling: ceiling.name(),
+            refused: mode > ceiling,
+            uplink: up,
+            allowed: allowed(cfg, mode, Platform::Mac, &way),
+            blocked: rows(&sources),
+            notes,
+            rules,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::build;
+
 #[cfg(test)]
 mod tests {
     use super::*;

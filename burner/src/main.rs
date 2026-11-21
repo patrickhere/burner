@@ -122,16 +122,6 @@ fn doctor_done(r: doctor::Report) -> ExitCode {
 }
 
 fn explain_main(cfg: &Config, a: &explain::ExplainArgs, json_on: bool) -> anyhow::Result<ExitCode> {
-    #[cfg(target_os = "macos")]
-    let _ = (cfg, a, json_on);
-    #[cfg(target_os = "macos")]
-    return Ok(json::fail(
-        "explain",
-        exit::EXIT_USAGE,
-        Kind::Unsupported,
-        "burner explain isn't there on macOS yet",
-    ));
-    #[cfg(target_os = "linux")]
     {
         let e = match explain::build(cfg, a) {
             Ok(e) => e,
