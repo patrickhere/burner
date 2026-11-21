@@ -211,8 +211,10 @@ stty -opost 2>/dev/null
 # job, proto) in result/fail, $2 why. a burner from before result/fail
 # takes the 125 in rc for the command's exit code, as it always did
 fail() {
-    echo "BURNER-$token-BEGIN"; echo "burner: $2"; echo "BURNER-$token-END"
-    echo "burner: $2" > /result/log.txt
+    # printf, not echo: $2 can carry names from the caller's tar, and some
+    # shells' echo (dash's) acts on backslashes in them
+    echo "BURNER-$token-BEGIN"; printf 'burner: %s\n' "$2"; echo "BURNER-$token-END"
+    printf 'burner: %s\n' "$2" > /result/log.txt
     echo "$1" > /result/fail
     echo 125 > /result/rc
 }
