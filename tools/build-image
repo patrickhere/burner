@@ -29,7 +29,9 @@ fi
 
 work=$(mktemp -d /tmp/burner-build-XXXX)
 cleanup() {
-    sudo rm -rf "$work"
+    # a build killed halfway may leave something mounted in there. the
+    # chroot steps run in their own mount namespace, so this is only in case
+    sudo rm -rf --one-file-system "$work"
     if [ "$mode" = docker ]; then docker rm -f "burner-build-$name" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
