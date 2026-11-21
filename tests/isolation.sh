@@ -363,6 +363,22 @@ sudo burner run --tag rofd --json-fd 2 -- 'sleep 20' </dev/null >/dev/null 2</de
   && ok "--json and --json-fd refuse an fd that isn't writable" \
   || bad "json fd not writable" "json=$r1 json-fd=$r2 $(head -c 200 "$T/ro1.err")"
 
+# 30 the network log's reader parses packets the guest sent: it runs as
+# burner-parse, never root and never the VM's own uid, and goes with the run
+if sudo nft list table inet burner >/dev/null 2>&1; then
+    ( sudo burner run --net web --ttl 60s --tag netlog -- 'sleep 15' </dev/null >/dev/null 2>&1 ) &
+    for _ in $(seq 30); do pgrep -f -- '__read-netlog' >/dev/null && break; sleep 1; done
+    uids=$(ps -o uid= -p "$(pgrep -d, -f -- '__read-netlog')" 2>/dev/null | sort -u | tr -d ' ')
+    vid=$(sudo burner ls | awk '/ netlog /{print $1}'); [ -n "$vid" ] && sudo burner kill "$vid" >/dev/null
+    wait
+    sleep 1
+    [ -n "$uids" ] && [ "$uids" = "$(id -u burner-parse)" ] && [ -z "$(pgrep -f -- '__read-netlog')" ] \
+      && ok "the network log's reader runs as burner-parse and goes with its run" \
+      || bad "network log reader" "uids=$uids left=$(pgrep -f -- '__read-netlog' | tr '\n' ' ')"
+else
+    echo "SKIP  network log reader  (no burner net up)"
+fi
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]
