@@ -4,6 +4,31 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# tools/build-image runs this in the image's chroot before it writes the
+# image: what this init needs and the image doesn't have, so an image that
+# would boot and then fail says so at build time. never as pid 1, and it
+# only prints
+if [ "${1:-}" = selftest ] && [ "$$" != 1 ]; then
+    missing=""
+    for t in mount umount pivot_root setsid stty tar dd tee od head tail wc sed grep tr cat mkdir rm sleep; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    # set is a special builtin: an option the shell doesn't know ends it
+    # shellcheck disable=SC3040
+    (set -o pipefail) 2>/dev/null || missing="$missing pipefail(/bin/sh)"
+    command -v unshare >/dev/null 2>&1 \
+        || echo "selftest: no unshare, so poweroff -f in a run or a shell stops the whole VM"
+    command -v busybox >/dev/null 2>&1 || command -v reboot >/dev/null 2>&1 \
+        || echo "selftest: no busybox or reboot, so every VM takes 3s longer to stop"
+    command -v blockdev >/dev/null 2>&1 \
+        || echo "selftest: no blockdev, so burner shell doesn't follow terminal resizes"
+    if [ -n "$missing" ]; then
+        echo "selftest: guest init needs these and the image doesn't have them:$missing"
+        exit 1
+    fi
+    exit 0
+fi
+
 halt() {
     sync
     if command -v busybox >/dev/null 2>&1; then busybox reboot -f; fi
@@ -224,7 +249,8 @@ fail() {
 # any failure goes in /result/error, which fails the run. the job's output is
 # still drained so the job itself never gets SIGPIPE
 capture() {
-    # busybox ash has pipefail, plain posix sh doesn't. this only runs on busybox
+    # busybox ash and debian's dash have pipefail, plain posix sh doesn't.
+    # the selftest checks the image's /bin/sh has it
     # shellcheck disable=SC3040
     set -o pipefail
     # one byte at a time so it streams as the job writes, and stops at exactly 64K
