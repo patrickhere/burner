@@ -168,7 +168,19 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
 
 ## from scripts and agents
 
-- exit codes: the command's own, 124 when it hit the time limit, 125 when the sandbox itself failed, the input didn't unpack in the VM, the command powered off or rebooted the VM (`poweroff -f` and the like) or the config didn't load, 2 for bad arguments, 130 when interrupted (ctrl-c, SIGTERM, SIGHUP) or killed with `burner kill`
+- exit codes, the same for every command:
+
+  | code | meaning |
+  |---|---|
+  | 0 | success. for run and shell: the command exited 0, the shell was left with `~.`, or the shell's VM was powered off |
+  | 1 | the command didn't do its job: doctor found a FAIL, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell |
+  | 2 | usage: bad flags or arguments, needs root (or must not be root), no terminal for shell, not on this OS. nothing was started |
+  | 124 | run and shell: the time limit stopped it |
+  | 125 | run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered |
+  | 130 | a signal (ctrl-c, SIGTERM, SIGHUP) stopped burner, or burner kill stopped the VM |
+  | other | run and shell: the command's own exit code |
+
+  a command can exit 2, 124, 125 or 130 itself, so for run use `--status-fd` to tell them apart
 - `--status-fd N` writes one JSON line when the run ends, so a command that exits 124 itself isn't mistaken for a timeout. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error`, `input_error` (an `--in tar` that didn't unpack in the VM, so the command never ran), `poweroff` (the command powered off or halted the VM before it exited), `reboot` (the same with a reboot) or `usage`. an image built with an older guest init still reports an input that didn't unpack as `exited` with rc 125, and gets no `poweroff` or `reboot`. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
 - when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up after 10 min. `--no-wait` fails right away instead. both end with 125 and outcome `busy`
 - `sudo burner ls --json` prints `{"vms": [...], "max_vms", "total_mem", "used_mem"}`. each VM has `id`, `tag`, `img`, `vcpus`, `mem`, `disk`, `net`, `status` (`preparing`, `running` or `cleanup-failed`), `owner`, `age`, `ttl` and `ttl_left`. `--tag` on a run makes yours easy to find

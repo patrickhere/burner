@@ -29,10 +29,7 @@ pub use launch::mkfs_bin;
 pub use launch::{config_failed, main, status_fd_ok};
 pub use plan::{RunArgs, ShellArgs, images, shell_main};
 
-pub const EXIT_USAGE: u8 = 2;
-pub const EXIT_TIMEOUT: u8 = 124;
-pub const EXIT_SANDBOX: u8 = 125;
-pub const EXIT_INTERRUPTED: u8 = 130;
+pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};
 
 /// an error with the exit code it should end the run with
 #[derive(Debug)]

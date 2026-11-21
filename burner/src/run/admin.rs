@@ -264,7 +264,7 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     };
     if let Some(why) = refused {
         eprintln!("burner: {id}: {why}");
-        return Ok(ExitCode::from(1));
+        return Ok(ExitCode::from(crate::exit::EXIT_FAILED));
     }
     cgroup::kill(id);
     log_line(&format!("kill {id}"));
@@ -281,7 +281,7 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
         std::thread::sleep(Duration::from_millis(200));
     }
     eprintln!("burner: kill requested for {id}, still stopping (burner ls shows it)");
-    Ok(ExitCode::from(1))
+    Ok(ExitCode::from(crate::exit::EXIT_FAILED))
 }
 
 /// a wrapper that's still alive a minute past its VM's deadline without having

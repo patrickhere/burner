@@ -3,6 +3,7 @@ mod cgroup;
 mod config;
 #[cfg_attr(target_os = "macos", path = "doctor_macos.rs")]
 mod doctor;
+mod exit;
 #[cfg(target_os = "macos")]
 mod krun;
 mod ledger;
@@ -42,8 +43,10 @@ enum Cmd {
     /// check that this machine can run burner, and say what to fix
     Doctor,
     /// run one command in a fresh VM and hand back its output and exit code
+    #[command(after_long_help = exit::help())]
     Run(run::RunArgs),
     /// a root shell in a fresh VM, gone when you exit
+    #[command(after_long_help = exit::help())]
     Shell(run::ShellArgs),
     /// set up or remove the VM network (nft table, forwarding)
     Net {
@@ -100,7 +103,7 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("burner: {e:#}");
-            ExitCode::from(1)
+            ExitCode::from(exit::EXIT_FAILED)
         }
     }
 }
@@ -136,13 +139,13 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Doctor => Ok(if doctor::run(&cfg) {
             ExitCode::SUCCESS
         } else {
-            ExitCode::from(1)
+            ExitCode::from(exit::EXIT_FAILED)
         }),
         #[cfg(target_os = "macos")]
         Cmd::Doctor => Ok(if doctor::run(&cfg, &cli.config) {
             ExitCode::SUCCESS
         } else {
-            ExitCode::from(1)
+            ExitCode::from(exit::EXIT_FAILED)
         }),
         Cmd::Run(a) => Ok(run::main(&cfg, a)),
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
