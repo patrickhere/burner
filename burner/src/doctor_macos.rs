@@ -291,8 +291,9 @@ fn images(r: &mut Report, cfg: &Config) {
             Level::Warn,
             "images",
             format!(
-                "{} not from this burner's guest init, burner setup fetches one that is",
-                other.join(", ")
+                "{} not from this burner's guest init, {}",
+                other.join(", "),
+                crate::setup::fix_hint(&other)
             ),
         );
     }

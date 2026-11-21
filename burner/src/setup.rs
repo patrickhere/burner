@@ -1,9 +1,10 @@
-//! `burner setup` on macOS: the guest kernel and the alpine image, checked
-//! and put where burner looks for them. they come from the copy homebrew
-//! installed next to burner when there is one (the formula pins both), else
-//! from a release. the kernel always has to match the sha256 install.sh pins,
-//! built into burner, except with --from. curl, shasum and gzip all come with
-//! macOS, so no http or archive crates
+//! `burner setup` on macOS: the guest kernel and the images (alpine, debian),
+//! checked and put where burner looks for them. they come from the copy
+//! homebrew installed next to burner when there is one (the formula pins the
+//! kernel and alpine and fetches them, and pins debian without fetching it),
+//! else from a release. the kernel always has to match the sha256 install.sh
+//! pins, built into burner, except with --from. curl, shasum and gzip all
+//! come with macOS, so no http or archive crates
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -23,20 +24,28 @@ use crate::sys;
 
 const REPO: &str = "https://github.com/patrickhere/burner";
 const KERNEL: &str = "vmlinux-aarch64";
-const IMAGE: &str = "alpine-aarch64.ext4.gz";
 const SUMS: &str = "SHA256SUMS";
-/// far over what a release carries (the kernel is ~20M, the image ~100M
-/// unpacked), low enough that a bad source can't fill the disk
+/// what the formula writes next to the files it fetched: a sha256 for each
+/// release file it pins but doesn't fetch, debian's image
+const PINS: &str = "pins";
+/// far over what a release carries (the kernel is ~20M, the images ~100M and
+/// ~250M unpacked), low enough that a bad source can't fill the disk
 const MAX_DOWNLOAD: u64 = 1 << 30;
 const MAX_UNPACKED: u64 = 4 << 30;
 const STAGE_PREFIX: &str = ".setup-";
-// what tools/build-image puts next to the image
+/// the images burner's own release publishes for macOS
+const IMAGES: [&str; 2] = ["alpine", "debian"];
+// what tools/build-image puts next to each image
 const ALPINE_DEFAULTS: &str = include_str!("../alpine-defaults.toml");
+const DEBIAN_DEFAULTS: &str = include_str!("../debian-defaults.toml");
 /// the kernel install.sh pins for aarch64, read from it by build.rs
 const KERNEL_SHA256: &str = env!("BURNER_KERNEL_SHA256");
 
 #[derive(Args)]
 pub struct SetupArgs {
+    /// the images to install, alpine when none are named
+    #[arg(value_name = "IMAGE", value_parser = IMAGES)]
+    images: Vec<String>,
     /// fetch from a github release (like v0.2.0) instead of the copy homebrew
     /// installed or this burner's own release. with no tag, the latest release
     #[arg(long, value_name = "TAG", num_args = 0..=1, default_missing_value = "latest")]
@@ -48,16 +57,48 @@ pub struct SetupArgs {
     from: Option<String>,
 }
 
-/// where the kernel and image come from
+/// where the kernel and images come from
 enum Source {
     /// the copy the homebrew formula installed, checked by brew against the
-    /// formula's sha256s
+    /// formula's sha256s. a file it pins but didn't fetch comes from this
+    /// burner's own release and has to match the formula's pin too
     Brew(PathBuf),
     /// a release: SHA256SUMS from the same place, and the kernel pin. true
     /// when it's this burner's own
     Release(String, bool),
     /// --from: only that dir's SHA256SUMS
     From(String, &'static str),
+}
+
+/// what fixes images that are missing or from another guest init, for the
+/// hints in doctor and burner shell
+pub(crate) fn fix_hint(imgs: &[String]) -> String {
+    if imgs.iter().all(|i| IMAGES.contains(&i.as_str())) {
+        format!("run burner setup {}", imgs.join(" "))
+    } else {
+        "rebuild it with this burner's guest init".into()
+    }
+}
+
+/// the release file for an image
+fn asset(img: &str) -> String {
+    format!("{img}-aarch64.ext4.gz")
+}
+
+fn defaults(img: &str) -> &'static str {
+    match img {
+        "debian" => DEBIAN_DEFAULTS,
+        _ => ALPINE_DEFAULTS,
+    }
+}
+
+/// "alpine", "alpine and debian"
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 pub fn main(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
@@ -96,6 +137,15 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     if cfg!(not(target_arch = "aarch64")) {
         bail!("burner on macOS needs apple silicon");
     }
+    let mut imgs: Vec<String> = Vec::new();
+    for i in &a.images {
+        if !imgs.contains(i) {
+            imgs.push(i.clone());
+        }
+    }
+    if imgs.is_empty() {
+        imgs.push("alpine".into());
+    }
     let src = source(&a)?;
     // checked again before the swap, this only saves a pointless download
     drop(idle(cfg)?);
@@ -113,30 +163,73 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
     let stage = Stage::new(root)?;
+    let files: Vec<String> = std::iter::once(KERNEL.to_string())
+        .chain(imgs.iter().map(|i| asset(i)))
+        .collect();
     match &src {
         Source::Brew(dir) => {
+            // what the formula fetched, and the rest from this burner's release
+            let (have, fetch): (Vec<String>, Vec<String>) =
+                files.iter().cloned().partition(|f| dir.join(f).is_file());
+            let what: Vec<String> = have.iter().map(|f| describe(f)).collect();
             eprintln!(
-                "burner: the guest kernel and alpine image homebrew installed with burner, from {}",
+                "burner: {} homebrew installed with burner, from {}",
+                and_list(&what),
                 dir.display()
             );
-            for name in [KERNEL, IMAGE] {
+            for name in &have {
                 let from = dir.join(name);
                 config::trusted_file(&from)?;
                 go_on()?;
                 fs::copy(&from, stage.0.join(name))
                     .with_context(|| format!("copying {}", from.display()))?;
             }
+            if !fetch.is_empty() {
+                let pins = dir.join(PINS);
+                let pins = if pins.exists() {
+                    config::trusted_file(&pins)?;
+                    fs::read_to_string(&pins)
+                        .with_context(|| format!("reading {}", pins.display()))?
+                } else {
+                    String::new()
+                };
+                let pinned = fetch
+                    .iter()
+                    .map(|f| match sum_for(&pins, f) {
+                        Some(h) => Ok((f.clone(), h)),
+                        None => Err(anyhow::anyhow!(
+                            "the homebrew formula pins no sha256 for {f}. burner setup \
+                             --version v{} fetches it checked only against the release's \
+                             SHA256SUMS",
+                            env!("CARGO_PKG_VERSION")
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let base = own_release();
+                eprintln!("burner: fetching {} from {base}", fetch.join(", "));
+                download(&base, "=https", &stage.0, &fetch)?;
+                for (f, want) in pinned {
+                    let got = sha256(&stage.0.join(&f))?;
+                    if got != want {
+                        bail!(
+                            "{f} is {got}, not the {want} the homebrew formula pins. \
+                             nothing was changed"
+                        );
+                    }
+                    eprintln!("burner: {f} matches SHA256SUMS and the sha256 homebrew pinned");
+                }
+            }
         }
         Source::Release(base, _) => {
-            eprintln!("burner: fetching the guest kernel and the alpine image from {base}");
-            download(base, "=https", &stage.0)?;
+            eprintln!("burner: fetching {} from {base}", files.join(", "));
+            download(base, "=https", &stage.0, &files)?;
         }
         Source::From(base, proto) => {
             eprintln!(
                 "burner: fetching from {base}. --from skips the kernel checksum built into \
-                 burner, both files are checked only against the SHA256SUMS there"
+                 burner, the files are checked only against the SHA256SUMS there"
             );
-            download(base, proto, &stage.0)?;
+            download(base, proto, &stage.0, &files)?;
         }
     }
     if !matches!(src, Source::From(..)) {
@@ -151,30 +244,33 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     }
     if matches!(src, Source::Release(..)) {
         eprintln!(
-            "burner: the image is checked only against the release's own SHA256SUMS, \
-             which comes from the same place. gh attestation verify checks where it was built"
+            "burner: the images are checked only against the release's own SHA256SUMS, \
+             which comes from the same place. gh attestation verify checks where they were built"
         );
     }
 
-    let rootfs = stage.0.join("rootfs.ext4");
-    gunzip(&stage.0.join(IMAGE), &rootfs)?;
-    let defaults = stage.0.join("defaults.toml");
-    fs::write(&defaults, ALPINE_DEFAULTS)?;
-    // the guest init the image was built with, what burner shell checks to
+    // the guest init an image was built with, what burner shell checks to
     // know the image tells it when the shell is ready. only known for an image
     // from this burner's own release; any other one counts as built with
     // another init, and the shell falls back to how older images worked
-    let init = stage.0.join("init");
     let own = matches!(src, Source::Brew(_) | Source::Release(_, true));
-    if own {
-        fs::write(&init, crate::doctor::GUEST_INIT)?;
-    }
     let kernel = stage.0.join(KERNEL);
-    for f in [&kernel, &rootfs, &defaults]
-        .into_iter()
-        .chain(own.then_some(&init))
-    {
-        fs::set_permissions(f, fs::Permissions::from_mode(0o644))?;
+    fs::set_permissions(&kernel, fs::Permissions::from_mode(0o644))?;
+    for img in &imgs {
+        let d = stage.0.join(img);
+        fs::DirBuilder::new().mode(0o755).create(&d)?;
+        let rootfs = d.join("rootfs.ext4");
+        gunzip(&stage.0.join(asset(img)), &rootfs)?;
+        fs::write(d.join("defaults.toml"), defaults(img))?;
+        if own {
+            fs::write(d.join("init"), crate::doctor::GUEST_INIT)?;
+        }
+        for f in ["rootfs.ext4", "defaults.toml"]
+            .into_iter()
+            .chain(own.then_some("init"))
+        {
+            fs::set_permissions(d.join(f), fs::Permissions::from_mode(0o644))?;
+        }
     }
 
     go_on()?;
@@ -183,8 +279,8 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let ledger = idle(cfg)?;
     go_on()?;
     let kdir = root.join("kernel");
-    let idir = root.join("images/alpine");
-    for d in [&kdir, &idir] {
+    let idirs: Vec<PathBuf> = imgs.iter().map(|i| root.join("images").join(i)).collect();
+    for d in std::iter::once(&kdir).chain(&idirs) {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o755)
@@ -192,20 +288,25 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     }
     SWAPPING.store(true, Ordering::SeqCst);
     fs::rename(&kernel, kdir.join("vmlinux"))?;
-    fs::rename(&rootfs, idir.join("rootfs.ext4"))?;
-    fs::rename(&defaults, idir.join("defaults.toml"))?;
-    if own {
-        fs::rename(&init, idir.join("init"))?;
-    } else {
-        match fs::remove_file(idir.join("init")) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+    for (img, idir) in imgs.iter().zip(&idirs) {
+        let d = stage.0.join(img);
+        fs::rename(d.join("rootfs.ext4"), idir.join("rootfs.ext4"))?;
+        fs::rename(d.join("defaults.toml"), idir.join("defaults.toml"))?;
+        if own {
+            fs::rename(d.join("init"), idir.join("init"))?;
+        } else {
+            match fs::remove_file(idir.join("init")) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
     }
     drop(ledger);
 
     println!("kernel  {}", kdir.join("vmlinux").display());
-    println!("image   {}", idir.join("rootfs.ext4").display());
+    for idir in &idirs {
+        println!("image   {}", idir.join("rootfs.ext4").display());
+    }
     println!("burner doctor checks the rest");
     Ok(ExitCode::SUCCESS)
 }
@@ -254,24 +355,38 @@ fn source(a: &SetupArgs) -> Result<Source> {
     ))
 }
 
+/// this burner's own release
+fn own_release() -> String {
+    format!("{REPO}/releases/download/v{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// the guest kernel, the alpine image
+fn describe(file: &str) -> String {
+    match file.strip_suffix("-aarch64.ext4.gz") {
+        Some(img) => format!("the {img} image"),
+        None => "the guest kernel".into(),
+    }
+}
+
 /// share/burner next to the bin dir this burner runs from, where the formula
 /// puts the kernel and image it fetched
 fn brew_copy() -> Option<PathBuf> {
     let dir = sys::self_exe().parent()?.parent()?.join("share/burner");
-    [KERNEL, IMAGE]
+    [KERNEL.to_string(), asset("alpine")]
         .iter()
         .all(|f| dir.join(f).is_file())
         .then_some(dir)
 }
 
-/// SHA256SUMS and both files from base into dir, each checked against it
-fn download(base: &str, proto: &str, dir: &Path) -> Result<()> {
+/// SHA256SUMS and the files from base into dir, each checked against it
+fn download(base: &str, proto: &str, dir: &Path, files: &[String]) -> Result<()> {
     fetch(&format!("{base}/{SUMS}"), proto, &dir.join(SUMS), 64 << 10)?;
     let sums = fs::read_to_string(dir.join(SUMS)).context("reading SHA256SUMS")?;
-    for name in [KERNEL, IMAGE] {
+    for name in files {
         let Some(want) = sum_for(&sums, name) else {
             bail!(
-                "{name} isn't in the release's SHA256SUMS (releases before the macOS port don't have it)"
+                "{name} isn't in the release's SHA256SUMS (releases before the macOS port \
+                 have no images, and before 0.3.0 no debian)"
             );
         };
         let f = dir.join(name);
@@ -367,7 +482,11 @@ fn gunzip(src: &Path, dest: &Path) -> Result<()> {
             }
             n += got as u64;
             if n > MAX_UNPACKED {
-                bail!("{IMAGE} unpacks to more than {} GiB", MAX_UNPACKED >> 30);
+                bail!(
+                    "{} unpacks to more than {} GiB",
+                    src.display(),
+                    MAX_UNPACKED >> 30
+                );
             }
             to.write_all(&buf[..got])?;
         }
@@ -380,7 +499,7 @@ fn gunzip(src: &Path, dest: &Path) -> Result<()> {
     let st = child.wait().context("waiting for gzip")?;
     copied?;
     if !st.success() {
-        bail!("gzip couldn't unpack {IMAGE}");
+        bail!("gzip couldn't unpack {}", src.display());
     }
     Ok(())
 }
@@ -462,9 +581,69 @@ mod tests {
             h.to_uppercase()
         );
         assert_eq!(sum_for(&list, KERNEL).as_deref(), Some(h));
-        assert_eq!(sum_for(&list, IMAGE).as_deref(), Some(h));
+        assert_eq!(sum_for(&list, &asset("alpine")).as_deref(), Some(h));
+        assert_eq!(sum_for(&list, &asset("debian")), None);
         assert_eq!(sum_for(&list, "vmlinux"), None);
         assert_eq!(sum_for(&list, "aarch64"), None);
+    }
+
+    #[test]
+    fn images() {
+        assert_eq!(asset("alpine"), "alpine-aarch64.ext4.gz");
+        assert_eq!(asset("debian"), "debian-aarch64.ext4.gz");
+        assert_eq!(describe(KERNEL), "the guest kernel");
+        assert_eq!(describe(&asset("debian")), "the debian image");
+        assert_eq!(and_list(&["a".into()]), "a");
+        assert_eq!(
+            fix_hint(&["alpine".into(), "debian".into()]),
+            "run burner setup alpine debian"
+        );
+        assert!(fix_hint(&["debian".into(), "mine".into()]).starts_with("rebuild"));
+        assert_eq!(
+            and_list(&["a".into(), "b".into(), "c".into()]),
+            "a, b and c"
+        );
+        // the keys run reads from an image's defaults.toml
+        for img in IMAGES {
+            let t: toml::Table = toml::from_str(defaults(img)).unwrap();
+            assert!(!t.is_empty(), "{img}");
+            for (k, v) in &t {
+                assert!(
+                    ["vcpus", "mem_mib", "disk_gib", "ttl_secs"].contains(&k.as_str()),
+                    "{img} {k}"
+                );
+                assert!(v.as_integer().is_some_and(|n| n > 0), "{img} {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn image_names() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            a: SetupArgs,
+        }
+        let a = Cli::try_parse_from(["setup"]).unwrap().a;
+        assert!(a.images.is_empty());
+        let a = Cli::try_parse_from(["setup", "alpine", "debian"])
+            .unwrap()
+            .a;
+        assert_eq!(a.images, ["alpine", "debian"]);
+        for bad in ["ubuntu", "../alpine", "Debian"] {
+            let e = Cli::try_parse_from(["setup", bad]).err().unwrap();
+            assert_eq!(e.exit_code(), 2, "{bad}");
+        }
+    }
+
+    #[test]
+    fn pins() {
+        let h = "7e7f3c7073c36e334e33e8a74ae744cea06c914f0ab9303b9e557e4106840da4";
+        let pins = format!("# the formula's pins\n{h}  debian-aarch64.ext4.gz\n");
+        assert_eq!(sum_for(&pins, &asset("debian")).as_deref(), Some(h));
+        assert_eq!(sum_for(&pins, &asset("alpine")), None);
+        assert_eq!(sum_for("", &asset("debian")), None);
     }
 
     #[test]
