@@ -264,6 +264,12 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     // the slot's log counters were read at teardown: the log is whole now
     let died = super::netwire::died();
     if let Some(log) = super::netwire::finish(cfg) {
+        // after everything else burner says, before the status line and json
+        if !quiet() {
+            for line in super::netwire::words(&log, a.log) {
+                eprintln!("burner: {line}");
+            }
+        }
         record::set_network(log);
     }
     if died {

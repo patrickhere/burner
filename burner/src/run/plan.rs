@@ -52,6 +52,10 @@ pub struct RunArgs {
     /// use 2: the json is then the last line on stderr
     #[arg(long, value_name = "FD")]
     pub(super) json_fd: Option<i32>,
+    /// the connection log after a run with a network, on stderr: a summary,
+    /// the full table, or nothing. it's kept either way (burner log)
+    #[arg(long, value_enum, default_value_t = LogMode::Summary)]
+    pub(super) log: LogMode,
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
@@ -89,6 +93,9 @@ pub struct ShellArgs {
     /// through sudo use 2
     #[arg(long, value_name = "FD")]
     json_fd: Option<i32>,
+    /// the connection log when the shell ends: a summary, the full table, or nothing
+    #[arg(long, value_enum, default_value_t = LogMode::Summary)]
+    log: LogMode,
 }
 
 /// a shell is a run with the caller's terminal and no command
@@ -105,6 +112,7 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         net_default: a.net.is_none(),
         status_fd: None,
         json_fd: a.json_fd,
+        log: a.log,
         no_wait: false,
         net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
@@ -128,6 +136,13 @@ pub(super) enum Input {
     None,
     Stdin,
     Tar,
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+pub(super) enum LogMode {
+    None,
+    Summary,
+    Full,
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]

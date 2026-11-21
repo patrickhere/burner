@@ -222,6 +222,23 @@ pub(super) fn died() -> bool {
     live(|l| l.as_ref().is_some_and(|l| l.died.load(Ordering::SeqCst)))
 }
 
+/// what --log prints after a run, each line to go after "burner: "
+pub(super) fn words(log: &NetLog, mode: super::plan::LogMode) -> Vec<String> {
+    use super::plan::LogMode;
+    match mode {
+        LogMode::None => Vec::new(),
+        LogMode::Summary => crate::netlog::summary_lines(log),
+        LogMode::Full => {
+            let t = crate::netlog::table(log);
+            let mut lines = t.lines();
+            let head = lines.next().unwrap_or_default().to_string();
+            std::iter::once(format!("{head} (burner log {})", log.id))
+                .chain(lines.map(str::to_string))
+                .collect()
+        }
+    }
+}
+
 /// the netcount file teardown wrote: (every attempt, those past the limit)
 fn counts(cfg: &Config, id: &str) -> Option<(u64, u64)> {
     let path = cfg.paths.state.join("netcount").join(id);
