@@ -420,7 +420,7 @@ impl Collector {
                     verdict,
                     proto,
                     dst,
-                    Some(port),
+                    has_ports(proto).then_some(port),
                     None,
                     None,
                     reason,
@@ -488,6 +488,9 @@ impl Collector {
         r: Option<Reason>,
     ) -> Option<String> {
         let r = r?;
+        if let Some(b) = self.model.range_for(dst, r) {
+            return Some(crate::netmodel::describe(b).1);
+        }
         let e = self.model.expect(dst, proto, port);
         match r {
             Reason::Rate => Some("past the filter's rate limit".into()),

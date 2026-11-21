@@ -224,11 +224,30 @@ impl Model {
         }
     }
 
-    /// the blocked range dst is in, the most specific one first
+    /// the blocked range dst is in, the most specific one first. a route
+    /// inside a network the host is on (a gateway's host route, a broadcast
+    /// address) says less than the network does
     pub fn range(&self, dst: Ipv4Addr) -> Option<&Blocked> {
+        self.candidates(dst)
+            .min_by_key(|b| (std::cmp::Reverse(b.prefix), rank(&b.why)))
+    }
+
+    fn candidates(&self, dst: Ipv4Addr) -> impl Iterator<Item = &Blocked> {
+        let on_host_net = self.blocked.iter().any(|b| {
+            matches!(b.why, Why::HostNet { .. } | Why::HostAddr { .. })
+                && inside(dst, b.net, b.prefix)
+        });
         self.blocked
             .iter()
-            .filter(|b| inside(dst, b.net, b.prefix))
+            .filter(move |b| inside(dst, b.net, b.prefix))
+            .filter(move |b| !(on_host_net && matches!(b.why, Why::Route { .. })))
+    }
+
+    /// the most specific range dst is in that gives this reason: for a
+    /// producer that says why itself (macnet) and wants the words
+    pub fn range_for(&self, dst: Ipv4Addr, reason: Reason) -> Option<&Blocked> {
+        self.candidates(dst)
+            .filter(|b| describe(b).0 == reason)
             .min_by_key(|b| (std::cmp::Reverse(b.prefix), rank(&b.why)))
     }
 
@@ -415,6 +434,30 @@ mod tests {
             m.expect(ip("192.168.1.1"), Proto::Udp, 53).verdict,
             Verdict::Blocked
         );
+    }
+
+    #[test]
+    fn a_gateway_route_reads_as_the_lan() {
+        let mut m = homelab(Mode::Web);
+        m.blocked.push(Blocked {
+            net: ip("192.168.1.1"),
+            prefix: 32,
+            why: Why::Route {
+                dev: "eth0".into(),
+                via: None,
+                table: "main".into(),
+            },
+        });
+        let e = m.expect(ip("192.168.1.1"), Proto::Tcp, 80);
+        assert_eq!(
+            e.detail.as_deref(),
+            Some("your lan (192.168.1.0/24 on eth0)")
+        );
+        let b = m.range_for(ip("192.168.1.1"), Reason::Route).unwrap();
+        assert_eq!(b.prefix, 24, "the lan, not the gateway's route");
+        let b = m.range_for(ip("169.254.169.254"), Reason::Special).unwrap();
+        assert_eq!(b.prefix, 16);
+        assert!(m.range_for(ip("140.82.112.3"), Reason::Special).is_none());
     }
 
     #[test]
