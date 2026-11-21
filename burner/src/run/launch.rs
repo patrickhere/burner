@@ -257,9 +257,23 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     let (id, run_dir) = alloc_id(&runs)?;
     record::set_id(&id);
     let mut vm = None;
-    let res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
+    let mut res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
     if vm.is_some() {
         timed_teardown(cfg, &id, None);
+    }
+    // the slot's log counters were read at teardown: the log is whole now
+    let died = super::netwire::died();
+    if let Some(log) = super::netwire::finish(cfg) {
+        record::set_network(log);
+    }
+    if died {
+        let msg = super::netwire::READER_DIED;
+        record::set_outcome(
+            RunOutcome::SandboxError,
+            None,
+            Some((Kind::Net, msg.into())),
+        );
+        res = Err(exit(EXIT_SANDBOX, Kind::Net, msg));
     }
     remove_tree(&run_dir);
     res
@@ -511,6 +525,8 @@ fn run_vm(
         outcome = supervise(&mut child, deadline, cfg, id);
     }
     record::mark(Mark::Ended);
+    // the VM is done sending: the log's reader goes before the result parser comes
+    super::netwire::stop();
     let live_bytes = live.bytes();
     // what the command wrote in all and what of it wasn't kept, when a result came
     let (mut bytes, mut skipped) = (None, 0);
@@ -828,6 +844,8 @@ fn launch(
     }
     let mut ifaces = Vec::new();
     if let Some(i) = net_slot {
+        // the log's reader first: a tap never passes traffic nobody records
+        super::netwire::start_linux(cfg, id, i, p.net)?;
         let s = net::tap_up(cfg, i, p.net, uid)?;
         let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
         ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),

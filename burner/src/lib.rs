@@ -32,6 +32,8 @@ pub mod netlog;
 #[doc(hidden)]
 pub mod netmodel;
 #[doc(hidden)]
+pub mod nflog;
+#[doc(hidden)]
 pub mod output;
 #[doc(hidden)]
 pub mod result;

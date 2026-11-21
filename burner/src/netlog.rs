@@ -319,6 +319,13 @@ pub struct Collector {
     pub not_itemized: u64,
     /// allowed connections past the rows cap: the log isn't complete then
     pub allowed_not_itemized: u64,
+    /// linux: new attempts the reader sent, to check against the try chain's counter
+    pub tries_seen: u64,
+    /// linux: connections let out with no attempt line before them, which
+    /// the try chain's limit cut (they're itemized all the same)
+    pub allowed_without_try: u64,
+    /// macOS: macnet said its final counts
+    pub saw_counts: bool,
     seq: Option<u32>,
     summary: Summary,
 }
@@ -345,6 +352,9 @@ impl Collector {
             invalid: 0,
             not_itemized: 0,
             allowed_not_itemized: 0,
+            tries_seen: 0,
+            allowed_without_try: 0,
+            saw_counts: false,
             seq: None,
             summary: Summary::default(),
         }
@@ -454,7 +464,10 @@ impl Collector {
             }
             Line::Answer { dst, sport, dns } => self.answer(dst, sport, dns),
             Line::Lost { n } => self.lost = self.lost.saturating_add(n),
-            Line::Counts { not_itemized, .. } => self.unlisted(not_itemized),
+            Line::Counts { not_itemized, .. } => {
+                self.saw_counts = true;
+                self.unlisted(not_itemized)
+            }
         }
     }
 
@@ -505,6 +518,7 @@ impl Collector {
             "t" | "o" | "q" if src != self.guest => self.invalid += 1,
             "a" | "r" if dst != self.guest => self.invalid += 1,
             "t" => {
+                self.tries_seen += 1;
                 self.pending.push_back(Try {
                     at: now,
                     flow: (proto, sport, dst, dport),
@@ -530,6 +544,9 @@ impl Collector {
                     });
                     self.dns_row(dst, sport, Verdict::Allowed, None, None, d, now);
                 } else {
+                    if pos.is_none() {
+                        self.allowed_without_try += 1;
+                    }
                     let port = has_ports(proto).then_some(dport);
                     let i = self.row(
                         Kind::Conn,

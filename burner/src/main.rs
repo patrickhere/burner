@@ -61,6 +61,10 @@ enum Cmd {
     Reap,
     #[command(name = "__parse-result", hide = true)]
     ParseResult { emit: String },
+    /// the connection log's reader, started by burner run
+    #[cfg(target_os = "linux")]
+    #[command(name = "__read-netlog", hide = true)]
+    ReadNetlog,
     /// the VMM for one VM, started by burner run
     #[cfg(target_os = "macos")]
     #[command(name = "vmm-krun", hide = true)]
@@ -87,6 +91,10 @@ fn main() -> ExitCode {
     json::set_on(cli.json);
     if let Cmd::ParseResult { emit } = &cli.cmd {
         return result::child_main(emit == "1");
+    }
+    #[cfg(target_os = "linux")]
+    if let Cmd::ReadNetlog = &cli.cmd {
+        return burnervm::nflog::child_main();
     }
     #[cfg(target_os = "macos")]
     match cli.cmd {
@@ -172,6 +180,8 @@ impl Cmd {
             Cmd::Setup(_) => "setup",
             Cmd::Reap => "reap",
             Cmd::ParseResult { .. } => "__parse-result",
+            #[cfg(target_os = "linux")]
+            Cmd::ReadNetlog => "__read-netlog",
             #[cfg(target_os = "macos")]
             Cmd::VmmKrun(_) => "vmm-krun",
             #[cfg(target_os = "macos")]
@@ -355,6 +365,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         #[cfg(target_os = "macos")]
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
+        #[cfg(target_os = "linux")]
+        Cmd::ReadNetlog => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::VmmKrun(_) | Cmd::Macnet(_) => unreachable!("handled before the config loads"),
     }

@@ -18,6 +18,7 @@ use crate::sys;
 mod admin;
 mod console;
 mod launch;
+mod netwire;
 mod plan;
 pub mod record;
 
