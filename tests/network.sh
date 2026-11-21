@@ -103,23 +103,40 @@ expect() {  # file name OPEN|BLOCKED
     if grep -qx "$3 $2" "$1"; then ok "$4: $2 $3"; else bad "$4: $2" "got $(grep " $2\$" "$1" | cut -d' ' -f1)"; fi
 }
 
-# a second VM sits at 172.29.217.2 (it starts first) so other-vm is a real target
-( sudo burner run --img "$IMG" --net web --ttl 8m --tag peer -- "$PRE"'(while :; do nc -l -p 22 </dev/null >/dev/null 2>&1; done) & sleep 400' </dev/null >/dev/null 2>&1 ) &
-sleep 6
+# a second VM sits at 172.29.217.2 (it starts first) so other-vm is a real
+# target. it says PEER-READY with its address once its own listener takes a
+# connection, and other-vm only counts as blocked after that, while it's
+# still up
+( sudo burner run --img "$IMG" --net web --ttl 8m --tag peer -- "$PRE"'(while :; do nc -l -p 22 </dev/null >/dev/null 2>&1; done) &
+up=""; for i in $(seq 20); do tcp 127.0.0.1 22 2>/dev/null && { up=1; break; }; sleep 0.5; done
+[ -n "$up" ] && echo "PEER-READY $(ip -4 -o addr show dev eth0 | awk "{print \$4}")"
+sleep 400' </dev/null > "$T/peer.out" 2>&1 ) &
+peer=no
+for _ in $(seq 60); do grep -q '^PEER-READY 172\.29\.217\.2/' "$T/peer.out" 2>/dev/null && { peer=yes; break; }; sleep 1; done
+# other-vm in mode $2's results $1, only with the peer listening
+peer_check() {
+    if [ "$peer" = yes ] && sudo burner ls | grep -q ' peer '; then
+        expect "$1" other-vm BLOCKED "$2"
+    else
+        bad "$2: other-vm" "the peer VM wasn't up and listening at 172.29.217.2: $(tr '\n' ' ' < "$T/peer.out" | head -c 200)"
+    fi
+}
 
 sudo burner run --img "$IMG" --net web -- "$PROBES" </dev/null > "$T/web.txt" 2>&1
-for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ssh-out ipv6-global; do
+for t in "${blocked[@]}" tap-host-side metadata dns-other-resolver smtp-out ssh-out ipv6-global; do
     expect "$T/web.txt" "$t" BLOCKED web
 done
+peer_check "$T/web.txt" web
 # some clouds (github's runners on azure) drop all icmp from the host itself
 web_open="dns https-github https-pypi https-npm https-crates"
 if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then web_open+=" ping-internet"; else echo "SKIP  web: ping-internet  (the host can't ping out either)"; fi
 for t in $web_open; do expect "$T/web.txt" "$t" OPEN web; done
 
 sudo burner run --img "$IMG" --net open -- "$PROBES" </dev/null > "$T/open.txt" 2>&1
-for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ipv6-global; do
+for t in "${blocked[@]}" tap-host-side metadata dns-other-resolver smtp-out ipv6-global; do
     expect "$T/open.txt" "$t" BLOCKED open
 done
+peer_check "$T/open.txt" open
 for t in ssh-out https-github dns; do expect "$T/open.txt" "$t" OPEN open; done
 pv=$(sudo burner ls | awk '/ peer /{print $1}'); [ -n "$pv" ] && sudo burner kill "$pv" >/dev/null; wait 2>/dev/null
 
