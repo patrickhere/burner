@@ -83,6 +83,8 @@ fi
 sudo rm -f "$r/.dockerenv" "$r/etc/resolv.conf" "$r/etc/hosts" "$r/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 burner\n::1 localhost\n' | sudo tee "$r/etc/hosts" >/dev/null
 echo burner | sudo tee "$r/etc/hostname" >/dev/null
+# an image that would boot and then fail in guest init fails here instead
+sudo chroot "$r" /bin/sh /sbin/burner-init selftest || { echo "$name can't run burner's guest init" >&2; exit 1; }
 mb=$(sudo du -sm "$r" | cut -f1)
 truncate -s $(( mb * 13 / 10 + 64 ))M "$work/rootfs.ext4"
 sudo mkfs.ext4 -q -F -L "burner-$name" -d "$r" "$work/rootfs.ext4"
