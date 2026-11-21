@@ -36,7 +36,7 @@ that's linux with kvm (x86_64 or arm), or any apple silicon mac (M1 and newer, m
 - `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https plus dns and ping only, or any port but mail. the LAN, the host and other VMs are always blocked
-- `burner ls`, `burner kill ID`, `burner images`, `burner doctor`
+- `burner ls`, `burner kill ID`, `burner images`, `burner doctor`, `burner version`. `--json` on any of them gives one JSON document instead ([docs/json.md](docs/json.md))
 
 ```
 git archive HEAD | sudo burner run --net web --in tar -- 'apk add -q nodejs npm && npm ci && npm test'
@@ -180,8 +180,9 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
   | 130 | a signal (ctrl-c, SIGTERM, SIGHUP) stopped burner, or burner kill stopped the VM |
   | other | run and shell: the command's own exit code |
 
-  a command can exit 2, 124, 125 or 130 itself, so for run use `--status-fd` to tell them apart
-- `--status-fd N` writes one JSON line when the run ends, so a command that exits 124 itself isn't mistaken for a timeout. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error`, `input_error` (an `--in tar` that didn't unpack in the VM, so the command never ran), `poweroff` (the command powered off or halted the VM before it exited), `reboot` (the same with a reboot) or `usage`. an image built with an older guest init still reports an input that didn't unpack as `exited` with rc 125, and gets no `poweroff` or `reboot`. sudo closes fds above 2, so through sudo use `--status-fd 2` and read the last line of stderr
+  a command can exit 2, 124, 125 or 130 itself, so for run use `--json-fd` to tell them apart
+- `--json` on any command prints one JSON document instead of text, schema in [docs/json.md](docs/json.md): `exit`, `ok`, the command's `result`, and burner's own lines as `errors` and `warnings`. `burner run --json` puts only that on stdout and the command's output on stderr. `--json-fd N` on run and shell writes it to fd N and leaves stdout and stderr alone, so a command that exits 124 itself isn't mistaken for a timeout: `result.outcome` says which. sudo closes fds above 2, so through sudo use `--json-fd 2` and read the last line of stderr
+- `--status-fd N` is the older one-line form, kept as it was. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error`, `input_error` (an `--in tar` that didn't unpack in the VM, so the command never ran), `poweroff` (the command powered off or halted the VM before it exited), `reboot` (the same with a reboot) or `usage`. an image built with an older guest init still reports an input that didn't unpack as `exited` with rc 125, and gets no `poweroff` or `reboot`
 - when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up after 10 min. `--no-wait` fails right away instead. both end with 125 and outcome `busy`
 - `sudo burner ls --json` prints the envelope with `result` holding `vms`, `max_vms`, `total_mem_mib` and `used_mem_mib`. each VM has `id`, `tag` (null without one), `img`, `vcpus`, `mem_mib`, `disk_gib`, `net`, `status` (`preparing`, `running` or `cleanup-failed`), `owner`, `started_unix`, `age_secs`, `ttl_secs` and `ttl_left_secs`. before 0.3 that object was the whole output, with `mem`, `disk`, `age`, `ttl` and `ttl_left` and the totals without `_mib`; burner-tui reads both. `--tag` on a run makes yours easy to find
 - anything the command leaves running in the background (a server started with `&`, a daemon, even one that called setsid) is killed when the command exits, and the run ends there. if the tests need a server, start it and stop it inside the same command
@@ -191,9 +192,9 @@ a wrapper that tells a failing test from a timeout or a busy box:
 ```sh
 #!/bin/sh
 log=$(mktemp)
-git archive HEAD | sudo burner run --net web --in tar --tag tests --status-fd 2 -- 'sh ./test.sh' 2>"$log"
+git archive HEAD | sudo burner run --net web --in tar --tag tests --json-fd 2 -- 'sh ./test.sh' 2>"$log"
 code=$?
-outcome=$(tail -n 1 "$log" | grep -o '"outcome":"[a-z_]*"' | cut -d'"' -f4)
+outcome=$(tail -n 1 "$log" | jq -r .result.outcome)
 case $outcome in
     exited) echo "tests exited $code" ;;
     timeout) echo "tests hit the time limit" ;;

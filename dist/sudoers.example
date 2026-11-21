@@ -5,4 +5,4 @@
 # stops VMs that caller started. net, reap, doctor and config stay root's.
 alice ALL=(root) NOPASSWD: /usr/local/bin/burner run *, /usr/local/bin/burner shell, \
     /usr/local/bin/burner shell *, /usr/local/bin/burner ls, /usr/local/bin/burner ls *, \
-    /usr/local/bin/burner kill *, /usr/local/bin/burner images
+    /usr/local/bin/burner kill *, /usr/local/bin/burner images, /usr/local/bin/burner images --json
