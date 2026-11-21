@@ -1,6 +1,7 @@
-# both VM suites on github's own linux runners, which have kvm. install.sh, the
-# image build and the suites run exactly as they would on anyone's box. the
-# dedicated box still runs them too, on a host with a LAN and vpns
+# both VM suites on github's own linux runners, which have kvm, once against
+# the alpine image and once against debian. install.sh, the image build and
+# the suites run exactly as they would on anyone's box. the dedicated box
+# still runs them too, on a host with a LAN and vpns
 name: vm suites
 
 on:
@@ -17,8 +18,15 @@ concurrency:
 
 jobs:
   suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        img: [alpine, debian]
+    name: suites (${{ matrix.img }})
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      IMG: ${{ matrix.img }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,6 +41,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq nftables conntrack
+          # debian images are built with mmdebstrap
+          if [ "$IMG" = debian ]; then sudo apt-get install -y -qq mmdebstrap; fi
       - run: cargo build --locked --release
       - name: install
         run: |
@@ -49,8 +59,8 @@ jobs:
           sudo iptables -I DOCKER-USER -d 172.29.217.0/24 -i "$up" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
           sudo ./install.sh
       - id: image
-        run: tools/build-image alpine
-      - run: sudo bash tests/isolation.sh
+        run: tools/build-image "$IMG"
+      - run: sudo env BURNER_TEST_IMG="$IMG" bash tests/isolation.sh
       # worth running even when isolation failed, as long as there's an image
       - if: always() && steps.image.outcome == 'success'
-        run: sudo bash tests/network.sh
+        run: sudo env BURNER_TEST_IMG="$IMG" bash tests/network.sh
