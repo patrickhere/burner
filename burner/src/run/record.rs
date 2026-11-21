@@ -130,6 +130,9 @@ pub struct RunResult {
     pub shell_end: Option<ShellEnd>,
     /// what guest init wrote to result/error: the guest's words, not burner's
     pub guest_error: Option<String>,
+    /// what was wrong with the result the guest left, in words that can quote
+    /// names it chose
+    pub guest_result: Option<String>,
     pub secs: f64,
     pub timing_secs: Timing,
     pub vm: Option<VmInfo>,
@@ -159,6 +162,7 @@ struct Rec {
     reason: Option<Problem>,
     shell_end: Option<ShellEnd>,
     guest_error: Option<String>,
+    guest_result: Option<String>,
     vm: Option<VmInfo>,
     marks: [Option<Instant>; 5],
     teardown: Option<Duration>,
@@ -199,6 +203,10 @@ pub(super) fn set_shell_end(e: ShellEnd) {
 
 pub(super) fn set_guest_error(text: String) {
     with(|r| r.guest_error = Some(text))
+}
+
+pub(super) fn set_guest_result(text: String) {
+    with(|r| r.guest_result = Some(text))
 }
 
 pub(super) fn set_output(o: OutputInfo) {
@@ -306,6 +314,7 @@ impl Rec {
             rc,
             shell_end: r.shell_end,
             guest_error: r.guest_error.clone(),
+            guest_result: r.guest_result.clone(),
             secs: total,
             timing_secs: timing,
             vm: r.vm.clone(),
@@ -453,7 +462,7 @@ mod tests {
         assert!(f.ok() && f.reason.is_none());
         assert_eq!(
             serde_json::to_string(&f.result).unwrap(),
-            r#"{"id":"burner-3f9a1c2b7d10","outcome":"exited","rc":3,"shell_end":null,"guest_error":null,"secs":3.0,"timing_secs":{"queue":0.0,"prepare":0.5,"boot":1.6,"command":0.5,"collect":0.1,"teardown":0.3},"vm":{"img":"alpine","backend":"firecracker","vcpus":1,"mem_mib":512,"disk_gib":2,"ttl_secs":600,"net":"web","tag":null},"output":{"bytes":1834,"live_bytes":1834,"skipped_bytes":0,"dropped":false},"result_tar":null,"network":null,"files":null,"processes":null}"#
+            r#"{"id":"burner-3f9a1c2b7d10","outcome":"exited","rc":3,"shell_end":null,"guest_error":null,"guest_result":null,"secs":3.0,"timing_secs":{"queue":0.0,"prepare":0.5,"boot":1.6,"command":0.5,"collect":0.1,"teardown":0.3},"vm":{"img":"alpine","backend":"firecracker","vcpus":1,"mem_mib":512,"disk_gib":2,"ttl_secs":600,"net":"web","tag":null},"output":{"bytes":1834,"live_bytes":1834,"skipped_bytes":0,"dropped":false},"result_tar":null,"network":null,"files":null,"processes":null}"#
         );
     }
 

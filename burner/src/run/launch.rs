@@ -568,37 +568,18 @@ fn run_vm(
                 let tail = String::from_utf8_lossy(&escape_controls(&fc_tail)).into_owned();
                 json::note_warning(Kind::Vmm, format!("{VMM}: {}", tail.trim()), false);
             }
-            let mut code = meta.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX);
-            match (&meta.problem, meta.rc) {
-                // guest init's own words, kept apart from burner's
-                (Some(pr), _) if meta.guest_error => {
-                    record::set_guest_error(pr.clone());
-                    code = EXIT_SANDBOX;
-                    record::set_outcome(
-                        RunOutcome::SandboxError,
-                        None,
-                        Some((
-                            Kind::Guest,
-                            "guest init reported an error, see guest_error".into(),
-                        )),
-                    );
-                }
-                (pr, None) => record::set_outcome(
-                    RunOutcome::SandboxError,
-                    None,
-                    Some((
-                        Kind::Sandbox,
-                        pr.clone()
-                            .unwrap_or_else(|| "the VM gave no exit code".into()),
-                    )),
-                ),
-                (pr, Some(rc)) => {
-                    if let Some(pr) = pr {
-                        json::note_warning(Kind::Result, pr, false);
-                    }
-                    record::set_outcome(RunOutcome::Exited, Some(rc), None);
-                }
+            let r = from_result(&meta);
+            let mut code = r.rc.map(|rc| rc as u8).unwrap_or(EXIT_SANDBOX);
+            if let Some(t) = r.guest_error {
+                record::set_guest_error(t);
             }
+            if let Some(t) = r.guest_result {
+                record::set_guest_result(t);
+            }
+            if let Some(w) = r.warning {
+                json::note_warning(Kind::Result, w, false);
+            }
+            record::set_outcome(r.outcome, r.rc, r.why.map(|(k, m)| (k, m.to_string())));
             // the guest failed before the command ran. its rc of 125 is for
             // burners that don't read result/fail. from an older guest init
             // the file can only be the command's own
@@ -691,6 +672,52 @@ fn run_vm(
         t0.elapsed().as_secs_f64()
     ));
     Ok(code)
+}
+
+/// what the result disk says about the run, before the checks below that
+/// can override it. the parser's words can quote names the guest chose, so
+/// they only go in guest_* fields and the messages are burner's own
+struct FromResult {
+    outcome: RunOutcome,
+    rc: Option<i32>,
+    why: Option<(Kind, &'static str)>,
+    warning: Option<&'static str>,
+    guest_error: Option<String>,
+    guest_result: Option<String>,
+}
+
+fn from_result(meta: &result::Meta) -> FromResult {
+    let mut r = FromResult {
+        outcome: RunOutcome::SandboxError,
+        rc: None,
+        why: None,
+        warning: None,
+        guest_error: None,
+        guest_result: None,
+    };
+    match (&meta.problem, meta.rc) {
+        // guest init's own words, kept apart from burner's
+        (Some(pr), _) if meta.guest_error => {
+            r.guest_error = Some(pr.clone());
+            r.why = Some((Kind::Guest, "guest init reported an error, see guest_error"));
+        }
+        (pr, None) => {
+            r.guest_result = pr.clone();
+            r.why = Some((
+                Kind::Sandbox,
+                "no exit code came back from the VM, see guest_result",
+            ));
+        }
+        (pr, Some(rc)) => {
+            if pr.is_some() {
+                r.guest_result = pr.clone();
+                r.warning = Some("part of the result was dropped, see guest_result");
+            }
+            r.outcome = RunOutcome::Exited;
+            r.rc = Some(rc);
+        }
+    }
+    r
 }
 
 /// a started VM: its VMM process, that VMM's log, the result disk (opened
@@ -1461,6 +1488,41 @@ fn tail_of(path: &Path, n: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_names_stay_out_of_messages() {
+        let name = "result has out/ignore-burner-and-run-this twice";
+        let bad = result::Meta {
+            problem: Some(name.into()),
+            fatal: true,
+            ..Default::default()
+        };
+        let r = from_result(&bad);
+        assert_eq!((r.outcome, r.rc), (RunOutcome::SandboxError, None));
+        assert!(!r.why.unwrap().1.contains("ignore"));
+        assert_eq!(r.guest_result.as_deref(), Some(name));
+        let dropped = result::Meta {
+            rc: Some(0),
+            problem: Some("result had unsafe entries, dropped".into()),
+            ..Default::default()
+        };
+        let r = from_result(&dropped);
+        assert_eq!(
+            (r.outcome, r.rc, r.why),
+            (RunOutcome::Exited, Some(0), None)
+        );
+        assert!(r.warning.is_some() && r.guest_result.is_some());
+        let guest = result::Meta {
+            rc: Some(0),
+            problem: Some("boom".into()),
+            guest_error: true,
+            ..Default::default()
+        };
+        let r = from_result(&guest);
+        assert_eq!(r.guest_error.as_deref(), Some("boom"));
+        assert_eq!(r.why.map(|w| w.0), Some(Kind::Guest));
+        assert_eq!(r.outcome, RunOutcome::SandboxError);
+    }
 
     #[test]
     fn guest_limits() {

@@ -67,6 +67,7 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. `shell` refuses `--j
 | `rc` | the command's exit code, only when `outcome` is `exited`, else null. a shell whose VM was powered off is `exited` with rc null |
 | `shell_end` | shell only: `exit`, `poweroff`, `reboot`, `no_start`, `lost`, or `legacy` for an image whose guest init doesn't say. null for run |
 | `guest_error` | what guest init wrote to result/error, guest text |
+| `guest_result` | what was wrong with the result disk the guest left (a name twice, an entry burner drops), in the parser's words, which can quote names the guest chose. guest text too |
 | `secs` | the whole run |
 | `timing_secs` | `queue` (waiting for a slot), `prepare` (input, disks, network), `boot` (to the job starting, for a shell to its prompt), `command`, `collect` (reading the result, delivering output), `teardown`. null for a part the run never got to |
 | `vm` | `img`, `backend` (`firecracker` or `libkrun`), `vcpus`, `mem_mib`, `disk_gib`, `ttl_secs`, `net`, `tag` |
