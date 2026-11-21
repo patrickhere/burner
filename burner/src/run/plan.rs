@@ -44,12 +44,14 @@ pub struct RunArgs {
     /// network: none, web (http/https, dns, ping) or open (any port but mail). never the LAN
     #[arg(long, default_value = "none")]
     net: String,
-    /// write one JSON line to this fd when done: how the run ended, the guest's
-    /// exit code if it has one, the VM id. for wrappers that need to tell a
-    /// timeout from a command that exited 124 itself. sudo closes fds above 2,
-    /// so through sudo use 2: the line is then the last thing on stderr
+    /// the older one-line form of --json-fd: outcome, rc, exit, id and secs
     #[arg(long, value_name = "FD")]
     pub(super) status_fd: Option<i32>,
+    /// write the json result (docs/json.md) to this fd when done, and leave
+    /// stdout and stderr as they are. sudo closes fds above 2, so through sudo
+    /// use 2: the json is then the last line on stderr
+    #[arg(long, value_name = "FD")]
+    pub(super) json_fd: Option<i32>,
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
@@ -102,6 +104,7 @@ pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
         tag: a.tag,
         net_default: a.net.is_none(),
         status_fd: None,
+        json_fd: None,
         no_wait: false,
         net: a.net.unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],

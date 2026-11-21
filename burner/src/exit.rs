@@ -37,7 +37,7 @@ pub fn help() -> String {
     for (code, what) in TABLE {
         s += &format!("  {code:<6} {}\n", what.replace('`', ""));
     }
-    s + "a command can exit 2, 124, 125 or 130 itself: --status-fd tells them apart"
+    s + "a command can exit 2, 124, 125 or 130 itself: --json-fd tells them apart"
 }
 
 #[cfg(test)]

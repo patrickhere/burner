@@ -208,9 +208,9 @@ fn command_word(args: &[String]) -> Option<&'static str> {
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let t0 = Instant::now();
     if let Cmd::Run(a) = &cli.cmd
-        && !run::status_fd_ok(a)
+        && let Some(code) = run::check_fds(a, t0)
     {
-        return Ok(ExitCode::from(run::EXIT_USAGE));
+        return Ok(code);
     }
     // run and shell end with 125 when they have no result, a config that
     // doesn't load included, and run still writes its status line

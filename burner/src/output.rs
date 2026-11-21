@@ -35,6 +35,8 @@ enum Chunk {
 pub enum Dest {
     Stdout,
     Stderr,
+    /// nowhere: burner's own lines with --json, which are in the json instead
+    Null,
 }
 
 impl Out {
@@ -42,6 +44,7 @@ impl Out {
         let (fd, w): (i32, Box<dyn Write + Send>) = match dest {
             Dest::Stdout => (1, Box::new(std::io::stdout())),
             Dest::Stderr => (2, Box::new(std::io::stderr())),
+            Dest::Null => (-1, Box::new(std::io::sink())),
         };
         Out::to(w, crate::sys::is_tty(fd), None)
     }

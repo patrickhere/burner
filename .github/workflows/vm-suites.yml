@@ -32,7 +32,7 @@ jobs:
       - name: packages
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq nftables conntrack
+          sudo apt-get install -y -qq nftables conntrack jq
       - run: cargo build --locked --release
       - name: install
         run: |

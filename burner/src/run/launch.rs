@@ -61,26 +61,66 @@ const VMM_SOFT_MIB: u64 = 64;
 /// setup (disks, tap) has this long before the reaper stops the wrapper
 const PREP_SECS: u32 = 180;
 
-/// checked before the config loads, so a run that fails that early still
-/// writes its status line
-pub fn status_fd_ok(a: &RunArgs) -> bool {
-    let Some(fd) = a.status_fd else {
-        return true;
+/// with --json stdout is the json's, and burner's own lines are only in it
+fn quiet() -> bool {
+    json::on()
+}
+
+/// where the json goes, if anywhere
+fn json_target(a: &RunArgs) -> Option<i32> {
+    if quiet() { Some(1) } else { a.json_fd }
+}
+
+/// 2, or an open fd above 2, now close-on-exec so it never reaches the VM's
+/// processes (stderr is passed explicitly anyway)
+fn fd_ok(fd: i32) -> bool {
+    // SAFETY: fcntl only inspects and flags the fd
+    fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0)
+}
+
+/// the fds and the flags that write to stdout, checked before the config
+/// loads so a run that fails that early still writes its status line and json.
+/// Some(exit) when the run can't go ahead
+pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
+    let status_ok = a.status_fd.is_none_or(fd_ok);
+    let json_ok = a.json_fd.is_none_or(|fd| fd == 1 || fd_ok(fd));
+    let tar_out = "--result tar writes the tar to stdout, use --json-fd 2 for the json";
+    let msg = match (a.status_fd, a.json_fd) {
+        (Some(fd), _) if !status_ok => {
+            format!("--status-fd {fd} isn't an open file descriptor (2, or above 2)")
+        }
+        (_, Some(fd)) if !json_ok => {
+            format!("--json-fd {fd} isn't an open file descriptor (1, 2, or above 2)")
+        }
+        (_, Some(_)) if quiet() => {
+            "--json writes to stdout, --json-fd to another fd: pick one".into()
+        }
+        _ if a.result.is_some() && json_target(a) == Some(1) => tar_out.into(),
+        _ => return None,
     };
-    // SAFETY: fcntl only inspects and flags the fd; close-on-exec keeps a
-    // caller's fd out of the VM's processes (stderr is passed explicitly anyway)
-    let ok =
-        fd == 2 || (fd > 2 && unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0);
-    if !ok {
-        eprintln!("burner: --status-fd {fd} isn't an open file descriptor (2, or above 2)");
+    if !quiet() {
+        eprintln!("burner: {msg}");
     }
-    ok
+    let why = Problem {
+        kind: Kind::Usage,
+        message: msg,
+    };
+    let f = record::finish(t0, EXIT_USAGE, Some(why));
+    if let (true, Some(fd)) = (status_ok, a.status_fd) {
+        json::write_fd(fd, &f.status_line());
+    }
+    if let (true, Some(fd)) = (json_ok, json_target(a)) {
+        json::write_fd(fd, &envelope(a, f));
+    }
+    Some(ExitCode::from(EXIT_USAGE))
 }
 
 /// a run whose config didn't load: no result, so 125 like any other sandbox failure
 pub fn config_failed(a: &RunArgs, e: &anyhow::Error, t0: Instant) -> ExitCode {
     let msg = format!("{e:#}");
-    eprintln!("burner: {msg}");
+    if !quiet() {
+        eprintln!("burner: {msg}");
+    }
     let why = Problem {
         kind: Kind::Config,
         message: msg,
@@ -88,15 +128,30 @@ pub fn config_failed(a: &RunArgs, e: &anyhow::Error, t0: Instant) -> ExitCode {
     finished(a, record::finish(t0, EXIT_SANDBOX, Some(why)))
 }
 
-/// the status line and the json, then the exit code
+/// the status line and the json, then the exit code. both on one fd: the
+/// json comes last
 fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
+    let code = f.code;
     if let Some(fd) = a.status_fd {
         json::write_fd(fd, &f.status_line());
     }
-    ExitCode::from(f.code)
+    if let Some(fd) = json_target(a) {
+        json::write_fd(fd, &envelope(a, f));
+    }
+    ExitCode::from(code)
 }
 
-/// the caller checked a.status_fd with status_fd_ok
+fn envelope(a: &RunArgs, f: record::Finished) -> String {
+    let command = if a.shell { "shell" } else { "run" };
+    let ok = f.ok();
+    let mut env = json::Envelope::new(Some(command), f.code, ok, f.result);
+    if let Some(why) = f.reason {
+        env.errors.insert(0, why);
+    }
+    env.line()
+}
+
+/// the caller checked the fds with check_fds
 pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
     interrupted();
     // boot mode from the start: keys typed during setup wait for the VM and
@@ -112,7 +167,9 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
                 sys::restore_saved_tty();
             }
             let message = format!("{e:#}");
-            eprintln!("burner: {message}");
+            if !quiet() {
+                eprintln!("burner: {message}");
+            }
             let (code, kind) = match e.downcast_ref::<Exit>() {
                 Some(Exit(code, kind, _)) => (*code, *kind),
                 None => (EXIT_SANDBOX, Kind::Sandbox),
@@ -211,13 +268,14 @@ fn run_vm(
     run_dir: &Path,
     held: &mut Option<()>,
 ) -> Result<u8> {
-    let live = Out::new(if a.result.is_some() {
+    // stdout is the tar's or the json's when there is one
+    let live = Out::new(if a.result.is_some() || quiet() {
         Dest::Stderr
     } else {
         Dest::Stdout
     });
     let tar_out = a.result.map(|_| Out::new(Dest::Stdout));
-    let diag = Out::new(Dest::Stderr);
+    let diag = Out::new(if quiet() { Dest::Null } else { Dest::Stderr });
     let t0 = Instant::now();
 
     if a.input != Input::None && !disk_left(run_dir, 0) {

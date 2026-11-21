@@ -319,6 +319,42 @@ st() { tail -n 1 "$1" | grep -o '"outcome":"[a-z_]*"' | cut -d'"' -f4; }
   && ok "ctrl-c during a shell's boot stops it (rc $rc)" \
   || bad "ctrl-c during boot" "rc=$rc $(tr -d '\r' < "$T/cc.out" | tail -n 3 | tr '\n' ' ')"
 
+# 27 --json: stdout is only the json, the command's output goes to stderr. a
+# command's own exit 124 is exited, the time limit is a timeout, an input that
+# doesn't unpack is input_error, --result tar with --json is refused before a
+# VM, and with --json-fd 2 the json is the last line on stderr, after the
+# status line, next to a tar on stdout
+jq_is() { printf '%s' "$1" | jq -e "$2" >/dev/null 2>&1; }
+j1=$(sudo burner run --json -- 'echo hi; exit 7' </dev/null 2>"$T/j1.err"); r1=$?
+j2=$(sudo burner run --json -- 'exit 124' </dev/null 2>/dev/null); r2=$?
+j3=$(sudo burner run --json --ttl 10s -- 'sleep 60' </dev/null 2>/dev/null); r3=$?
+j4=$(printf 'not a tar' | sudo burner run --json --in tar -- true 2>/dev/null); r4=$?
+j5=$(sudo burner run --json --result tar -- true </dev/null 2>/dev/null); r5=$?
+sudo burner run --result tar --status-fd 2 --json-fd 2 -- 'echo x > /out/f' </dev/null >"$T/j6.tar" 2>"$T/j6.err"; r6=$?
+j6=$(tail -n 1 "$T/j6.err"); s6=$(tail -n 2 "$T/j6.err" | head -n 1)
+[ "$r1" = 7 ] && jq_is "$j1" '.schema == 1 and .command == "run" and .exit == 7 and .ok and .result.outcome == "exited" and .result.rc == 7' \
+  && [ "$(cat "$T/j1.err")" = hi ] \
+  && [ "$r2" = 124 ] && jq_is "$j2" '.result.outcome == "exited" and .result.rc == 124' \
+  && [ "$r3" = 124 ] && jq_is "$j3" '.result.outcome == "timeout" and .result.rc == null and .errors[0].kind == "timeout" and (.ok | not)' \
+  && [ "$r4" = 125 ] && jq_is "$j4" '.result.outcome == "input_error" and .result.rc == null and .errors[0].kind == "input"' \
+  && [ "$r5" = 2 ] && jq_is "$j5" '.result == null and .errors[0].kind == "usage"' \
+  && [ "$r6" = 0 ] && jq_is "$j6" '.result.result_tar.delivered and .ok' && [ "$(tar -xOf "$T/j6.tar" out/f 2>/dev/null)" = x ] \
+  && jq_is "$s6" 'keys_unsorted == ["exit","id","outcome","rc","secs"]' \
+  && ok "--json: exited 7, own 124, timeout, input_error, tar refused, --json-fd 2 with a tar" \
+  || bad "--json" "r=$r1,$r2,$r3,$r4,$r5,$r6 $(printf '%s' "$j3$j4" | head -c 300)"
+
+# 28 the other commands' json: ls with the envelope, kill of an unknown id,
+# images, doctor and config
+jl=$(sudo burner ls --json); jk=$(sudo burner kill --json burner-000000000000); rk=$?
+ji=$(sudo burner images --json); jd=$(sudo burner doctor --json); jc=$(sudo burner config --json)
+jq_is "$jl" '.command == "ls" and (.result.vms | type) == "array" and .result.max_vms > 0' \
+  && [ "$rk" = 1 ] && jq_is "$jk" '.errors[0].kind == "not_found" and .result == null' \
+  && jq_is "$ji" '[.result.images[].name] | index("alpine") != null' \
+  && jq_is "$jd" '.command == "doctor" and (.result.checks | length) > 0' \
+  && jq_is "$jc" '.result.limits.max_vms > 0' \
+  && ok "--json: ls, kill, images, doctor, config" \
+  || bad "--json commands" "kill=$rk $(printf '%s' "$jk" | head -c 200)"
+
 if clean_state; then ok "no leftover jails, state files or cgroups"; else bad "leftovers" "$(sudo ls /var/lib/burner/jail/firecracker/ /run/burner/vms/)"; fi
 echo "---- $pass passed, $fail failed"
 [ "$fail" = 0 ]
