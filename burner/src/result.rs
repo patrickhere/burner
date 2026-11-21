@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -175,8 +175,14 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     if !status.success() {
         return Err(io::Error::other("parser failed"));
     }
+    accept_meta(&out)
+}
+
+/// the parser's answer, taken as hostile as the guest bytes it read: rc in
+/// range, problem short and without controls, fail and ended one word each
+pub fn accept_meta(out: &str) -> io::Result<Meta> {
     let mut meta: Meta =
-        serde_json::from_str(&out).map_err(|_| io::Error::other("parser gave no answer"))?;
+        serde_json::from_str(out).map_err(|_| io::Error::other("parser gave no answer"))?;
     meta.rc = meta.rc.filter(|rc| (0..=255).contains(rc));
     meta.problem = meta.problem.map(|p| {
         p.chars()
@@ -286,8 +292,7 @@ fn fatal(msg: &str) -> io::Error {
 /// entry types busybox tar writes, small long-name and pax records, a bounded
 /// number of headers, and every size in range. the crate would otherwise load
 /// extension records and sparse maps before any of burner's limits apply
-fn prescan(src: &mut File, len: u64) -> io::Result<()> {
-    use std::io::{Seek, SeekFrom};
+pub fn prescan(src: &mut (impl Read + Seek), len: u64) -> io::Result<()> {
     let len = len.min(RESULT_SIZE);
     let (mut off, mut headers) = (0u64, 0u32);
     let mut h = [0u8; 512];
@@ -352,10 +357,10 @@ fn octal(f: &[u8]) -> Option<u64> {
     u64::from_str_radix(s, 8).ok()
 }
 
-fn walk(
-    src: File,
-    mut logf: File,
-    mut out: Option<&mut tar::Builder<Capped>>,
+pub fn walk<W: Write>(
+    src: impl Read,
+    mut logf: impl Write,
+    mut out: Option<&mut tar::Builder<W>>,
     meta: &mut Meta,
 ) -> io::Result<()> {
     let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 16, src));
@@ -527,7 +532,6 @@ impl Write for Capped {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[test]
     fn names() {
@@ -556,16 +560,29 @@ mod tests {
         b.into_inner().unwrap()
     }
 
+    #[test]
+    fn parser_answers() {
+        let m = accept_meta(r#"{"rc":300,"problem":"a\u001b]0;x\u0007b","skipped":0,"fatal":false,"fail":"in put\n"}"#).unwrap();
+        // an rc out of range is no rc, and no rc is fatal
+        assert_eq!((m.rc, m.fatal), (None, true));
+        assert_eq!(m.problem.as_deref(), Some("a?]0;x?b"));
+        assert_eq!(m.fail.as_deref(), Some("input"));
+        let m = accept_meta(r#"{"rc":3,"problem":null,"skipped":0,"fatal":true}"#).unwrap();
+        assert_eq!(m.rc, None);
+        assert!(accept_meta("not json").is_err());
+    }
+
     fn walk_bytes(bytes: &[u8]) -> io::Result<Meta> {
-        let dir = std::env::temp_dir().join(format!("burner-walk-{}", sys::random_hex(6)?));
-        fs::create_dir(&dir)?;
-        fs::write(dir.join("raw"), bytes)?;
         let mut meta = Meta::default();
-        let mut src = File::open(dir.join("raw"))?;
-        let res = prescan(&mut src, bytes.len() as u64)
-            .and_then(|()| walk(src, File::create(dir.join("log"))?, None, &mut meta));
-        let _ = fs::remove_dir_all(&dir);
-        res.map(|()| meta)
+        let mut src = io::Cursor::new(bytes);
+        prescan(&mut src, bytes.len() as u64)?;
+        walk(
+            src,
+            io::sink(),
+            None::<&mut tar::Builder<Vec<u8>>>,
+            &mut meta,
+        )?;
+        Ok(meta)
     }
 
     #[test]
