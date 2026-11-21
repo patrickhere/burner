@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use super::admin::reaper_alive;
-use super::launch::main;
+use super::launch::{main, refuse};
 use super::{EXIT_SANDBOX, EXIT_USAGE, exit, usage};
 use crate::config::Config;
 use crate::json::{self, Kind};
@@ -16,7 +16,7 @@ use crate::sys;
 
 const CMD_CAP: usize = 64 << 10;
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct RunArgs {
     /// image to boot (burner images lists them)
     #[arg(long, default_value = "alpine")]
@@ -85,32 +85,42 @@ pub struct ShellArgs {
     net: Option<String>,
     #[arg(long)]
     tag: Option<String>,
+    /// write the json result (docs/json.md) to this fd when the shell ends.
+    /// through sudo use 2
+    #[arg(long, value_name = "FD")]
+    json_fd: Option<i32>,
 }
 
-pub fn shell_main(cfg: &Config, a: ShellArgs) -> ExitCode {
-    if !(sys::is_tty(0) && sys::is_tty(1)) {
-        eprintln!("burner: burner shell needs a terminal (over ssh: ssh -t)");
-        return ExitCode::from(EXIT_USAGE);
-    }
-    let img = a.spec.unwrap_or_else(|| "alpine".into());
-    let ra = RunArgs {
-        img,
+/// a shell is a run with the caller's terminal and no command
+pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
+    RunArgs {
+        img: a.spec.clone().unwrap_or_else(|| "alpine".into()),
         cpus: a.cpus,
         mem: a.mem,
         disk: a.disk,
-        ttl: a.ttl,
+        ttl: a.ttl.clone(),
         input: Input::None,
         result: None,
-        tag: a.tag,
+        tag: a.tag.clone(),
         net_default: a.net.is_none(),
         status_fd: None,
-        json_fd: None,
+        json_fd: a.json_fd,
         no_wait: false,
-        net: a.net.unwrap_or_else(|| "web".into()),
+        net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
-    };
-    main(cfg, ra)
+    }
+}
+
+pub fn shell_main(cfg: &Config, a: &RunArgs) -> ExitCode {
+    if !(sys::is_tty(0) && sys::is_tty(1)) {
+        return refuse(
+            a,
+            Kind::NoTty,
+            "burner shell needs a terminal (over ssh: ssh -t)".into(),
+        );
+    }
+    main(cfg, a)
 }
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]

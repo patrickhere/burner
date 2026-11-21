@@ -86,6 +86,9 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     let json_ok = a.json_fd.is_none_or(|fd| fd == 1 || fd_ok(fd));
     let tar_out = "--result tar writes the tar to stdout, use --json-fd 2 for the json";
     let msg = match (a.status_fd, a.json_fd) {
+        _ if a.shell && quiet() => {
+            "burner shell has the terminal, use --json-fd N for the json".into()
+        }
         (Some(fd), _) if !status_ok => {
             format!("--status-fd {fd} isn't an open file descriptor (2, or above 2)")
         }
@@ -113,6 +116,15 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
         json::write_fd(fd, &envelope(a, f));
     }
     Some(ExitCode::from(EXIT_USAGE))
+}
+
+/// a usage error found after the fds were checked, before anything started
+pub(super) fn refuse(a: &RunArgs, kind: Kind, msg: String) -> ExitCode {
+    if !quiet() {
+        eprintln!("burner: {msg}");
+    }
+    let why = Problem { kind, message: msg };
+    finished(a, record::finish(Instant::now(), EXIT_USAGE, Some(why)))
 }
 
 /// a run whose config didn't load: no result, so 125 like any other sandbox failure
@@ -152,7 +164,7 @@ fn envelope(a: &RunArgs, f: record::Finished) -> String {
 }
 
 /// the caller checked the fds with check_fds
-pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
+pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
     interrupted();
     // boot mode from the start: keys typed during setup wait for the VM and
     // ctrl-c works. the terminal comes back however main returns
@@ -160,7 +172,7 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
         .shell
         .then(|| sys::ShellTty::take(crate::output::TERM_RESET));
     let t0 = Instant::now();
-    let (code, failed) = match run(cfg, &a) {
+    let (code, failed) = match run(cfg, a) {
         Ok(code) => (code, None),
         Err(e) => {
             if a.shell {
@@ -177,7 +189,7 @@ pub fn main(cfg: &Config, a: RunArgs) -> ExitCode {
             (code, Some(Problem { kind, message }))
         }
     };
-    finished(&a, record::finish(t0, code, failed))
+    finished(a, record::finish(t0, code, failed))
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {

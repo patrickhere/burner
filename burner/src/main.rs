@@ -207,7 +207,13 @@ fn command_word(args: &[String]) -> Option<&'static str> {
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let t0 = Instant::now();
-    if let Cmd::Run(a) = &cli.cmd
+    // a shell is a run with the caller's terminal from here on
+    let run_args = match &cli.cmd {
+        Cmd::Run(a) => Some(a.clone()),
+        Cmd::Shell(a) => Some(run::shell_run_args(a)),
+        _ => None,
+    };
+    if let Some(a) = &run_args
         && let Some(code) = run::check_fds(a, t0)
     {
         return Ok(code);
@@ -216,21 +222,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     // doesn't load included, and run still writes its status line
     let cfg = match Config::load(&cli.config) {
         Ok(cfg) => cfg,
-        Err(e) => match &cli.cmd {
-            Cmd::Run(a) => return Ok(run::config_failed(a, &e, t0)),
-            Cmd::Shell(_) => {
-                eprintln!("burner: {e:#}");
-                return Ok(ExitCode::from(run::EXIT_SANDBOX));
+        Err(e) => {
+            if let Some(a) = &run_args {
+                return Ok(run::config_failed(a, &e, t0));
             }
-            c => {
-                return Ok(json::fail(
-                    c.name(),
-                    exit::EXIT_FAILED,
-                    Kind::Config,
-                    format!("{e:#}"),
-                ));
-            }
-        },
+            let msg = format!("{e:#}");
+            return Ok(json::fail(
+                cli.cmd.name(),
+                exit::EXIT_FAILED,
+                Kind::Config,
+                msg,
+            ));
+        }
     };
     #[cfg(target_os = "macos")]
     cgroup::set_dir(&cfg.paths.state);
@@ -246,8 +249,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
         Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
-        Cmd::Run(a) => Ok(run::main(&cfg, a)),
-        Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
+        Cmd::Run(_) => Ok(run::main(&cfg, &run_args.expect("set for run"))),
+        Cmd::Shell(_) => Ok(run::shell_main(&cfg, &run_args.expect("set for shell"))),
         // not there on this OS rather than failed, like a wrong flag
         #[cfg(target_os = "macos")]
         Cmd::Net { .. } => Ok(json::fail(
