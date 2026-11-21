@@ -603,6 +603,12 @@ pub fn table_exists() -> bool {
     run("nft", &["list", "table", "inet", TABLE]).is_ok()
 }
 
+/// the table has the connection log's maps: one loaded by an older burner
+/// doesn't, and a tap can't come up in it
+fn log_maps_ok() -> bool {
+    run("nft", &["list", "map", "inet", TABLE, "log_try"]).is_ok()
+}
+
 /// load the ruleset and turn on forwarding. safe to run again: the reload is
 /// one nft transaction, and running VMs get their tap entries back right after
 pub fn up(cfg: &Config) -> Result<Vec<String>> {
@@ -966,7 +972,16 @@ pub fn refresh_public_ip(cfg: &Config) {
 /// and if something wiped the table while taps are up, put it back or kill them
 pub fn check(cfg: &Config) {
     let has_taps = !taps_present(cfg).is_empty();
-    if !table_exists() {
+    let exists = table_exists();
+    if !exists || !log_maps_ok() {
+        // a table an older burner loaded: the same filter, without the log.
+        // reload it, the same as net up after an upgrade
+        if exists && !has_taps {
+            if up(cfg).is_err() {
+                sys::syslog("burner net: reloading the filter for the network log failed");
+            }
+            return;
+        }
         if !has_taps {
             return;
         }
@@ -1023,6 +1038,9 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
     let _lock = net_lock_for(cfg, std::time::Duration::from_secs(60))?;
     if !table_exists() || !routing_ok(cfg) {
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
+    }
+    if !log_maps_ok() {
+        bail!("the VM network was set up by an older burner, run burner net up again");
     }
     let s = slot(cfg, i)?;
     if !sys::which("conntrack") {
