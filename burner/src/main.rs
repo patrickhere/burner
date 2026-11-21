@@ -56,6 +56,12 @@ enum Cmd {
     Images,
     /// this burner's version, backend and the json and guest protocol it speaks
     Version,
+    /// the hosts -H knows, from ~/.config/burner/hosts.toml
+    Hosts {
+        /// try every address now
+        #[arg(long)]
+        check: bool,
+    },
     /// fetch the guest kernel and alpine image from a release and install them
     #[cfg(target_os = "macos")]
     Setup(setup::SetupArgs),
@@ -144,6 +150,7 @@ impl Cmd {
             Cmd::Kill { .. } => "kill",
             Cmd::Images => "images",
             Cmd::Version => "version",
+            Cmd::Hosts { .. } => "hosts",
             #[cfg(target_os = "macos")]
             Cmd::Setup(_) => "setup",
             Cmd::Reap => "reap",
@@ -210,7 +217,7 @@ fn command_word(args: &[String]) -> Option<&'static str> {
     };
     [
         "config", "doctor", "run", "shell", "net up", "net down", "net show", "ls", "kill",
-        "images", "setup", "version",
+        "images", "setup", "version", "hosts",
     ]
     .into_iter()
     .find(|c| *c == full)
@@ -227,7 +234,7 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     match &cli.cmd {
         Cmd::Run(a) if a.is_remote() => return None,
         Cmd::Shell(a) if a.is_remote() => return None,
-        Cmd::ParseResult { .. } | Cmd::Reap => return None,
+        Cmd::ParseResult { .. } | Cmd::Reap | Cmd::Hosts { .. } => return None,
         _ => {}
     }
     let host = match hosts::resolve(cli.host.as_deref()) {
@@ -269,9 +276,7 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),
         Cmd::Run(a) => remote::client::run(&host, a, &config),
         Cmd::Shell(a) => remote::pty::shell(&host, &run::shell_run_args(a), &config),
-        Cmd::Doctor => {
-            return usage(format!("burner {name} doesn't go over -H yet"));
-        }
+        Cmd::Doctor => remote::doctor::doctor(&host, &config),
         _ => {
             let what = name.split(' ').next().unwrap_or(name);
             return usage(format!(
@@ -292,6 +297,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
         }
         return Ok(json::reply("version", 0, Some(v)));
+    }
+    if let Cmd::Hosts { check } = cli.cmd {
+        return Ok(remote::doctor::hosts(check));
     }
     let t0 = Instant::now();
     // a shell is a run with the caller's terminal from here on
@@ -392,7 +400,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reap => run::reap(&cfg),
-        Cmd::Version => unreachable!("handled before the config loads"),
+        Cmd::Version | Cmd::Hosts { .. } => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),

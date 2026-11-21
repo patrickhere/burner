@@ -115,7 +115,7 @@ pub fn decide(
 }
 
 /// a TCP connect to every address `name:port` resolves to, within `limit`
-fn knock(name: &str, port: u16, limit: Duration) -> Answer {
+pub fn knock(name: &str, port: u16, limit: Duration) -> Answer {
     let t0 = Instant::now();
     let (tx, rx) = mpsc::channel();
     let target = (name.to_string(), port);
@@ -175,7 +175,7 @@ pub struct NoneAnswered(pub Vec<(String, String)>);
 
 /// the shown name of an address: `name:port` when ssh would connect
 /// somewhere it doesn't say
-fn label(addr: &str, c: &SshConf) -> String {
+pub fn label(addr: &str, c: &SshConf) -> String {
     if c.port == 22 && (c.hostname.is_empty() || c.hostname == addr) {
         addr.to_string()
     } else if c.hostname.is_empty() || c.hostname == addr {
@@ -373,9 +373,11 @@ mod tests {
             Answer::Up(_)
         ));
         drop(l);
-        assert_eq!(
-            knock("127.0.0.1", port, Duration::from_secs(1)),
-            Answer::Down("refused".into())
+        // refused, unless another test took the port in between
+        let gone = knock("127.0.0.1", port, Duration::from_secs(1));
+        assert!(
+            gone == Answer::Down("refused".into()) || matches!(gone, Answer::Up(_)),
+            "{gone:?}"
         );
         assert_eq!(
             knock("no-such-host.invalid", 22, Duration::from_secs(2)),

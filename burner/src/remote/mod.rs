@@ -4,6 +4,7 @@
 //! a compromised host shouldn't get to drive your terminal or your tar -x
 
 pub mod client;
+pub mod doctor;
 pub mod frame;
 pub mod hosts;
 pub mod probe;
