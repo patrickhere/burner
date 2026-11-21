@@ -40,6 +40,8 @@ pub const FIELDS: [Field; 7] = [
 pub enum Action {
     Nothing,
     Quit,
+    /// switch to this host: local, or a name from hosts.toml
+    Host(String),
     Launch(Vec<String>, Mode),
     Kill(String),
     Refresh,
@@ -65,6 +67,8 @@ pub struct App {
     pub help: bool,
     pub status: String,
     pub users: HashMap<u32, String>,
+    /// local and the hosts in hosts.toml, for h
+    pub hosts: Vec<String>,
 }
 
 impl App {
@@ -89,7 +93,21 @@ impl App {
             help: false,
             status: String::new(),
             users: HashMap::new(),
+            hosts: Vec::new(),
         }
+    }
+
+    /// h: the next host after the one in use, local first
+    pub fn next_host(&self) -> Option<String> {
+        let all: Vec<&str> = std::iter::once("local")
+            .chain(self.hosts.iter().map(String::as_str))
+            .collect();
+        if all.len() < 2 {
+            return None;
+        }
+        let now = self.burner.host.as_deref().unwrap_or("local");
+        let i = all.iter().position(|h| *h == now).map_or(0, |i| i + 1);
+        Some(all[i % all.len()].to_string())
     }
 
     pub fn launch(&self) -> Launch {
@@ -182,6 +200,13 @@ impl App {
                 self.help = true;
                 Action::Nothing
             }
+            'h' => match self.next_host() {
+                Some(h) => Action::Host(h),
+                None => {
+                    self.status = "no hosts in ~/.config/burner/hosts.toml".into();
+                    Action::Nothing
+                }
+            },
             _ => Action::Nothing,
         }
     }
@@ -304,11 +329,27 @@ mod tests {
     use super::*;
     use crate::burner::{Vm, parse_ls};
 
+    #[test]
+    fn h_cycles_hosts() {
+        let mut a = app();
+        assert_eq!(a.next_host(), None);
+        a.hosts = vec!["mini".into(), "vps".into()];
+        assert_eq!(a.next_host().as_deref(), Some("mini"));
+        a.burner.host = Some("mini".into());
+        assert_eq!(a.next_host().as_deref(), Some("vps"));
+        a.burner.host = Some("vps".into());
+        assert_eq!(a.next_host().as_deref(), Some("local"));
+        // a -H host that isn't in hosts.toml: on to the first
+        a.burner.host = Some("box".into());
+        assert_eq!(a.next_host().as_deref(), Some("local"));
+    }
+
     fn app() -> App {
         App::new(
             Burner {
                 bin: "burner".into(),
                 root: false,
+                host: None,
             },
             vec!["alpine".into(), "node".into()],
         )
