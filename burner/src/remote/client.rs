@@ -321,9 +321,12 @@ pub(super) fn exit_of(st: &ExitStatus) -> Option<i32> {
     st.code()
 }
 
-/// a json document from the far end as it came, one line, with DEL and C1
-/// controls made ? (serde escapes C0 ones, these it would pass on raw to your
-/// terminal) and the host filled in. None when it isn't a json object
+/// a json document from the far end on one line, with DEL and C1 controls
+/// made ? (serde escapes C0 ones, these it would pass on raw to your
+/// terminal) and the host filled in. it's written from what was parsed, not
+/// patched as text: a far end that sends a key twice can't have readers that
+/// take the first one see something else than burner did. None when it
+/// isn't a json object
 pub(super) fn forward_json(reply: &str, host: &str) -> Option<String> {
     let clean: String = reply
         .trim()
@@ -340,20 +343,33 @@ pub(super) fn forward_json(reply: &str, host: &str) -> Option<String> {
     if !v.is_object() {
         return None;
     }
-    let h = Value::String(host.into());
-    // burner writes "host":null before anything that could hold another
-    // one, so the first is the envelope's. checked, and else rebuilt
-    let named = clean.replacen("\"host\":null", &format!("\"host\":{h}"), 1);
-    if !named.contains('\n')
-        && serde_json::from_str::<Value>(&named)
-            .ok()
-            .is_some_and(|n| n.get("host") == Some(&h))
-    {
-        return Some(named + "\n");
-    }
-    v["host"] = h;
+    v["host"] = Value::String(host.into());
     Some(v.to_string() + "\n")
 }
+
+/// a run's or shell's argv for the far end with --config in it, right
+/// after the command word and --remote: after the `--` it would be part of
+/// the command
+pub(super) fn with_config(mut args: Vec<String>, config: &[String]) -> Vec<String> {
+    let at = 3.min(args.len());
+    args.splice(at..at, config.iter().cloned());
+    args
+}
+
+/// waits for a reader thread, but not forever: whatever ssh left running (a
+/// ProxyCommand, a connection master) can hold its pipes open after it exited
+pub(super) fn join_until<T>(h: std::thread::JoinHandle<T>, until: Instant) -> Option<T> {
+    while !h.is_finished() {
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    h.join().ok()
+}
+
+/// how long readers get once ssh has exited
+pub(super) const READERS_GRACE: Duration = Duration::from_secs(10);
 
 fn spawn(cmd: &mut Command) -> Result<Child, Failed> {
     cmd.spawn()
@@ -415,29 +431,33 @@ pub fn oneshot(host: &Host, command: &'static str, mut args: Vec<String>, mode: 
         .stderr
         .take()
         .map(|e| read_records(e, &c.nonce, seen.clone(), err_out.clone()));
-    let out = Out::new(Dest::Stdout);
-    let mut reply = Vec::new();
-    if let Some(mut so) = child.stdout.take() {
-        if json::on() {
-            let _ = so.by_ref().take(JSON_CAP + 1).read_to_end(&mut reply);
-            // whatever is past the cap isn't read: ssh's pipe would fill
-            let _ = std::io::copy(&mut so, &mut std::io::sink());
-        } else {
-            let mut buf = vec![0u8; 65536];
-            while let Ok(n) = so.read(&mut buf) {
-                if n == 0 {
-                    break;
+    let out = Arc::new(Out::new(Dest::Stdout));
+    let json_on = json::on();
+    let outs = child.stdout.take().map(|mut so| {
+        let out = out.clone();
+        std::thread::spawn(move || {
+            let mut reply = Vec::new();
+            if json_on {
+                let _ = so.by_ref().take(JSON_CAP + 1).read_to_end(&mut reply);
+                // whatever is past the cap is read and dropped: ssh's pipe would fill
+                let _ = std::io::copy(&mut so, &mut std::io::sink());
+            } else {
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = so.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    out.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300)));
                 }
-                out.put(
-                    &buf[..n],
-                    Some(Instant::now() + std::time::Duration::from_secs(300)),
-                );
             }
-        }
-    }
+            reply
+        })
+    });
     let st = child.wait();
+    let grace = Instant::now() + READERS_GRACE;
+    let reply = outs.and_then(|h| join_until(h, grace)).unwrap_or_default();
     if let Some(h) = errs {
-        let _ = h.join();
+        join_until(h, grace);
     }
     let until = Instant::now() + Duration::from_secs(30);
     out.drain(until);
@@ -697,8 +717,7 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
         Ok(c) => c,
         Err(f) => return ended(failed(RunOutcome::Unreachable, f)),
     };
-    let mut args = a.remote_argv(&c.nonce, json::on());
-    args.extend(config.iter().cloned());
+    let args = with_config(a.remote_argv(&c.nonce, json::on()), config);
     let o = Opts {
         no_stdin: !a.reads_stdin(),
         ..Default::default()
@@ -773,8 +792,9 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
         })
     });
     let st = wait_ssh(&mut child);
+    let grace = Instant::now() + READERS_GRACE;
     for h in [errs, outs].into_iter().flatten() {
-        let _ = h.join();
+        join_until(h, grace);
     }
     let until = Instant::now() + Duration::from_secs(30);
     live.drain(until);
@@ -997,17 +1017,39 @@ mod tests {
     }
 
     #[test]
+    fn config_goes_before_the_command() {
+        let a: Vec<String> = ["run", "--remote", "1:x", "--net", "none", "--", "ls"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            with_config(a, &["--config=/etc/burner/b.toml".into()]),
+            [
+                "run",
+                "--remote",
+                "1:x",
+                "--config=/etc/burner/b.toml",
+                "--net",
+                "none",
+                "--",
+                "ls"
+            ]
+        );
+    }
+
+    #[test]
     fn json_from_the_far_end_is_cleaned() {
-        let raw = "{\"schema\":1,\"host\":null,\"a\u{85}\":[\"x\u{9b}31m\",\"\u{7f}\",1],\"b\":{\"c\":\"ok\\n\"}}\n";
+        let raw =
+            "{\"host\":null,\"a\u{85}\":[\"x\u{9b}31m\",\"\u{7f}\",1],\"b\":{\"c\":\"ok\\n\"}}\n";
         assert_eq!(
             forward_json(raw, "vps").unwrap(),
-            "{\"schema\":1,\"host\":\"vps\",\"a?\":[\"x?31m\",\"?\",1],\"b\":{\"c\":\"ok\\n\"}}\n"
+            "{\"a?\":[\"x?31m\",\"?\",1],\"b\":{\"c\":\"ok\\n\"},\"host\":\"vps\"}\n"
         );
-        // a nested host first: rebuilt, sorted, with the real one set
-        let odd = r#"{"r":{"host":null},"host":null}"#;
+        // a host the far end sends twice is one, ours
+        let twice = r#"{"host":"evil","exit":0,"host":null}"#;
         assert_eq!(
-            forward_json(odd, "vps").unwrap(),
-            r#"{"host":"vps","r":{"host":null}}"#.to_string() + "\n"
+            forward_json(twice, "vps").unwrap(),
+            r#"{"exit":0,"host":"vps"}"#.to_string() + "\n"
         );
         // pretty printed comes out on one line
         assert_eq!(

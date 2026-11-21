@@ -258,7 +258,8 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     let config = cli
         .config
         .as_ref()
-        .map(|c| vec!["--config".to_string(), c.to_string_lossy().into_owned()])
+        // one word, so a path that looks like a flag stays the value
+        .map(|c| vec![format!("--config={}", c.to_string_lossy())])
         .unwrap_or_default();
     let words = |w: &[&str]| -> Vec<String> {
         w.iter()
@@ -269,10 +270,17 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     let h = &host.name;
     Some(match &cli.cmd {
         Cmd::Ls => remote::client::oneshot(&host, "ls", words(&["ls"]), Mode::Auto),
+        // checked here: an id like -Hother would be a flag on the far end
+        Cmd::Kill { id } if !burnervm::ledger::valid_id(id) => {
+            return usage("usage: burner kill burner-xxxxxxxxxxxx".into());
+        }
         Cmd::Kill { id } => {
             remote::client::oneshot(&host, "kill", words(&["kill", id]), Mode::Auto)
         }
-        Cmd::Images => remote::client::oneshot(&host, "images", words(&["images"]), Mode::Auto),
+        // the sudo rule names `burner images` exactly, so no --config for it
+        Cmd::Images => {
+            remote::client::oneshot(&host, "images", vec!["images".to_string()], Mode::Auto)
+        }
         // config needs no root there, and isn't in the sudo rule
         Cmd::Config => remote::client::oneshot(&host, "config", words(&["config"]), Mode::User),
         Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),

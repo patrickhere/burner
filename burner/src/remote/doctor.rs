@@ -187,13 +187,22 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
         .stderr
         .take()
         .map(|e| client::read_records(e, &c.nonce, seen.clone(), sink.clone()));
-    let mut out = Vec::new();
-    if let Some(so) = child.stdout.take() {
-        let _ = so.take(4 << 20).read_to_end(&mut out);
-    }
+    let outs = child.stdout.take().map(|mut so| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = so.by_ref().take(4 << 20).read_to_end(&mut out);
+            // the rest is read and dropped, or ssh would block on a full pipe
+            let _ = std::io::copy(&mut so, &mut std::io::sink());
+            out
+        })
+    });
     let st = child.wait().ok();
+    let grace = std::time::Instant::now() + client::READERS_GRACE;
+    let out = outs
+        .and_then(|h| client::join_until(h, grace))
+        .unwrap_or_default();
     if let Some(h) = errs {
-        let _ = h.join();
+        client::join_until(h, grace);
     }
     let code = st.as_ref().and_then(client::exit_of);
     let s = seen.lock().unwrap_or_else(|e| e.into_inner());

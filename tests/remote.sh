@@ -433,6 +433,9 @@ drive 'expect tag ;; wait 0.3' -- "$B" -H fake ls >/dev/null
 # F15 what doesn't go over -H, and -H as root
 "$B" -H fake net show >/dev/null 2>"$T/e"; rn=$?
 "$B" -H fake reap >/dev/null 2>&1; rr=$?
+# a kill id that would be a flag on the far end never gets there
+"$B" -H fake kill -Hother >/dev/null 2>&1; rk=$?
+[ "$rk" = 2 ] || rr="$rr kill=$rk"
 rroot=2
 # linux only: sudo there is what a client user would type
 if [ "$(uname -s)" = Linux ] && sudo -n true 2>/dev/null; then
@@ -440,7 +443,8 @@ if [ "$(uname -s)" = Linux ] && sudo -n true 2>/dev/null; then
     grep -q "drop the sudo" "$T/e.root" || rroot="$rroot: $(short "$T/e.root")"
 fi
 [ "$rn" = 2 ] && grep -q "runs on the machine itself" "$T/e" && [ "$rr" = 2 ] && [ "$rroot" = 2 ] \
-  && ok "net and reap stay local, -H refuses root: exit 2" || bad "refusals" "net=$rn reap=$rr root=$rroot"
+  && ok "net and reap stay local, a kill id like a flag and -H as root are refused: exit 2" \
+  || bad "refusals" "net=$rn reap+kill=$rr root=$rroot"
 
 # F16 BURNER_HOST picks the host, -H local overrides it
 BURNER_HOST=fake "$B" run -- code9 </dev/null >/dev/null 2>&1; re=$?

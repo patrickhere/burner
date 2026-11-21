@@ -160,8 +160,7 @@ pub fn shell(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
             skipped.join(", ")
         );
     }
-    let mut args = a.remote_argv(&c.nonce, false);
-    args.extend(config.iter().cloned());
+    let args = client::with_config(a.remote_argv(&c.nonce, false), config);
     let (mut child, master) = match start(&c, &args) {
         Ok(x) => x,
         Err(f) if f.kind == Kind::Usage => return crate::run::refuse(a, Kind::Usage, f.msg),
@@ -195,7 +194,7 @@ pub fn shell(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     sys::restore_saved_tty();
     let st = stop_ssh(&mut child, matches!(ended, Ended::Closed));
     if let Some(h) = errs {
-        let _ = h.join();
+        client::join_until(h, Instant::now() + client::READERS_GRACE);
     }
     let s = seen.lock().unwrap_or_else(|e| e.into_inner());
     let id = s.start.clone();
