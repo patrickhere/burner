@@ -6,21 +6,36 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+use serde::Serialize;
+
 use crate::config::{self, Config};
+use crate::json;
 use crate::net;
 use crate::sys;
 
 pub const GUEST_INIT: &[u8] = include_bytes!("../guest-init");
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-enum Level {
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Level {
     Ok,
     Warn,
     Fail,
 }
 
-struct Report {
-    worst: Level,
+#[derive(Serialize)]
+pub struct Check {
+    pub name: String,
+    pub level: Level,
+    /// for people, may change in any release
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct Report {
+    pub root: bool,
+    pub worst: Level,
+    pub checks: Vec<Check>,
 }
 
 impl Report {
@@ -30,14 +45,28 @@ impl Report {
             Level::Warn => "warn",
             Level::Fail => "FAIL",
         };
-        println!("{tag}  {what:<12} {}", detail.as_ref());
+        if !json::on() {
+            println!("{tag}  {what:<12} {}", detail.as_ref());
+        }
         self.worst = self.worst.max(level);
+        self.checks.push(Check {
+            name: what.into(),
+            level,
+            detail: detail.as_ref().into(),
+        });
+    }
+
+    pub fn failed(&self) -> bool {
+        self.worst == Level::Fail
     }
 }
 
-/// returns true when nothing failed
-pub fn run(cfg: &Config) -> bool {
-    let mut r = Report { worst: Level::Ok };
+pub fn run(cfg: &Config) -> Report {
+    let mut r = Report {
+        root: false,
+        worst: Level::Ok,
+        checks: Vec::new(),
+    };
     let root = is_root();
     if !root {
         r.line(
@@ -58,13 +87,16 @@ pub fn run(cfg: &Config) -> bool {
         services(&mut r, cfg);
     }
 
-    println!();
-    match r.worst {
-        Level::Ok => println!("all good"),
-        Level::Warn => println!("works, see the warnings above"),
-        Level::Fail => println!("not ready, fix the FAIL lines first"),
+    if !json::on() {
+        println!();
+        match r.worst {
+            Level::Ok => println!("all good"),
+            Level::Warn => println!("works, see the warnings above"),
+            Level::Fail => println!("not ready, fix the FAIL lines first"),
+        }
     }
-    r.worst != Level::Fail
+    r.root = root;
+    r
 }
 
 fn is_root() -> bool {

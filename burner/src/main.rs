@@ -97,6 +97,19 @@ fn main() -> ExitCode {
     }
 }
 
+fn doctor_done(r: doctor::Report) -> ExitCode {
+    if !r.failed() {
+        return json::reply("doctor", 0, Some(r));
+    }
+    // the human text already said so, as its last line
+    json::note_error(
+        Kind::DoctorFailed,
+        "not ready, fix the FAIL lines first",
+        false,
+    );
+    json::reply("doctor", exit::EXIT_FAILED, Some(r))
+}
+
 impl Cmd {
     /// the command's name in the envelope
     fn name(&self) -> &'static str {
@@ -222,17 +235,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(json::reply("config", 0, Some(&cfg)))
         }
         #[cfg(target_os = "linux")]
-        Cmd::Doctor => Ok(if doctor::run(&cfg) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(exit::EXIT_FAILED)
-        }),
+        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
-        Cmd::Doctor => Ok(if doctor::run(&cfg, &cli.config) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(exit::EXIT_FAILED)
-        }),
+        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
         Cmd::Run(a) => Ok(run::main(&cfg, a)),
         Cmd::Shell(a) => Ok(run::shell_main(&cfg, a)),
         // not there on this OS rather than failed, like a wrong flag
