@@ -92,10 +92,9 @@ jobs:
           tools/build-image alpine
           gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > out/alpine-aarch64.ext4.gz
           # apk installs whatever the mirror has today, so this is the record of
-          # what went into the image: every package and its version
-          debugfs -R 'cat /lib/apk/db/installed' "$BURNER_ROOT/images/alpine/rootfs.ext4" 2>/dev/null \
-            | awk '/^P:/ { p = substr($0, 3) } /^V:/ { print p, substr($0, 3) }' \
-            | LC_ALL=C sort > out/alpine-aarch64.packages
+          # what went into the image: every package and its version, which
+          # build-image writes next to it
+          cp "$BURNER_ROOT/images/alpine/packages" out/alpine-aarch64.packages
           grep -q '^apk-tools ' out/alpine-aarch64.packages || { echo "no package list from the image" >&2; exit 1; }
           cat out/alpine-aarch64.packages
           ls -l out

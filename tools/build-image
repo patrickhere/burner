@@ -87,6 +87,11 @@ printf '127.0.0.1 localhost\n127.0.1.1 burner\n::1 localhost\n' | sudo tee "$r/e
 echo burner | sudo tee "$r/etc/hostname" >/dev/null
 # an image that would boot and then fail in guest init fails here instead
 sudo chroot "$r" /bin/sh /sbin/burner-init selftest || { echo "$name can't run burner's guest init" >&2; exit 1; }
+# every package in the image and its version, kept next to it
+if [ -f "$r/lib/apk/db/installed" ]; then
+    sudo cat "$r/lib/apk/db/installed" | awk '/^P:/ { p = substr($0, 3) } /^V:/ { print p, substr($0, 3) }' \
+        | LC_ALL=C sort > "$work/packages"
+fi
 mb=$(sudo du -sm "$r" | cut -f1)
 truncate -s $(( mb * 13 / 10 + 64 ))M "$work/rootfs.ext4"
 sudo mkfs.ext4 -q -F -L "burner-$name" -d "$r" "$work/rootfs.ext4"
@@ -96,6 +101,11 @@ sudo install -d -m 0755 "$dest"
 sudo install -m 0644 "$work/rootfs.ext4" "$dest/rootfs.ext4.new"
 sudo mv -f "$dest/rootfs.ext4.new" "$dest/rootfs.ext4"
 [ -f "$img/defaults.toml" ] && sudo install -m 0644 "$img/defaults.toml" "$dest/defaults.toml"
+if [ -s "$work/packages" ]; then
+    sudo install -m 0644 "$work/packages" "$dest/packages"
+else
+    sudo rm -f "$dest/packages"
+fi
 # what burner doctor compares against its own copy, to spot images built from an older init
 sudo install -m 0644 "$src/guest/init" "$dest/init"
 echo "$name: $(du -h "$dest/rootfs.ext4" | cut -f1) ($mb M content) -> $dest"
