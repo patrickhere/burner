@@ -3,6 +3,7 @@
 //! there by hand; what it sends back is parsed and filtered here again, since
 //! a compromised host shouldn't get to drive your terminal or your tar -x
 
+pub mod frame;
 pub mod hosts;
 pub mod quote;
 pub mod ssh;
