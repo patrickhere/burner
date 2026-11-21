@@ -699,6 +699,16 @@ impl Collector {
             let e = &mut self.rows[i];
             e.count += 1;
             e.last = t;
+            // a name that resolved to it since the row began
+            if kind == Kind::Conn
+                && let Some(names) = self.names.get(&dst)
+            {
+                for n in names {
+                    if e.names.len() < NAMES_PER_IP && !e.names.contains(n) {
+                        e.names.push(n.clone());
+                    }
+                }
+            }
             return Some(i);
         }
         let full = match verdict {
