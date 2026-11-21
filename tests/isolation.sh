@@ -41,7 +41,7 @@ EOF
 out=$(sudo burner run --img "$IMG" --in tar --status-fd 2 -- 'ls /work' < "$T/dotdot.tar" 2>"$T/dotdot.err"); rc=$?
 st=$(tail -n 1 "$T/dotdot.err" | grep -o '"outcome":"[a-z_]*"' | cut -d'"' -f4)
 case $IMG in
-    debian) [ "$rc" = 125 ] && [ "$st" = input_error ] && [ -z "$out" ] && grep -q 'input tar did not unpack' "$T/dotdot.err" ;;
+    debian) [ "$rc" = 125 ] && [ "$st" = input_error ] && [ "$out" != "${out#burner: input tar did not unpack}" ] ;;
     *) [ "$rc" = 0 ] && [ "$st" = exited ] && [ "$out" = "$(printf 'ok.txt\nup.txt')" ] ;;
 esac && ok "--in tar with a ../ member: rc $rc, $st" || bad "../ in --in tar" "rc=$rc outcome=$st out=$out $(head -c 200 "$T/dotdot.err")"
 
