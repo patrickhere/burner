@@ -2,7 +2,10 @@
 # replace alice, then check it with: sudo visudo -cf /etc/sudoers.d/burner
 #
 # through sudo, burner only takes configs from /etc/burner and burner kill only
-# stops VMs that caller started. net, reap, doctor and config stay root's.
+# stops VMs that caller started and burner log only shows their own runs. net,
+# reap, doctor and config stay root's.
 alice ALL=(root) NOPASSWD: /usr/local/bin/burner run *, /usr/local/bin/burner shell, \
     /usr/local/bin/burner shell *, /usr/local/bin/burner ls, /usr/local/bin/burner ls *, \
-    /usr/local/bin/burner kill *, /usr/local/bin/burner images, /usr/local/bin/burner images --json
+    /usr/local/bin/burner kill *, /usr/local/bin/burner images, /usr/local/bin/burner images --json, \
+    /usr/local/bin/burner log, /usr/local/bin/burner log *, /usr/local/bin/burner explain, \
+    /usr/local/bin/burner explain *

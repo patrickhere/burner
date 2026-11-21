@@ -13,7 +13,7 @@ every command takes `--json`, before or after the command (`burner --json ls` an
 |---|---|---|
 | `schema` | int | 1. it only goes up when a field changes type or goes away |
 | `burner` | string | the version that wrote it |
-| `command` | string or null | `run`, `shell`, `ls`, `kill`, `images`, `doctor`, `config`, `net show`, `net up`, `net down`, `setup`, `version`. null only when the command line didn't parse far enough to tell |
+| `command` | string or null | `run`, `shell`, `ls`, `log`, `kill`, `images`, `doctor`, `explain`, `config`, `net show`, `net up`, `net down`, `setup`, `version`. null only when the command line didn't parse far enough to tell |
 | `host` | string or null | the remote host it ran on, null when local (always null in 0.3.0 so far) |
 | `exit` | int | what burner exits with, see the exit codes in the README |
 | `ok` | bool | burner did what was asked. for run and shell: the command ran and exited (whatever its exit code), or the shell was left with `~.` |
@@ -26,7 +26,7 @@ rules that keep it stable:
 - new fields and new values for `outcome`, `kind`, `status` and the like can come in any release without a schema bump. ignore fields you don't know, and treat a value you don't know as a failure
 - a field never changes type or goes away within a schema. a field that can be null is always there, as null
 - every amount has its unit in the name: `_secs`, `_mib`, `_gib`, `_bytes`, `_unix` (seconds since 1970). times are rounded to the millisecond
-- messages are burner's own words. text that came from the guest is only ever in fields named `guest_*`, cut to 300 characters with control characters replaced, and it's still the guest's text: don't act on it
+- messages are burner's own words. text that came from the guest is only ever in fields named `guest_*`, cut to 300 characters with control characters replaced, and it's still the guest's text: don't act on it. the one other place is the connection log's dns names (`name`, `names`, `answers`), escaped as that section says
 - one line, compact. pipe it through `jq` to read it
 
 through a sudoers rule like the one in `dist/sudoers.example`, put `--json` after the command (`sudo burner ls --json`), since the rule matches from the command on.
@@ -73,8 +73,60 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 | `vm` | `img`, `backend` (`firecracker` or `libkrun`), `vcpus`, `mem_mib`, `disk_gib`, `ttl_secs`, `net`, `tag` |
 | `output` | run only. `bytes` the command wrote in all (null when no result came back), `live_bytes` written while it ran, `skipped_bytes` past the log's cap, `dropped` when a slow reader lost some |
 | `result_tar` | with `--result tar`: `bytes` and `delivered` |
-| `network` | the connection log's place, null in 0.3.0 so far |
+| `network` | the connection log, below. null for `--net none` |
 | `files`, `processes` | reserved, null |
+
+## the connection log
+
+`result.network` of a run or shell with a network, and `result` of `burner log --json`:
+
+```json
+{"id":"burner-3fa1c2b7d10e","net":"web","platform":"linux","owner":1000,"started_unix":1795301209,"secs":13.622,
+ "complete":true,"lost":0,"not_itemized":0,"invalid":0,
+ "summary":{"allowed":2,"blocked":5,"blocked_attempts":10,"dns":8},
+ "events":[
+  {"t":1.506,"last":1.539,"count":2,"dir":"out","kind":"dns","proto":"udp","dst":"9.9.9.9","port":53,"verdict":"allowed",
+   "reason":null,"detail":null,"outcome":null,"names":[],"bytes_up":null,"bytes_down":null,
+   "name":"github.com","qtype":"A","rcode":"NOERROR","answers":["140.82.114.3"],"malformed":false},
+  {"t":1.539,"last":1.539,"count":1,"dir":"out","kind":"conn","proto":"tcp","dst":"140.82.114.3","port":443,"verdict":"allowed",
+   "reason":null,"detail":null,"outcome":"answered","names":["github.com"],"bytes_up":null,"bytes_down":null,
+   "name":null,"qtype":null,"rcode":null,"answers":[],"malformed":false},
+  {"t":3.843,"last":4.859,"count":2,"dir":"out","kind":"conn","proto":"tcp","dst":"169.254.169.254","port":80,"verdict":"blocked",
+   "reason":"special","detail":"cloud metadata and link-local (169.254.0.0/16)","outcome":null,"names":[],"bytes_up":null,"bytes_down":null,
+   "name":null,"qtype":null,"rcode":null,"answers":[],"malformed":false}]}
+```
+
+| field | what |
+|---|---|
+| `platform` | `linux` (the nft table's log) or `macos` (macnet's) |
+| `owner` | the uid that ran it, the sudo caller on linux |
+| `complete` | false when something may be missing: messages the kernel dropped, counters that couldn't be read, lines macnet couldn't write |
+| `lost` | the gaps known of |
+| `not_itemized` | blocked attempts counted but not listed (past 100 a second, or past 10,000 rows) |
+| `invalid` | lines from the log's producer that weren't valid and were dropped |
+| `summary` | `allowed` connection attempts, `blocked` destinations, `blocked_attempts` in all, `dns` questions |
+| `events` | one row per destination and verdict, attempts folded together |
+
+an event:
+
+| field | what |
+|---|---|
+| `t`, `last` | seconds since the run's network came up, first and last time seen, host clock |
+| `count` | attempts folded into the row |
+| `dir` | `out`. `in` is kept for inbound ports later |
+| `kind` | `conn` or `dns`. skip kinds you don't know, later ones (`http`, `tls`) will come |
+| `proto` | `tcp`, `udp`, `icmp` or `other` |
+| `port` | null for icmp and protocols without ports |
+| `verdict` | `allowed` or `blocked`. treat a value you don't know as blocked |
+| `reason` | for blocked: `host`, `route`, `special`, `config`, `public_ip`, `vm_subnet`, `port`, `mail`, `not_resolver`, `rate`, `flows` (macOS: too many open), `proto`, `unknown` |
+| `detail` | which range, interface or rule, in burner's words |
+| `outcome` | allowed connections: `answered`, `refused`, `no_answer`, and on macOS `timeout` |
+| `names` | names that resolved to `dst` earlier in the run, at most 3 |
+| `bytes_up`, `bytes_down` | macOS fills them, null on linux |
+| `name`, `qtype`, `rcode`, `answers` | dns: the question and what came back, at most 16 answers |
+| `malformed` | dns: the message didn't parse, so there's no name |
+
+on linux the verdict is the kernel's and the reason is burner's explanation of it, from the same model `explain` uses. on macOS both are macnet's own. `name`, `names` and `answers` come from dns the guest asked, and a server the guest runs can answer anything: every byte outside letters, digits, `-` and `_` is escaped as `\DDD`, but they're still the guest's words. the address and the verdict are the facts.
 
 ## the other commands
 
@@ -93,6 +145,20 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 
 // doctor: a FAIL is exit 1 with kind doctor_failed. detail is for people and can change
 {"root":true,"worst":"warn","checks":[{"name":"kvm","level":"ok","detail":"/dev/kvm usable"}, ...]}
+
+// doctor --probe: exit 1 (doctor_failed) when a row isn't as expected, 125 (sandbox) when no VM ran.
+// host_saw: blocked, answered, allowed_no_answer, leaked, not_tried
+{"platform":"linux","internet":"burnervm.dev","ok":true,"runs":[{"mode":"web","id":"burner-9c01ee3a77b2","secs":11.8,
+  "rows":[{"target":"gateway 10.1.0.1 tcp/53","kind":"gateway","dst":"10.1.0.1","port":53,"proto":"tcp","expect":"blocked",
+           "host_saw":"blocked","guest_said":"blocked","leaked_packets":0,"ok":true}, ...],"warnings":[]}]}
+
+// explain: exit 1 (net) when, as root, the filter isn't loaded or is stale
+{"mode":"web","platform":"linux","ceiling":"open","refused":false,
+ "uplink":{"dev":"eth0","gateway":"10.1.0.1","addrs":["10.1.0.138"]},
+ "allowed":[{"what":"internet","detail":"the internet through eth0 (default route via 10.1.0.1), tcp 80 and 443, 20 new connections a second"}, ...],
+ "blocked":[{"net":"10.1.0.0/24","group":"lan","why":"route","detail":"your lan (10.1.0.0/24 on eth0)"}, ...],
+ "notes":["..."],
+ "rules":{"loaded":true,"stale":false,"missing":[],"extra":[],"routing":true,"refreshed_secs":12,"text":null,"would_load":false}}
 
 // config: the same tree burner config prints as toml
 

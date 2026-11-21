@@ -13,7 +13,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ),
     (
         "1",
-        "the command didn't do its job: doctor found a FAIL, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell",
+        "the command didn't do its job: doctor found a FAIL or doctor --probe something not as expected, explain found the filter missing or stale, log has no such run, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell",
     ),
     (
         "2",
@@ -22,7 +22,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("124", "run and shell: the time limit stopped it"),
     (
         "125",
-        "run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered",
+        "run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered, the network log's reader stopped. doctor --probe: its VM couldn't run",
     ),
     (
         "130",
