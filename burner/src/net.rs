@@ -95,34 +95,117 @@ const SPECIAL: &[&str] = &[
     "240.0.0.0/4",
 ];
 
+/// why a range is in the blocked set, for explain and the connection log
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+pub enum Why {
+    /// one of the ranges that are never reachable on any network
+    Special,
+    /// net.block
+    Config,
+    /// the VMs' own subnet
+    Subnet,
+    /// net.block_public_ip
+    PublicIp,
+    /// an address of this host, on dev
+    HostAddr { dev: String },
+    /// a network this host is attached to, on dev
+    HostNet { dev: String },
+    /// a route that isn't the default one
+    Route {
+        dev: String,
+        via: Option<Ipv4Addr>,
+        table: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Blocked {
+    pub net: Ipv4Addr,
+    pub prefix: u8,
+    #[serde(flatten)]
+    pub why: Why,
+}
+
+/// an address on one of the host's interfaces
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Addr {
+    pub ip: Ipv4Addr,
+    pub prefix: u8,
+    pub dev: String,
+}
+
+/// a route from `ip route show table all`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub dst: Ipv4Addr,
+    pub prefix: u8,
+    pub dev: String,
+    pub via: Option<Ipv4Addr>,
+    /// main, local, or a number
+    pub table: String,
+}
+
 /// everything a VM must never reach: the special ranges, every address and
 /// attached network on the host, every route that isn't the default one (a LAN
 /// on public addresses, a vpn, a docker network), the VM subnet and net.block.
 /// what's left is the internet through the default route
 pub fn blocked(cfg: &Config) -> Result<Vec<String>> {
-    let mut nets: Vec<(u32, u8)> = Vec::new();
-    let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
-    for s in SPECIAL
-        .iter()
-        .map(|s| s.to_string())
-        .chain(cfg.net.block.iter().cloned())
-    {
-        add(config::parse_cidr(&s).with_context(|| format!("net.block {s:?}"))?);
+    Ok(collapse(
+        blocked_sources(cfg)?
+            .iter()
+            .map(|b| (u32::from(b.net) & config::mask(b.prefix), b.prefix))
+            .collect(),
+    ))
+}
+
+/// blocked(), with where each range comes from
+pub fn blocked_sources(cfg: &Config) -> Result<Vec<Blocked>> {
+    let public = public_ip(cfg).map(|(ip, _)| ip);
+    sources_from(cfg, public, &local_addrs()?, &route_dsts(&cfg.uplink()?)?)
+}
+
+/// the pure half of blocked_sources, for tests on fixtures
+pub fn sources_from(
+    cfg: &Config,
+    public: Option<Ipv4Addr>,
+    addrs: &[Addr],
+    routes: &[Route],
+) -> Result<Vec<Blocked>> {
+    let mut out = Vec::new();
+    let mut add = |(net, prefix): (Ipv4Addr, u8), why: Why| {
+        let net = Ipv4Addr::from(u32::from(net) & config::mask(prefix));
+        out.push(Blocked { net, prefix, why });
+    };
+    for s in SPECIAL {
+        add(config::parse_cidr(s)?, Why::Special);
     }
-    add(cfg.subnet()?);
-    if let Some((ip, _)) = public_ip(cfg) {
-        add((ip, 32));
+    for s in &cfg.net.block {
+        add(
+            config::parse_cidr(s).with_context(|| format!("net.block {s:?}"))?,
+            Why::Config,
+        );
     }
-    for (addr, prefix) in local_addrs()? {
-        add((addr, 32));
-        add((addr, prefix));
+    add(cfg.subnet()?, Why::Subnet);
+    if let Some(ip) = public {
+        add((ip, 32), Why::PublicIp);
     }
-    for dst in route_dsts(&cfg.uplink()?)? {
-        if dst.1 > 0 {
-            add(dst);
-        }
+    for a in addrs {
+        let dev = a.dev.clone();
+        add((a.ip, 32), Why::HostAddr { dev: dev.clone() });
+        add((a.ip, a.prefix), Why::HostNet { dev });
     }
-    Ok(collapse(nets))
+    for r in routes.iter().filter(|r| r.prefix > 0) {
+        add(
+            (r.dst, r.prefix),
+            Why::Route {
+                dev: r.dev.clone(),
+                via: r.via,
+                table: r.table.clone(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// drop entries covered by a wider one, so nft gets no overlapping intervals
@@ -144,19 +227,29 @@ fn collapse(mut nets: Vec<(u32, u8)>) -> Vec<String> {
         .collect()
 }
 
-fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
+fn local_addrs() -> Result<Vec<Addr>> {
     let out = helper("ip", &["-j", "-4", "addr", "show"], None)?;
     if !out.status.success() {
         bail!("ip addr show failed");
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    parse_addrs(&out.stdout)
+}
+
+/// `ip -j -4 addr show`: every address with its prefix and interface
+pub fn parse_addrs(json: &[u8]) -> Result<Vec<Addr>> {
+    let v: serde_json::Value = serde_json::from_slice(json)?;
     let mut addrs = Vec::new();
     for link in v.as_array().into_iter().flatten() {
+        let dev = link["ifname"].as_str().unwrap_or("?").to_string();
         for a in link["addr_info"].as_array().into_iter().flatten() {
             let ip = a["local"].as_str().and_then(|s| s.parse().ok());
             let prefix = a["prefixlen"].as_u64().map(|p| p.min(32) as u8);
-            if let (Some(ip), Some(p)) = (ip, prefix) {
-                addrs.push((ip, p));
+            if let (Some(ip), Some(prefix)) = (ip, prefix) {
+                addrs.push(Addr {
+                    ip,
+                    prefix,
+                    dev: dev.clone(),
+                });
             }
         }
     }
@@ -168,13 +261,18 @@ fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
 /// the default route does. dhcp clients add such routes for the dns servers
 /// they hand out (systemd-networkd does by default), and blocking them would
 /// block public resolvers like 1.1.1.1
-fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
+fn route_dsts(uplink: &str) -> Result<Vec<Route>> {
     let out = helper("ip", &["-j", "-4", "route", "show", "table", "all"], None)?;
     if !out.status.success() {
         bail!("ip route show failed");
     }
-    // a route list we can't read must not shrink the blocked set
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("reading ip route")?;
+    parse_routes(&out.stdout, uplink)
+}
+
+/// the pure half of route_dsts. a route list we can't read must not shrink
+/// the blocked set, so that's an error
+pub fn parse_routes(json: &[u8], uplink: &str) -> Result<Vec<Route>> {
+    let v: serde_json::Value = serde_json::from_slice(json).context("reading ip route")?;
     let routes = v.as_array().cloned().unwrap_or_default();
     let gateways: Vec<&str> = routes
         .iter()
@@ -189,11 +287,21 @@ fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
         .filter_map(|r| {
             let dst = r["dst"].as_str()?;
             let (ip, p) = match dst.split_once('/') {
-                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok()?),
+                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok().filter(|&p: &u8| p <= 32)?),
                 None if dst == "default" => return None,
                 None => (dst.parse().ok()?, 32),
             };
-            Some((ip, p))
+            Some(Route {
+                dst: ip,
+                prefix: p,
+                dev: r["dev"].as_str().unwrap_or("?").to_string(),
+                via: r["gateway"].as_str().and_then(|g| g.parse().ok()),
+                table: match &r["table"] {
+                    serde_json::Value::String(t) => t.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => "main".into(),
+                },
+            })
         })
         .collect())
 }
@@ -968,6 +1076,167 @@ mod tests {
         ] {
             assert!(!plausible_public(bad.parse().unwrap()), "{bad}");
         }
+    }
+
+    /// a homelab box: lan on eth0, a wireguard tunnel, docker, tailscale's
+    /// own table (52) and the VM table burner made
+    pub(crate) const HOMELAB_ADDRS: &str = r#"[
+ {"ifindex":1,"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},
+ {"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.168.1.20","prefixlen":24}]},
+ {"ifindex":3,"ifname":"wg0","addr_info":[{"family":"inet","local":"10.1.0.5","prefixlen":16}]},
+ {"ifindex":4,"ifname":"docker0","addr_info":[{"family":"inet","local":"172.17.0.1","prefixlen":16}]},
+ {"ifindex":5,"ifname":"tailscale0","addr_info":[{"family":"inet","local":"100.101.102.103","prefixlen":32}]},
+ {"ifindex":9,"ifname":"bn0","addr_info":[{"family":"inet","local":"172.29.217.1","prefixlen":30}]}]"#;
+    pub(crate) const HOMELAB_ROUTES: &str = r#"[
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","table":"29217","flags":[]},
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+ {"dst":"9.9.9.9","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+ {"dst":"10.1.0.0/16","dev":"wg0","protocol":"kernel","scope":"link","prefsrc":"10.1.0.5","flags":[]},
+ {"dst":"172.16.98.0/30","gateway":"10.1.0.1","dev":"wg0","flags":[]},
+ {"dst":"172.17.0.0/16","dev":"docker0","protocol":"kernel","scope":"link","prefsrc":"172.17.0.1","flags":["linkdown"]},
+ {"dst":"172.29.217.0/30","dev":"bn0","protocol":"kernel","scope":"link","prefsrc":"172.29.217.1","flags":[]},
+ {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]},
+ {"dst":"100.100.100.100","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"100.64.0.0/10","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"203.0.114.0/24","dev":"tailscale0","table":"52","flags":[]},
+ {"type":"local","dst":"192.168.1.20","dev":"eth0","table":"local","protocol":"kernel","scope":"host","prefsrc":"192.168.1.20","flags":[]},
+ {"type":"broadcast","dst":"192.168.1.255","dev":"eth0","table":"local","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]},
+ {"type":"local","dst":"127.0.0.0/8","dev":"lo","table":"local","protocol":"kernel","scope":"host","prefsrc":"127.0.0.1","flags":[]}]"#;
+    /// a vps: one public address, nothing else
+    pub(crate) const VPS_ADDRS: &str = r#"[
+ {"ifindex":1,"ifname":"lo","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},
+ {"ifindex":2,"ifname":"ens6","addr_info":[{"local":"74.208.113.109","prefixlen":32}]}]"#;
+    pub(crate) const VPS_ROUTES: &str = r#"[
+ {"dst":"default","gateway":"74.208.113.1","dev":"ens6","protocol":"dhcp","flags":[]},
+ {"dst":"74.208.113.1","dev":"ens6","protocol":"dhcp","scope":"link","flags":[]},
+ {"type":"local","dst":"74.208.113.109","dev":"ens6","table":"local","protocol":"kernel","scope":"host","flags":[]}]"#;
+
+    /// blocked() before it knew why: the same adds, straight into collapse
+    fn old_blocked(
+        cfg: &Config,
+        public: Option<Ipv4Addr>,
+        addrs: &str,
+        routes: &str,
+        up: &str,
+    ) -> Vec<String> {
+        let mut nets: Vec<(u32, u8)> = Vec::new();
+        let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
+        for s in SPECIAL
+            .iter()
+            .map(|s| s.to_string())
+            .chain(cfg.net.block.iter().cloned())
+        {
+            add(config::parse_cidr(&s).unwrap());
+        }
+        add(cfg.subnet().unwrap());
+        if let Some(ip) = public {
+            add((ip, 32));
+        }
+        for a in parse_addrs(addrs.as_bytes()).unwrap() {
+            add((a.ip, 32));
+            add((a.ip, a.prefix));
+        }
+        for r in parse_routes(routes.as_bytes(), up).unwrap() {
+            if r.prefix > 0 {
+                add((r.dst, r.prefix));
+            }
+        }
+        collapse(nets)
+    }
+
+    fn fixture(public: Option<Ipv4Addr>, addrs: &str, routes: &str, up: &str) -> Vec<Blocked> {
+        let mut cfg = Config::default();
+        cfg.net.block = vec!["140.82.121.0/24".into()];
+        sources_from(
+            &cfg,
+            public,
+            &parse_addrs(addrs.as_bytes()).unwrap(),
+            &parse_routes(routes.as_bytes(), up).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sources_collapse_to_the_old_set() {
+        let mut cfg = Config::default();
+        cfg.net.block = vec!["140.82.121.0/24".into()];
+        for (public, addrs, routes, up) in [
+            (None, HOMELAB_ADDRS, HOMELAB_ROUTES, "eth0"),
+            (
+                Some(Ipv4Addr::new(81, 2, 3, 4)),
+                HOMELAB_ADDRS,
+                HOMELAB_ROUTES,
+                "eth0",
+            ),
+            (None, VPS_ADDRS, VPS_ROUTES, "ens6"),
+        ] {
+            let new: Vec<(u32, u8)> = fixture(public, addrs, routes, up)
+                .iter()
+                .map(|b| (u32::from(b.net), b.prefix))
+                .collect();
+            assert_eq!(collapse(new), old_blocked(&cfg, public, addrs, routes, up));
+        }
+    }
+
+    #[test]
+    fn sources_say_why() {
+        let b = fixture(
+            Some(Ipv4Addr::new(81, 2, 3, 4)),
+            HOMELAB_ADDRS,
+            HOMELAB_ROUTES,
+            "eth0",
+        );
+        let has = |net: &str, prefix: u8, why: Why| {
+            let net: Ipv4Addr = net.parse().unwrap();
+            assert!(
+                b.iter()
+                    .any(|x| x.net == net && x.prefix == prefix && x.why == why),
+                "{net}/{prefix} {why:?} in {b:#?}"
+            );
+        };
+        has("192.168.1.20", 32, Why::HostAddr { dev: "eth0".into() });
+        has("192.168.1.0", 24, Why::HostNet { dev: "eth0".into() });
+        has(
+            "172.17.0.0",
+            16,
+            Why::HostNet {
+                dev: "docker0".into(),
+            },
+        );
+        has(
+            "172.16.98.0",
+            30,
+            Why::Route {
+                dev: "wg0".into(),
+                via: Some(Ipv4Addr::new(10, 1, 0, 1)),
+                table: "main".into(),
+            },
+        );
+        has(
+            "203.0.114.0",
+            24,
+            Why::Route {
+                dev: "tailscale0".into(),
+                via: None,
+                table: "52".into(),
+            },
+        );
+        has("81.2.3.4", 32, Why::PublicIp);
+        has("140.82.121.0", 24, Why::Config);
+        has("172.29.217.0", 24, Why::Subnet);
+        has("169.254.0.0", 16, Why::Special);
+        // the dhcp route to the resolver goes the default way, so it stays open
+        assert!(!b.iter().any(|x| x.net == Ipv4Addr::new(9, 9, 9, 9)));
+        // and the VM table's default route is no destination
+        assert!(!b.iter().any(|x| x.prefix == 0));
+    }
+
+    #[test]
+    fn unreadable_routes_are_an_error() {
+        assert!(parse_routes(b"not json", "eth0").is_err());
+        assert!(parse_addrs(b"{").is_err());
+        let odd = parse_routes(br#"[{"dst":"10.0.0.0/40","dev":"x"}]"#, "eth0").unwrap();
+        assert!(odd.is_empty(), "a prefix over 32 is no route");
     }
 
     #[test]
