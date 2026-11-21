@@ -1042,7 +1042,12 @@ fn launch(
                 dns.join(",")
             );
             let (vm_end, net_end) = crate::macnet::pair().context("the VM's network socket")?;
-            Some((s, vm_end, net_end))
+            // the connection log: macnet writes its decisions, a thread here reads them
+            let (ev_read, ev_write) =
+                crate::macnet::events_pipe().context("the network log's pipe")?;
+            let blocked = crate::explain::mac_sources(cfg).unwrap_or_default();
+            super::netwire::start_mac(cfg, id, p.net, s.guest, ev_read, blocked);
+            Some((s, vm_end, net_end, ev_write))
         }
         None => None,
     };
@@ -1064,7 +1069,7 @@ fn launch(
     // and so kill takes the group
     vmm.process_group(0);
     let me = std::process::id() as libc::pid_t;
-    let vm_fd = net.as_ref().map(|(_, v, _)| v.as_raw_fd());
+    let vm_fd = net.as_ref().map(|(_, v, _, _)| v.as_raw_fd());
     let fds = sys::open_fds().context("listing open fds")?;
     // SAFETY: join_from_child only calls getppid, close_strays and inherit
     // only fcntl and close
@@ -1117,12 +1122,13 @@ fn launch(
         return Err(e).context("recording the VMM");
     }
     let net = match net {
-        Some((s, vm_end, net_end)) => {
+        Some((s, vm_end, net_end, ev_write)) => {
             // the VMM holds its end now. ours has to go, or macnet would never
             // see it close when the VM stops
             drop(vm_end);
-            let started = crate::macnet::spawn(cfg, p.net, &s, net_end, child.id(), net_log)
-                .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
+            let started =
+                crate::macnet::spawn(cfg, p.net, &s, net_end, child.id(), net_log, Some(ev_write))
+                    .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
             match started {
                 Ok(n) => Some(n),
                 Err(e) => {

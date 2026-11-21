@@ -5,6 +5,8 @@
 //! VM, so nothing goes unrecorded
 
 use std::io::{BufRead, BufReader, Read};
+#[cfg(target_os = "macos")]
+use std::net::Ipv4Addr;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,9 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::config::Config;
 use crate::net::Mode;
 use crate::netlog::{Collector, LINE_CAP, NetLog};
-#[cfg(target_os = "linux")]
-use crate::netmodel::Model;
-use crate::netmodel::Platform;
+use crate::netmodel::{Model, Platform};
 
 /// what the run says when the reader went away under a running VM
 pub const READER_DIED: &str =
@@ -42,8 +42,6 @@ fn live<T>(f: impl FnOnce(&mut Option<Live>) -> T) -> T {
     f(&mut g)
 }
 
-// macnet's events come in through here too, later
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 /// read a producer's lines into the collector until it closes. lines past
 /// the cap are skipped to their end and counted
 fn pump(
@@ -90,7 +88,6 @@ fn pump(
     on_eof();
 }
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -188,6 +185,45 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
         })
     });
     Ok(())
+}
+
+/// macOS: macnet writes to the other end of `events`. its going away isn't
+/// the run's business, the network goes with it
+#[cfg(target_os = "macos")]
+pub(super) fn start_mac(
+    cfg: &Config,
+    id: &str,
+    mode: Mode,
+    guest: Ipv4Addr,
+    events: std::os::fd::OwnedFd,
+    blocked: Vec<crate::net::Blocked>,
+) {
+    let model = Model::new(cfg, mode, Platform::Mac, blocked);
+    let coll = Arc::new(Mutex::new(Some(Collector::new(
+        model,
+        guest,
+        Instant::now(),
+    ))));
+    let last = Arc::new(Mutex::new(Instant::now()));
+    let thread = {
+        let (coll, last) = (coll.clone(), last.clone());
+        let f = std::fs::File::from(events);
+        std::thread::spawn(move || pump(f, coll, last, || {}))
+    };
+    live(|l| {
+        *l = Some(Live {
+            id: id.into(),
+            mode,
+            platform: Platform::Mac,
+            started_unix: unix_now(),
+            coll,
+            last,
+            stopping: Arc::new(AtomicBool::new(true)),
+            died: Arc::new(AtomicBool::new(false)),
+            child: None,
+            thread: Some(thread),
+        })
+    });
 }
 
 /// the VM is gone: let the last messages in (the reader flushes every 10 ms),
@@ -289,7 +325,6 @@ pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netmodel::Model;
     use std::net::Ipv4Addr;
 
     #[test]

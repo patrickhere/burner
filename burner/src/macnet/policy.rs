@@ -83,8 +83,6 @@ impl Refused {
         }
     }
 
-    // the connection log's, next
-    #[allow(dead_code)]
     pub fn reason(self) -> Reason {
         match self {
             Refused::HostUnreadable | Refused::Host => Reason::Host,

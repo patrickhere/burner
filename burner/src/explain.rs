@@ -751,7 +751,7 @@ mod mac {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::build;
+pub use mac::{build, sources as mac_sources};
 
 #[cfg(test)]
 mod tests {
