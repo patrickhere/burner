@@ -36,6 +36,8 @@ pub mod nflog;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]
+pub mod probe;
+#[doc(hidden)]
 pub mod result;
 #[doc(hidden)]
 pub mod run;

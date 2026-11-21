@@ -254,6 +254,24 @@ check $? "explain: every blocked target is in a blocked range it lists (exit $er
 sudo nft list chain inet burner ingress | grep -q 'iifname "bn\*" meta nfproto ipv6 drop'
 check $? "ipv6: taps' ipv6 is dropped before anything else sees it" "no such rule"
 
+# doctor --probe: a VM per mode tries what it must not reach, the host's
+# log and witness counters judge it. nothing may leak, ipv6 included
+sudo burner doctor --probe --json > "$T/probe.json"; prc=$?
+python3 -I - "$T/probe.json" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1]))["result"]
+rows = [r for run in p["runs"] for r in run["rows"]]
+bad = [r["target"] + ": " + r["host_saw"] for r in rows if not r["ok"] or r["host_saw"] == "leaked"]
+v6 = [r for r in rows if r["kind"] == "ipv6"]
+print("; ".join(bad))
+sys.exit(1 if bad or not rows or not v6 or any(r["host_saw"] != "blocked" for r in v6) else 0)
+PY
+r=$?
+[ "$prc" = 0 ] && [ "$r" = 0 ] && ok "doctor --probe: every row as expected, nothing leaked, ipv6 sent and dropped" \
+  || bad "doctor --probe" "exit $prc $(head -c 400 "$T/probe.json")"
+sudo nft list tables | grep -q burner_probe
+[ $? = 1 ] && ok "doctor --probe: its witness table is gone after" || bad "probe leftovers" "$(sudo nft list tables)"
+
 # the runs below compare what they print, so they leave out the network
 # summary burner adds on stderr (--log none)
 

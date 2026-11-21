@@ -540,6 +540,8 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
     {
         net::refresh_public_ip(cfg);
         net::check(cfg);
+        // a probe that died left its witness table behind
+        crate::probe::reap_tables();
     }
     // nothing to check on macOS: macnet reads addresses and routes itself
     #[cfg(target_os = "macos")]

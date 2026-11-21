@@ -10,7 +10,7 @@ use burnervm::json::{self, Kind};
 use burnervm::net;
 #[cfg(target_os = "macos")]
 use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, explain, result, run};
+use burnervm::{doctor, exit, explain, probe, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
@@ -30,8 +30,9 @@ struct Cli {
 enum Cmd {
     /// print the config burner would use, defaults filled in
     Config,
-    /// check that this machine can run burner, and say what to fix
-    Doctor,
+    /// check that this machine can run burner, and say what to fix. --probe
+    /// also boots a VM that tries what a VM must not reach here
+    Doctor(probe::ProbeArgs),
     /// run one command in a fresh VM and hand back its output and exit code
     #[command(after_long_help = exit::help())]
     Run(run::RunArgs),
@@ -131,6 +132,27 @@ fn doctor_done(r: doctor::Report) -> ExitCode {
     json::reply("doctor", exit::EXIT_FAILED, Some(r))
 }
 
+fn probe_done(cfg: &Config, config: &std::path::Path, a: &probe::ProbeArgs) -> ExitCode {
+    let (code, p, msg) = probe::main(cfg, config, a);
+    if let Some(p) = &p
+        && !json::on()
+    {
+        print!("{}", probe::render(p));
+    }
+    if let Some(m) = msg {
+        let kind = match code {
+            exit::EXIT_USAGE => Kind::Usage,
+            exit::EXIT_FAILED => Kind::DoctorFailed,
+            _ => Kind::Sandbox,
+        };
+        if code != exit::EXIT_FAILED && !json::on() {
+            eprintln!("burner: {m}");
+        }
+        json::note_error(kind, m, false);
+    }
+    json::reply("doctor", code, p)
+}
+
 fn explain_main(cfg: &Config, a: &explain::ExplainArgs, json_on: bool) -> anyhow::Result<ExitCode> {
     {
         let e = match explain::build(cfg, a) {
@@ -165,7 +187,7 @@ impl Cmd {
     fn name(&self) -> &'static str {
         match self {
             Cmd::Config => "config",
-            Cmd::Doctor => "doctor",
+            Cmd::Doctor(_) => "doctor",
             Cmd::Run(_) => "run",
             Cmd::Shell(_) => "shell",
             Cmd::Explain(_) => "explain",
@@ -304,10 +326,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(json::reply("config", 0, Some(&cfg)))
         }
+        Cmd::Doctor(a) if a.probe => Ok(probe_done(&cfg, &cli.config, &a)),
         #[cfg(target_os = "linux")]
-        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg))),
+        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
-        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
+        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
         Cmd::Run(_) => Ok(run::main(&cfg, &run_args.expect("set for run"))),
         Cmd::Shell(_) => Ok(run::shell_main(&cfg, &run_args.expect("set for shell"))),
         // not there on this OS rather than failed, like a wrong flag
