@@ -10,7 +10,7 @@ use burnervm::json::{self, Kind};
 use burnervm::net;
 #[cfg(target_os = "macos")]
 use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, result, run};
+use burnervm::{doctor, exit, explain, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
@@ -38,6 +38,8 @@ enum Cmd {
     /// a root shell in a fresh VM, gone when you exit
     #[command(after_long_help = exit::help())]
     Shell(run::ShellArgs),
+    /// what a VM could reach on this host, and with --rules the rules behind it
+    Explain(explain::ExplainArgs),
     /// set up or remove the VM network (nft table, forwarding)
     Net {
         #[arg(value_parser = ["up", "down", "show"])]
@@ -119,6 +121,45 @@ fn doctor_done(r: doctor::Report) -> ExitCode {
     json::reply("doctor", exit::EXIT_FAILED, Some(r))
 }
 
+fn explain_main(cfg: &Config, a: &explain::ExplainArgs, json_on: bool) -> anyhow::Result<ExitCode> {
+    #[cfg(target_os = "macos")]
+    let _ = (cfg, a, json_on);
+    #[cfg(target_os = "macos")]
+    return Ok(json::fail(
+        "explain",
+        exit::EXIT_USAGE,
+        Kind::Unsupported,
+        "burner explain isn't there on macOS yet",
+    ));
+    #[cfg(target_os = "linux")]
+    {
+        let e = match explain::build(cfg, a) {
+            Ok(e) => e,
+            Err(e) if e.to_string().starts_with("--net ") => {
+                return Ok(json::fail(
+                    "explain",
+                    exit::EXIT_USAGE,
+                    Kind::Usage,
+                    e.to_string(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if !json_on {
+            print!("{}", explain::render(&e));
+        }
+        if e.healthy() {
+            return Ok(json::reply("explain", 0, Some(e)));
+        }
+        json::note_error(
+            Kind::Net,
+            "the filter isn't loaded, or isn't what this config and host give now",
+            false,
+        );
+        Ok(json::reply("explain", exit::EXIT_FAILED, Some(e)))
+    }
+}
+
 impl Cmd {
     /// the command's name in the envelope
     fn name(&self) -> &'static str {
@@ -127,6 +168,7 @@ impl Cmd {
             Cmd::Doctor => "doctor",
             Cmd::Run(_) => "run",
             Cmd::Shell(_) => "shell",
+            Cmd::Explain(_) => "explain",
             Cmd::Net { action } => match action.as_str() {
                 "up" => "net up",
                 "down" => "net down",
@@ -201,8 +243,8 @@ fn command_word(args: &[String]) -> Option<&'static str> {
         _ => cmd,
     };
     [
-        "config", "doctor", "run", "shell", "net up", "net down", "net show", "ls", "kill",
-        "images", "setup", "version",
+        "config", "doctor", "run", "shell", "explain", "net up", "net down", "net show", "ls",
+        "kill", "images", "setup", "version",
     ]
     .into_iter()
     .find(|c| *c == full)
@@ -308,6 +350,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(json::reply(name, 0, Some(net::UpResult { notes })))
             }
         },
+        Cmd::Explain(a) => explain_main(&cfg, &a, cli.json),
         Cmd::Ls => run::ls(&cfg),
         Cmd::Kill { id } => run::kill(&cfg, &id),
         Cmd::Images if cli.json => Ok(json::reply("images", 0, Some(run::images_result(&cfg)))),

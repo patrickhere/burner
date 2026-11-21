@@ -484,6 +484,13 @@ fn egress_route(uplink: &str) -> Result<Vec<String>> {
     Ok(route)
 }
 
+/// the uplink's default gateway, if it has one
+pub fn default_gateway(uplink: &str) -> Option<Ipv4Addr> {
+    let r = egress_route(uplink).ok()?;
+    let i = r.iter().position(|w| w == "via")?;
+    r.get(i + 1)?.parse().ok()
+}
+
 /// point the VM table at the uplink's current default route. safe to repeat
 fn routing_up(cfg: &Config) -> Result<()> {
     let route = egress_route(&cfg.uplink()?)?;
@@ -676,7 +683,7 @@ pub fn public_ip(cfg: &Config) -> Option<(Ipv4Addr, Duration)> {
 }
 
 /// a public address worth blocking. anything else an outside service says is ignored
-fn plausible_public(ip: Ipv4Addr) -> bool {
+pub fn plausible_public(ip: Ipv4Addr) -> bool {
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
