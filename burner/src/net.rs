@@ -77,30 +77,69 @@ pub fn slot(cfg: &Config, i: u32) -> Result<Slot> {
     })
 }
 
-/// always blocked, on any network
-const SPECIAL: &[&str] = &[
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.0.0.0/24",
-    "192.0.2.0/24",
-    "192.168.0.0/16",
-    "198.18.0.0/15",
-    "198.51.100.0/24",
-    "203.0.113.0/24",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
+/// a range that's never reachable, on any network, and what it is
+pub struct Special {
+    pub net: Ipv4Addr,
+    pub prefix: u8,
+    pub label: &'static str,
+}
+
+const fn sp(a: u8, b: u8, prefix: u8, label: &'static str) -> Special {
+    Special {
+        net: Ipv4Addr::new(a, b, 0, 0),
+        prefix,
+        label,
+    }
+}
+
+/// always blocked, on any network. the linux filter and macnet's policy both
+/// read this one list
+pub const SPECIAL: &[Special] = &[
+    sp(0, 0, 8, "this network (0/8)"),
+    sp(10, 0, 8, "private range"),
+    sp(100, 64, 10, "cgnat and tailscale"),
+    sp(127, 0, 8, "loopback"),
+    sp(169, 254, 16, "cloud metadata and link-local"),
+    sp(172, 16, 12, "private range"),
+    Special {
+        net: Ipv4Addr::new(192, 0, 0, 0),
+        prefix: 24,
+        label: "ietf protocol assignments",
+    },
+    Special {
+        net: Ipv4Addr::new(192, 0, 2, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    sp(192, 168, 16, "private range"),
+    sp(198, 18, 15, "benchmarking"),
+    Special {
+        net: Ipv4Addr::new(198, 51, 100, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    Special {
+        net: Ipv4Addr::new(203, 0, 113, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    sp(224, 0, 4, "multicast"),
+    sp(240, 0, 4, "reserved and broadcast"),
 ];
+
+/// the special range dst is in, if any
+pub fn special(dst: Ipv4Addr) -> Option<&'static Special> {
+    SPECIAL
+        .iter()
+        .find(|s| u32::from(dst) & config::mask(s.prefix) == u32::from(s.net))
+}
 
 /// why a range is in the blocked set, for explain and the connection log
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "why", rename_all = "snake_case")]
 pub enum Why {
     /// one of the ranges that are never reachable on any network
-    Special,
+    Special { label: &'static str },
     /// net.block
     Config,
     /// the VMs' own subnet
@@ -178,7 +217,7 @@ pub fn sources_from(
         out.push(Blocked { net, prefix, why });
     };
     for s in SPECIAL {
-        add(config::parse_cidr(s)?, Why::Special);
+        add((s.net, s.prefix), Why::Special { label: s.label });
     }
     for s in &cfg.net.block {
         add(
@@ -1121,7 +1160,24 @@ mod tests {
     ) -> Vec<String> {
         let mut nets: Vec<(u32, u8)> = Vec::new();
         let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
-        for s in SPECIAL
+        // the list as it was before it had labels
+        let old_special = [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ];
+        for s in old_special
             .iter()
             .map(|s| s.to_string())
             .chain(cfg.net.block.iter().cloned())
@@ -1224,11 +1280,32 @@ mod tests {
         has("81.2.3.4", 32, Why::PublicIp);
         has("140.82.121.0", 24, Why::Config);
         has("172.29.217.0", 24, Why::Subnet);
-        has("169.254.0.0", 16, Why::Special);
+        has(
+            "169.254.0.0",
+            16,
+            Why::Special {
+                label: "cloud metadata and link-local",
+            },
+        );
         // the dhcp route to the resolver goes the default way, so it stays open
         assert!(!b.iter().any(|x| x.net == Ipv4Addr::new(9, 9, 9, 9)));
         // and the VM table's default route is no destination
         assert!(!b.iter().any(|x| x.prefix == 0));
+    }
+
+    #[test]
+    fn special_ranges() {
+        for s in SPECIAL {
+            assert_eq!(u32::from(s.net) & !config::mask(s.prefix), 0, "{}", s.net);
+        }
+        let label = |ip: [u8; 4]| special(Ipv4Addr::from(ip)).map(|s| s.label);
+        assert_eq!(
+            label([169, 254, 169, 254]),
+            Some("cloud metadata and link-local")
+        );
+        assert_eq!(label([100, 100, 100, 100]), Some("cgnat and tailscale"));
+        assert_eq!(label([255, 255, 255, 255]), Some("reserved and broadcast"));
+        assert_eq!(label([140, 82, 112, 3]), None);
     }
 
     #[test]
