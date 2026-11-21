@@ -1,5 +1,16 @@
 # changelog
 
+## 0.3.0
+
+- a debian 13 image next to alpine, `--img debian` or `burner shell debian`, with python3, curl, sudo and gpg (no git). on linux `tools/build-image debian` builds it with mmdebstrap from a pinned snapshot.debian.org timestamp, and the build fails unless every package matches the lock file for that arch. on a mac `burner setup debian` fetches it, checked against the release and the homebrew formula's pin. the release carries it for x86_64 and aarch64, with its package list
+- `burner setup` takes image names, `burner setup alpine debian`. no names is alpine, as before
+- commands in a run use the image's `/bin/sh`: busybox ash on alpine, dash on debian
+- a run ends about a tenth of a second sooner: guest init no longer starts a `cat` for every process when it looks for leftovers after the job
+- guest init mounts `/dev/shm`, falls back to `xterm-256color` when the image has no terminfo entry for your terminal (kitty, ghostty), and checks at build time that an image has every tool it needs
+- `tools/build-image` writes each image's package list next to it, and cleans up without crossing into anything still mounted
+- the test suites run against any image with `BURNER_TEST_IMG`, and github runs them on alpine and debian
+- images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
+
 ## 0.2.1
 
 - `burner setup` on a mac takes the kernel and image homebrew fetched again. it refused them because homebrew's Cellar is writable by the admin group, whose members can become root anyway. a directory only you, root or the admin group can write counts as safe now, world write and other groups still don't
