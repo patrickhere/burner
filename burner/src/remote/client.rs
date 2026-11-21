@@ -803,7 +803,7 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     let mut end = decide(&c, &s, st.as_ref().and_then(exit_of), "run");
     let id = s.start.clone();
     drop(s);
-    if let (Some(sp), Some(env)) = (spool, end.env.as_mut()) {
+    if let (Some(sp), Some(env)) = (&spool, end.env.as_mut()) {
         let over = over.load(std::sync::atomic::Ordering::Relaxed);
         if let Err(why) = sp.deliver(env, over, &host.name) {
             if !json::on() {
@@ -840,7 +840,7 @@ fn result_lost(env: &mut Value, why: &str) {
 /// burner-UID in the temp dir (your own one on a mac). one that already
 /// exists has to be yours and private, or it isn't used
 pub(super) fn private_dir() -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     // SAFETY: getuid can't fail
     let me = unsafe { libc::getuid() };
     #[cfg(target_os = "macos")]
@@ -850,12 +850,13 @@ pub(super) fn private_dir() -> std::io::Result<std::path::PathBuf> {
         Some(d) if d.is_absolute() => d.join("burner"),
         _ => std::env::temp_dir().join(format!("burner-{me}")),
     };
-    match std::fs::create_dir(&base) {
+    // made 0700 or found, never chmod'ed: in a shared /tmp it could be a
+    // link someone planted, and that's refused below without touching it
+    match std::fs::DirBuilder::new().mode(0o700).create(&base) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e),
     }
-    sys::private_dir(&base).ok();
     let m = std::fs::symlink_metadata(&base)?;
     if !m.is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
         return Err(std::io::Error::other(format!(
@@ -864,6 +865,16 @@ pub(super) fn private_dir() -> std::io::Result<std::path::PathBuf> {
         )));
     }
     Ok(base)
+}
+
+/// the files go however the run ended: delivered, refused, or never
+/// looked at because the far end didn't say how it went
+impl Drop for Spool {
+    fn drop(&mut self) {
+        for ext in ["tar", "clean", "log"] {
+            let _ = std::fs::remove_file(self.path.with_extension(ext));
+        }
+    }
 }
 
 /// the result tar as it came from the far end, in a private file
@@ -890,14 +901,10 @@ impl Spool {
 
     /// parse it again here and write the clean tar that comes out to stdout.
     /// Err says why nothing (or not all of it) was written
-    fn deliver(self, env: &Value, over: bool, host: &str) -> Result<(), String> {
+    fn deliver(&self, env: &Value, over: bool, host: &str) -> Result<(), String> {
         let clean = self.path.with_extension("clean");
         let log = self.path.with_extension("log");
-        let res = self.deliver_inner(env, over, host, &clean, &log);
-        for p in [&self.path, &clean, &log] {
-            let _ = std::fs::remove_file(p);
-        }
-        res
+        self.deliver_inner(env, over, host, &clean, &log)
     }
 
     fn deliver_inner(

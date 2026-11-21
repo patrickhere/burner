@@ -385,6 +385,12 @@ names() { tar -tf "$1" 2>/dev/null | sed 's|/$||' | tr '\n' ' '; }
   && ok "result tar parsed again here: clean passes, hostile entries dropped, a clash or oversize is 125 and empty" \
   || bad "result tar" "good=$rg ($(names "$T/good.out")) evil=$re ($(names "$T/evil.out")) clash=$rc $(short "$T/e.clash") big=$rb"
 
+# the spool for a result tar goes whatever happened, an end that never came too
+"$B" -H fake run --result tar -- nostatus </dev/null >/dev/null 2>&1
+left=$(find "${XDG_RUNTIME_DIR:-/nonexistent}/burner" "/tmp/burner-$(id -u)" \
+    "$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)burner-$(id -u)" -name 'result-*' 2>/dev/null | wc -l | tr -d ' ')
+[ "$left" = 0 ] && ok "no result spool left behind, after a good run or a broken one" || bad "spool left" "$left files"
+
 # F10 --status-fd and --json-fd: the line as before, the json with the host
 "$B" -H fake run --status-fd 3 --json-fd 4 -- code5 </dev/null >/dev/null 2>/dev/null 3>"$T/st" 4>"$T/js"; rc=$?
 [ "$rc" = 5 ] && grep -q '^{"exit":5,"id":"burner-0123456789ab","outcome":"exited","rc":5,"secs":0.5}$' "$T/st" \
