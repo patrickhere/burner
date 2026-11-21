@@ -7,6 +7,8 @@ pub mod cgroup;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod dns;
+#[doc(hidden)]
 #[cfg_attr(target_os = "macos", path = "doctor_macos.rs")]
 pub mod doctor;
 #[doc(hidden)]
