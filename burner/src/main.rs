@@ -89,7 +89,7 @@ fn main() -> ExitCode {
     };
     json::set_on(cli.json);
     if let Cmd::ParseResult { emit } = &cli.cmd {
-        return result::child_main(emit == "1");
+        return result::child_main(emit);
     }
     #[cfg(target_os = "macos")]
     match cli.cmd {

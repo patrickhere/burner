@@ -682,9 +682,6 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     if let Err(msg) = a.check_local() {
         return crate::run::refuse(a, Kind::Usage, msg);
     }
-    if a.result_tar() {
-        return crate::run::refuse(a, Kind::Usage, "--result tar doesn't go over -H yet".into());
-    }
     let ended = |end: End| finish_run_with_id(a, t0, end, &host.name, None);
     let failed = |o: RunOutcome, f: Failed| End {
         code: if f.kind == Kind::Usage {
@@ -734,15 +731,44 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     } else {
         Dest::Stdout
     }));
+    // --result tar: stdout is the far end's tar, spooled to be checked here
+    // before any of it reaches yours
+    let spool = match a.result_tar().then(Spool::new).transpose() {
+        Ok(sp) => sp,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let f = Failed::new(
+                Kind::Io,
+                format!("no private place for the result tar: {e}"),
+            );
+            return ended(failed(RunOutcome::SandboxError, f));
+        }
+    };
+    let over = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let outs = child.stdout.take().map(|mut so| {
         let live = live.clone();
+        let file = spool.as_ref().and_then(|sp| sp.file.try_clone().ok());
+        let over = over.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
+            let (mut file, mut n_total) = (file, 0u64);
             while let Ok(n) = so.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                live.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300)));
+                match &mut file {
+                    // past the cap the rest is read and dropped, so ssh never blocks
+                    Some(f) => {
+                        n_total += n as u64;
+                        if n_total > crate::result::CLEAN_SIZE
+                            || std::io::Write::write_all(f, &buf[..n]).is_err()
+                        {
+                            over.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    None => live.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300))),
+                }
             }
         })
     });
@@ -754,10 +780,145 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     live.drain(until);
     err_out.drain(until);
     let s = seen.lock().unwrap_or_else(|e| e.into_inner());
-    let end = decide(&c, &s, st.as_ref().and_then(exit_of), "run");
+    let mut end = decide(&c, &s, st.as_ref().and_then(exit_of), "run");
     let id = s.start.clone();
     drop(s);
+    if let (Some(sp), Some(env)) = (spool, end.env.as_mut()) {
+        let over = over.load(std::sync::atomic::Ordering::Relaxed);
+        if let Err(why) = sp.deliver(env, over, &host.name) {
+            if !json::on() {
+                eprintln!("burner: {why}");
+            }
+            result_lost(env, &why);
+            end.code = EXIT_SANDBOX;
+            end.raw = Some(env.to_string());
+        }
+    }
     finish_run_with_id(a, t0, end, &host.name, id.as_deref())
+}
+
+/// the far end's json for a run whose result tar didn't check out here: a
+/// sandbox error now, with why first in the errors
+fn result_lost(env: &mut Value, why: &str) {
+    env["exit"] = EXIT_SANDBOX.into();
+    env["ok"] = false.into();
+    if let Some(r) = env.get_mut("result").filter(|r| r.is_object()) {
+        r["outcome"] = "sandbox_error".into();
+        r["rc"] = Value::Null;
+        if let Some(t) = r.get_mut("result_tar").filter(|t| t.is_object()) {
+            t["delivered"] = false.into();
+        }
+    }
+    let p = serde_json::json!({"kind": "result_lost", "message": why});
+    match env.get_mut("errors").and_then(Value::as_array_mut) {
+        Some(e) => e.insert(0, p),
+        None => env["errors"] = Value::Array(vec![p]),
+    }
+}
+
+/// a place for files only you can read: $XDG_RUNTIME_DIR/burner, or
+/// burner-UID in the temp dir (your own one on a mac). one that already
+/// exists has to be yours and private, or it isn't used
+pub(super) fn private_dir() -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: getuid can't fail
+    let me = unsafe { libc::getuid() };
+    #[cfg(target_os = "macos")]
+    let base = crate::config::user_temp().join(format!("burner-{me}"));
+    #[cfg(target_os = "linux")]
+    let base = match std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) {
+        Some(d) if d.is_absolute() => d.join("burner"),
+        _ => std::env::temp_dir().join(format!("burner-{me}")),
+    };
+    match std::fs::create_dir(&base) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    sys::private_dir(&base).ok();
+    let m = std::fs::symlink_metadata(&base)?;
+    if !m.is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(format!(
+            "{} isn't a directory only you can use",
+            base.display()
+        )));
+    }
+    Ok(base)
+}
+
+/// the result tar as it came from the far end, in a private file
+struct Spool {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    file: std::fs::File,
+}
+
+impl Spool {
+    fn new() -> std::io::Result<Spool> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = private_dir()?;
+        let path = dir.join(format!("result-{}.tar", sys::random_hex(8)?));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)?;
+        Ok(Spool { dir, path, file })
+    }
+
+    /// parse it again here and write the clean tar that comes out to stdout.
+    /// Err says why nothing (or not all of it) was written
+    fn deliver(self, env: &Value, over: bool, host: &str) -> Result<(), String> {
+        let clean = self.path.with_extension("clean");
+        let log = self.path.with_extension("log");
+        let res = self.deliver_inner(env, over, host, &clean, &log);
+        for p in [&self.path, &clean, &log] {
+            let _ = std::fs::remove_file(p);
+        }
+        res
+    }
+
+    fn deliver_inner(
+        &self,
+        env: &Value,
+        over: bool,
+        host: &str,
+        clean: &std::path::Path,
+        log: &std::path::Path,
+    ) -> Result<(), String> {
+        if over {
+            return Err(format!(
+                "the result tar from {host} is over the size cap, nothing written"
+            ));
+        }
+        let len = self.file.metadata().map(|m| m.len()).unwrap_or(0);
+        let said = env
+            .pointer("/result/result_tar/delivered")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if len == 0 {
+            return match said {
+                true => Err(format!("the result tar from {host} didn't arrive")),
+                false => Ok(()),
+            };
+        }
+        let f = std::fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        let meta = crate::result::recheck(f, log, clean, &self.dir);
+        if meta.fatal {
+            return Err(format!(
+                "the result tar from {host} didn't check out here ({}), nothing written",
+                meta.problem.as_deref().unwrap_or("no reason")
+            ));
+        }
+        let mut c = std::fs::File::open(clean).map_err(|e| e.to_string())?;
+        let mut out = std::io::stdout().lock();
+        std::io::copy(&mut c, &mut out)
+            .and_then(|_| std::io::Write::flush(&mut out))
+            .map_err(|e| format!("result tar not fully delivered ({e})"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

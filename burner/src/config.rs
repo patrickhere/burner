@@ -58,7 +58,7 @@ fn home() -> PathBuf {
 /// the per-user temp dir launchd hands out (what $TMPDIR is set to), only
 /// you can enter it. it doesn't depend on the environment burner got
 #[cfg(target_os = "macos")]
-fn user_temp() -> PathBuf {
+pub fn user_temp() -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0u8; 1024];
     // SAFETY: confstr writes at most buf.len() bytes, NUL included
