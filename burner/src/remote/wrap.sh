@@ -9,6 +9,8 @@ n=$1
 b=$2
 m=$3
 shift 3
+# burner here runs here: a BURNER_HOST from a profile must not send it on
+unset BURNER_HOST
 os=$(uname -s)
 if [ -z "$b" ]; then
     case $os in

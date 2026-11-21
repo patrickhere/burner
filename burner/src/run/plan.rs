@@ -122,6 +122,19 @@ fn remote_nonce(s: &str) -> Result<String, String> {
     Ok(nonce.into())
 }
 
+impl RunArgs {
+    /// started by burner -H on the far end of ssh
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+}
+
+impl ShellArgs {
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+}
+
 /// a shell is a run with the caller's terminal and no command
 pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
     RunArgs {

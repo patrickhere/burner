@@ -85,7 +85,7 @@ impl<'a, T: Serialize> Envelope<'a, T> {
             schema: SCHEMA,
             burner: env!("CARGO_PKG_VERSION"),
             command,
-            host: None,
+            host: HOST.get().map(String::as_str),
             exit,
             ok,
             result,
@@ -124,6 +124,12 @@ impl Version {
 }
 
 static ON: OnceLock<bool> = OnceLock::new();
+static HOST: OnceLock<String> = OnceLock::new();
+
+/// set once by burner -H: the host every envelope from here on is about
+pub fn set_host(name: &str) {
+    let _ = HOST.set(name.to_string());
+}
 static NOTED: Mutex<(Vec<Problem>, Vec<Problem>)> = Mutex::new((Vec::new(), Vec::new()));
 
 /// set once from main: --json was given

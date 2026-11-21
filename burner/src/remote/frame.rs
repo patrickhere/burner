@@ -31,8 +31,9 @@ pub enum Record {
     Sudo { cmd: String, ok: bool },
     /// burner there has a VM id for the run
     Start { id: String },
-    /// how it ended: the json document a --json-fd would get
-    Status(Value),
+    /// how it ended: the json document a --json-fd would get, as it came
+    /// (an object, checked)
+    Status(String),
 }
 
 pub struct Frames {
@@ -203,7 +204,7 @@ impl Frames {
                     return Err(bad("status"));
                 }
                 self.ended = true;
-                Record::Status(v)
+                Record::Status(rest.to_string())
             }
             _ => return Err("a record of a kind this burner doesn't know".into()),
         };
@@ -282,7 +283,7 @@ mod tests {
                 Record::Start {
                     id: "burner-4f1c09ab22e1".into()
                 },
-                Record::Status(serde_json::json!({"exit": 3})),
+                Record::Status("{\"exit\":3}".into()),
             ]
         );
     }

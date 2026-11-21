@@ -10,18 +10,23 @@ use burnervm::json::{self, Kind};
 use burnervm::net;
 #[cfg(target_os = "macos")]
 use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, result, run};
+use burnervm::{doctor, exit, remote, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// config file
-    #[arg(long, global = true, default_value_os_t = config::default_path())]
-    config: PathBuf,
+    /// config file [default: /etc/burner/config.toml, on macOS in
+    /// ~/Library/Application Support/burner]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// write one JSON document (docs/json.md) instead of text
     #[arg(long, global = true)]
     json: bool,
+    /// run it on this host over ssh: a name from ~/.config/burner/hosts.toml
+    /// or an ssh host. local means here. default: $BURNER_HOST
+    #[arg(short = 'H', long = "host", global = true, value_name = "HOST")]
+    host: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -93,6 +98,9 @@ fn main() -> ExitCode {
         _ => {}
     }
     let name = cli.cmd.name();
+    if let Some(code) = remote(&cli) {
+        return code;
+    }
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -184,7 +192,7 @@ fn parse_failed(e: clap::Error) -> ExitCode {
 fn command_word(args: &[String]) -> Option<&'static str> {
     let mut words = args.iter().scan(false, |skip, a| {
         let this = !*skip && !a.starts_with('-');
-        *skip = a == "--config";
+        *skip = matches!(a.as_str(), "--config" | "-H" | "--host");
         Some((this, a.as_str()))
     });
     let first = words.find(|(w, _)| *w)?.1;
@@ -206,6 +214,69 @@ fn command_word(args: &[String]) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|c| *c == full)
+}
+
+/// -H or BURNER_HOST: the command goes to that host over ssh, and nothing
+/// here is loaded. None when it runs here
+fn remote(cli: &Cli) -> Option<ExitCode> {
+    use remote::hosts::{self, Target};
+    use remote::ssh::Mode;
+    let name = cli.cmd.name();
+    // the far end of -H always runs here. the wrapper drops BURNER_HOST, and
+    // a run or shell started for a client never looks
+    match &cli.cmd {
+        Cmd::Run(a) if a.is_remote() => return None,
+        Cmd::Shell(a) if a.is_remote() => return None,
+        Cmd::ParseResult { .. } | Cmd::Reap => return None,
+        _ => {}
+    }
+    let host = match hosts::resolve(cli.host.as_deref()) {
+        Ok(Target::Local) => return None,
+        Ok(Target::Remote(h)) => h,
+        Err(e) => {
+            return Some(json::fail(
+                name,
+                exit::EXIT_USAGE,
+                Kind::Config,
+                format!("{e:#}"),
+            ));
+        }
+    };
+    let usage = |msg: String| Some(json::fail(name, exit::EXIT_USAGE, Kind::Usage, msg));
+    if let Some(why) = remote::client::refuse_here() {
+        return usage(why);
+    }
+    let config = cli
+        .config
+        .as_ref()
+        .map(|c| vec!["--config".to_string(), c.to_string_lossy().into_owned()])
+        .unwrap_or_default();
+    let words = |w: &[&str]| -> Vec<String> {
+        w.iter()
+            .map(|s| s.to_string())
+            .chain(config.clone())
+            .collect()
+    };
+    let h = &host.name;
+    Some(match &cli.cmd {
+        Cmd::Ls => remote::client::oneshot(&host, "ls", words(&["ls"]), Mode::Auto),
+        Cmd::Kill { id } => {
+            remote::client::oneshot(&host, "kill", words(&["kill", id]), Mode::Auto)
+        }
+        Cmd::Images => remote::client::oneshot(&host, "images", words(&["images"]), Mode::Auto),
+        // config needs no root there, and isn't in the sudo rule
+        Cmd::Config => remote::client::oneshot(&host, "config", words(&["config"]), Mode::User),
+        Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),
+        Cmd::Run(_) | Cmd::Shell(_) | Cmd::Doctor => {
+            return usage(format!("burner {name} doesn't go over -H yet"));
+        }
+        _ => {
+            let what = name.split(' ').next().unwrap_or(name);
+            return usage(format!(
+                "burner {what} runs on the machine itself, not over -H (ssh {h} sudo burner {name}, or -H local here)"
+            ));
+        }
+    })
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -234,7 +305,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     // run and shell end with 125 when they have no result, a config that
     // doesn't load included, and run still writes its status line
-    let cfg = match Config::load(&cli.config) {
+    let config_path = cli.config.clone().unwrap_or_else(config::default_path);
+    let cfg = match Config::load(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
             if let Some(a) = &run_args {
@@ -262,7 +334,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         #[cfg(target_os = "linux")]
         Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
-        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
+        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &config_path))),
         Cmd::Run(_) => Ok(run::main(&cfg, &run_args.expect("set for run"))),
         Cmd::Shell(_) => Ok(run::shell_main(&cfg, &run_args.expect("set for shell"))),
         // not there on this OS rather than failed, like a wrong flag
@@ -341,6 +413,8 @@ mod tests {
         let w = |a: &[&str]| command_word(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(w(&["--json", "ls"]), Some("ls"));
         assert_eq!(w(&["--config", "ls", "kill", "--json"]), Some("kill"));
+        assert_eq!(w(&["-H", "ls", "images", "--json"]), Some("images"));
+        assert_eq!(w(&["--host", "kill", "ls"]), Some("ls"));
         assert_eq!(w(&["net", "--json", "up"]), Some("net up"));
         assert_eq!(w(&["net", "sideways"]), None);
         assert_eq!(w(&["reap", "--json"]), None);
