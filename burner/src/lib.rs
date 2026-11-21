@@ -28,6 +28,8 @@ pub mod macnet;
 #[doc(hidden)]
 pub mod net;
 #[doc(hidden)]
+pub mod netlog;
+#[doc(hidden)]
 pub mod netmodel;
 #[doc(hidden)]
 pub mod output;
