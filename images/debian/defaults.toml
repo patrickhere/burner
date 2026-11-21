@@ -1,0 +1,4 @@
+vcpus = 1
+mem_mib = 512
+disk_gib = 2
+ttl_secs = 600
