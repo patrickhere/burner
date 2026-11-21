@@ -286,18 +286,26 @@ capture() {
     echo "$total $n" > /result/total
 }
 
-# the session id of pid $1 in $s, from /proc/PID/stat. comm can hold spaces
-# and ")", so everything up to the last ") " goes first. read, not a cat per
-# process: strays looks at every process, and an exec each cost a debian
-# image a quarter second per run. a name with a newline in it cuts the line
-# short, and then the session is "?", a stray
+# the session id of pid $1 in $s, from /proc/PID/stat. comm is the
+# process's own to set and can hold spaces, ")", globs and newlines, so
+# only what follows the last ")" counts, split with globbing off. read, not
+# a cat per process: strays looks at every process, and an exec each cost a
+# debian image a quarter second per run. read gets only the first line, so
+# a name with a newline cuts the fields short. a line that doesn't look
+# like a whole stat line gives "?", a stray, never init's own session
 sid() {
-    s=""
+    s="?"
     read -r st 2>/dev/null < "/proc/$1/stat" || return 1
-    st=${st##*) }
+    case $st in *")"*) ;; *) return 0 ;; esac
+    st=${st##*)}
+    set -f
     # shellcheck disable=SC2086
     set -- $st
-    if [ $# -ge 40 ]; then s=$4; else s="?"; fi
+    set +f
+    [ $# -ge 40 ] || return 0
+    case $1 in [A-Za-z]) ;; *) return 0 ;; esac
+    case $2$3$4 in ''|*[!0-9-]*) return 0 ;; esac
+    s=$4
 }
 
 # something the job left running in the background (a server, a daemon) still
@@ -312,8 +320,9 @@ strays() {
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
             sid "$p" || continue
-            # 0 is the kernel's own threads
-            [ "$s" = "$me" ] || [ "$s" = 0 ] || { kill -KILL "$p" 2>/dev/null; found=1; }
+            # 0 is the kernel's own threads. "?" is never anyone's session
+            { [ "$s" != "?" ] && { [ "$s" = "$me" ] || [ "$s" = 0 ]; }; } \
+                || { kill -KILL "$p" 2>/dev/null; found=1; }
         done
         [ -n "$found" ] || break
     done
