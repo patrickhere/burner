@@ -3,7 +3,7 @@ class Burner < Formula
   homepage "https://burnervm.dev"
   # burner and burner-tui as the release workflow built them for apple
   # silicon, so installing doesn't need rust. at release, tools/formula-shas
-  # TAG COMMIT prints the urls and the three sha256s for this file, each
+  # TAG COMMIT prints the urls and the four sha256s for this file, each
   # checked against the release's build provenance or the tagged commit, not
   # taken from what github serves
   url "https://github.com/patrickhere/burner/releases/download/v0.2.1/burner-v0.2.1-aarch64-macos.tar.gz"
@@ -62,13 +62,19 @@ class Burner < Formula
     system "codesign", "--force", "--sign", "-", "--entitlements", entitlements, bin/"burner"
     resource("guest-kernel").stage { pkgshare.install "vmlinux-aarch64" }
     resource("alpine-image").stage { pkgshare.install "alpine-aarch64.ext4.gz" }
+    # the debian image isn't fetched here, so brew install doesn't download it
+    # for everyone. it's pinned all the same: burner setup debian fetches it
+    # from the release and checks it against this
+    (pkgshare/"pins").write "0000000000000000000000000000000000000000000000000000000000000000  " \
+                            "debian-aarch64.ext4.gz\n"
   end
 
   def caveats
     <<~EOS
       burner needs a guest kernel and an image before it can boot anything.
-      this formula fetched both, install them once:
+      this formula fetched the kernel and the alpine image, install them once:
         burner setup
+      burner setup debian fetches the debian image too.
       then burner doctor checks the rest. VMs run as you, no sudo.
     EOS
   end
@@ -81,5 +87,6 @@ class Burner < Formula
     assert_match "https:// or file://", shell_output("#{bin}/burner setup --from ftp://example.com 2>&1", 1)
     assert_path_exists pkgshare/"vmlinux-aarch64"
     assert_path_exists pkgshare/"alpine-aarch64.ext4.gz"
+    assert_match(/\A\h{64}  debian-aarch64\.ext4\.gz\n\z/, (pkgshare/"pins").read)
   end
 end

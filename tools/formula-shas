@@ -4,7 +4,7 @@
 # just what github serves right now:
 # - the tag has to point at the commit you name, the one you tagged yourself:
 #   a tag fetched from github would only check github against itself
-# - the mac build, the kernel and the image need build provenance from this
+# - the mac build, the kernel and the images need build provenance from this
 #   repo's release workflow, run for that tag at that commit (gh attestation
 #   verify, needs gh)
 # - the mac build has to be burner and burner-tui for that tag
@@ -32,7 +32,7 @@ trap 'rm -rf "$work"' EXIT
 
 base="https://github.com/$repo/releases/download/$tag"
 mac="burner-$tag-aarch64-macos"
-for f in "$mac.tar.gz" vmlinux-aarch64 alpine-aarch64.ext4.gz; do
+for f in "$mac.tar.gz" vmlinux-aarch64 alpine-aarch64.ext4.gz debian-aarch64.ext4.gz; do
     get "$base/$f" "$work/$f"
     gh attestation verify "$work/$f" -R "$repo" \
         --signer-workflow "$repo/.github/workflows/release.yml" \
@@ -57,3 +57,6 @@ echo
 echo "resource \"alpine-image\""
 echo "url     $base/alpine-aarch64.ext4.gz"
 echo "sha256  $(sha "$work/alpine-aarch64.ext4.gz")"
+echo
+echo "pin \"debian-aarch64.ext4.gz\" (the pins line in install, not fetched)"
+echo "sha256  $(sha "$work/debian-aarch64.ext4.gz")"
