@@ -1,29 +1,15 @@
-#[cfg_attr(target_os = "macos", path = "cgroup_macos.rs")]
-mod cgroup;
-mod config;
-#[cfg_attr(target_os = "macos", path = "doctor_macos.rs")]
-mod doctor;
-mod exit;
-#[cfg(target_os = "macos")]
-mod krun;
-mod ledger;
-#[cfg(target_os = "macos")]
-mod macnet;
-mod net;
-mod output;
-mod result;
-mod run;
-#[cfg(target_os = "macos")]
-mod setup;
-mod sys;
-
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 
-use config::Config;
+use burnervm::config::{self, Config};
+#[cfg(target_os = "linux")]
+use burnervm::net;
+#[cfg(target_os = "macos")]
+use burnervm::{cgroup, krun, macnet, setup, sys};
+use burnervm::{doctor, exit, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
