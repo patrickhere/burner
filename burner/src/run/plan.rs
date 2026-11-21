@@ -3,13 +3,14 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Args, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
 use super::admin::reaper_alive;
 use super::launch::main;
 use super::{EXIT_SANDBOX, EXIT_USAGE, Exit, usage};
 use crate::config::Config;
+use crate::json::{self, Kind};
 use crate::net;
 use crate::sys;
 
@@ -121,9 +122,9 @@ pub(super) enum ResultMode {
     Tar,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default)]
 #[serde(default, deny_unknown_fields)]
-struct ImageDefaults {
+pub struct ImageDefaults {
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
     disk_gib: Option<u32>,
@@ -155,6 +156,46 @@ pub fn images(cfg: &Config) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+#[derive(Serialize)]
+pub struct ImagesResult {
+    pub images: Vec<Image>,
+}
+
+#[derive(Serialize)]
+pub struct Image {
+    pub name: String,
+    pub rootfs_bytes: u64,
+    /// built with the guest init this burner has
+    pub init_matches: bool,
+    /// from its defaults.toml, null when that doesn't parse
+    pub defaults: Option<ImageDefaults>,
+}
+
+pub fn images_result(cfg: &Config) -> ImagesResult {
+    let dir = cfg.paths.root.join("images");
+    let images = images(cfg)
+        .into_iter()
+        .map(|name| {
+            let d = dir.join(&name);
+            let defaults = match image_defaults(cfg, &name) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    json::warn(Kind::Image, format!("{e:#}"));
+                    None
+                }
+            };
+            Image {
+                rootfs_bytes: fs::metadata(d.join("rootfs.ext4")).map_or(0, |m| m.len()),
+                init_matches: fs::read(d.join("init")).ok().as_deref()
+                    == Some(crate::doctor::GUEST_INIT),
+                defaults,
+                name,
+            }
+        })
+        .collect();
+    ImagesResult { images }
 }
 
 /// an image without a defaults.toml uses the config's. one that doesn't parse
@@ -330,6 +371,25 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_json() {
+        let r = ImagesResult {
+            images: vec![Image {
+                name: "alpine".into(),
+                rootfs_bytes: 268435456,
+                init_matches: true,
+                defaults: Some(ImageDefaults {
+                    mem_mib: Some(512),
+                    ..Default::default()
+                }),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"images":[{"name":"alpine","rootfs_bytes":268435456,"init_matches":true,"defaults":{"vcpus":null,"mem_mib":512,"disk_gib":null,"ttl_secs":null}}]}"#
+        );
+    }
 
     #[test]
     fn ttl() {

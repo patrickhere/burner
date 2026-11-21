@@ -216,8 +216,10 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     cgroup::set_dir(&cfg.paths.state);
     match cli.cmd {
         Cmd::Config => {
-            print!("{}", toml::to_string_pretty(&cfg)?);
-            Ok(ExitCode::SUCCESS)
+            if !cli.json {
+                print!("{}", toml::to_string_pretty(&cfg)?);
+            }
+            Ok(json::reply("config", 0, Some(&cfg)))
         }
         #[cfg(target_os = "linux")]
         Cmd::Doctor => Ok(if doctor::run(&cfg) {
@@ -263,6 +265,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         },
         Cmd::Ls => run::ls(&cfg),
         Cmd::Kill { id } => run::kill(&cfg, &id),
+        Cmd::Images if cli.json => Ok(json::reply("images", 0, Some(run::images_result(&cfg)))),
         Cmd::Images => {
             for i in run::images(&cfg) {
                 println!("{i}");

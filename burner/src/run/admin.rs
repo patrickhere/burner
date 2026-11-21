@@ -11,7 +11,8 @@ use super::EXIT_USAGE;
 use super::{EXIT_SANDBOX, Exit};
 use crate::cgroup;
 use crate::config::Config;
-use crate::json;
+use crate::exit::EXIT_FAILED;
+use crate::json::{self, Kind};
 use crate::ledger::{self, Ident, Ledger, Status, valid_id};
 use crate::net;
 use crate::sys;
@@ -280,10 +281,21 @@ pub fn ls(cfg: &Config) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+#[derive(Serialize)]
+pub struct KillResult {
+    pub id: String,
+    /// gone, or stopping when it hadn't stopped 20s later
+    pub state: &'static str,
+}
+
 pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     if !valid_id(id) {
-        eprintln!("burner: usage: burner kill burner-xxxxxxxxxxxx");
-        return Ok(ExitCode::from(EXIT_USAGE));
+        return Ok(json::fail(
+            "kill",
+            EXIT_USAGE,
+            Kind::Usage,
+            "usage: burner kill burner-xxxxxxxxxxxx",
+        ));
     }
     // through sudo you can only kill what you started. real root can kill anything
     let caller: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
@@ -291,22 +303,32 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
     let refused = {
         let led = Ledger::open(&cfg.paths.state)?;
         match led.get(id) {
-            None => Some("no VM with that id"),
+            None => Some((Kind::NotFound, "no VM with that id")),
             Some(v) if caller.is_some_and(|c| v.owner != Some(c)) => {
-                Some("not yours, another user started it")
+                Some((Kind::NotOwner, "not yours, another user started it"))
             }
             Some(_) => match led.update(id, |v| v.cancel = true)? {
                 Some(_) => None,
-                None => Some("no VM with that id"),
+                None => Some((Kind::NotFound, "no VM with that id")),
             },
         }
     };
-    if let Some(why) = refused {
-        eprintln!("burner: {id}: {why}");
-        return Ok(ExitCode::from(crate::exit::EXIT_FAILED));
+    if let Some((kind, why)) = refused {
+        return Ok(json::fail(
+            "kill",
+            EXIT_FAILED,
+            kind,
+            format!("{id}: {why}"),
+        ));
     }
     cgroup::kill(id);
     log_line(&format!("kill {id}"));
+    let done = |state| {
+        Some(KillResult {
+            id: id.into(),
+            state,
+        })
+    };
     // only say it's gone once its wrapper (or the reaper) has cleaned it up
     let end = Instant::now() + Duration::from_secs(20);
     while Instant::now() < end {
@@ -314,13 +336,18 @@ pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
         #[cfg(target_os = "macos")]
         let _ = reap(cfg);
         if matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None)) {
-            println!("killed {id}");
-            return Ok(ExitCode::SUCCESS);
+            if !json::on() {
+                println!("killed {id}");
+            }
+            return Ok(json::reply("kill", 0, done("gone")));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    eprintln!("burner: kill requested for {id}, still stopping (burner ls shows it)");
-    Ok(ExitCode::from(crate::exit::EXIT_FAILED))
+    json::error(
+        Kind::StillStopping,
+        format!("kill requested for {id}, still stopping (burner ls shows it)"),
+    );
+    Ok(json::reply("kill", EXIT_FAILED, done("stopping")))
 }
 
 /// a wrapper that's still alive a minute past its VM's deadline without having

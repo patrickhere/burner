@@ -27,7 +27,7 @@ pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
 pub use launch::{config_failed, main, status_fd_ok};
-pub use plan::{RunArgs, ShellArgs, images, shell_main};
+pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main};
 
 pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};
 
