@@ -177,6 +177,35 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     }
 }
 
+/// burner log: a run's connection log, the newest of yours without an id
+pub fn log(cfg: &Config, id: Option<&str>) -> Result<ExitCode> {
+    #[cfg(target_os = "linux")]
+    if !sys::is_root() {
+        return Ok(json::fail(
+            "log",
+            EXIT_USAGE,
+            Kind::NotRoot,
+            "burner log needs root, like the runs it reads (sudo burner log)",
+        ));
+    }
+    // through sudo it's the caller's runs; root itself sees every one
+    let owner = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
+    let Some(l) = crate::netlog::load(&cfg.paths.state, id, owner) else {
+        let msg = match id {
+            Some(id) => format!(
+                "{id}: no network log for that run (only the last {} are kept)",
+                crate::netlog::KEEP
+            ),
+            None => "no network log yet: run something with --net web or open".into(),
+        };
+        return Ok(json::fail("log", EXIT_FAILED, Kind::NotFound, msg));
+    };
+    if !json::on() {
+        print!("{}: {}", l.id, crate::netlog::table(&l));
+    }
+    Ok(json::reply("log", 0, Some(l)))
+}
+
 /// who asked for the run: the sudo caller when there is one, else our own uid
 pub(super) fn caller_uid() -> String {
     std::env::var("SUDO_UID")
@@ -515,6 +544,17 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
     // nothing to check on macOS: macnet reads addresses and routes itself
     #[cfg(target_os = "macos")]
     net::refresh_public_ip(cfg);
+    crate::netlog::prune(&cfg.paths.state, crate::netlog::KEEP);
+    // counters teardown kept for a run that never came back for them
+    for e in fs::read_dir(cfg.paths.state.join("netcount"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+    {
+        if old(&e.path(), 600) {
+            let _ = fs::remove_file(e.path());
+        }
+    }
     let _ = fs::write(
         cfg.paths.state.join(REAPED),
         format!("{}\n", sys::boottime()),

@@ -881,6 +881,109 @@ pub fn cut_to(log: &mut NetLog, cap: usize) {
     }
 }
 
+// ---- kept logs ----
+
+/// how many runs' logs are kept
+pub const KEEP: usize = 32;
+
+fn logs_dir(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("logs")
+}
+
+/// keep a run's log in the state dir (cleared on reboot on linux), mode
+/// 0600, and drop the oldest past KEEP
+pub fn store(state: &std::path::Path, log: &NetLog) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if !crate::ledger::valid_id(&log.id) {
+        return Err(std::io::Error::other("not a run id"));
+    }
+    let dir = logs_dir(state);
+    crate::sys::private_dir(&dir)?;
+    let path = dir.join(format!("{}.json", log.id));
+    let tmp = dir.join(format!("{}.json.new", log.id));
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    f.write_all(&serde_json::to_vec(log)?)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    prune(state, KEEP);
+    Ok(())
+}
+
+/// the kept logs, newest first
+fn kept(state: &std::path::Path) -> Vec<(std::time::SystemTime, std::path::PathBuf)> {
+    let mut v: Vec<_> = std::fs::read_dir(logs_dir(state))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let id = name.strip_suffix(".json")?;
+            crate::ledger::valid_id(id).then_some(())?;
+            Some((e.metadata().ok()?.modified().ok()?, e.path()))
+        })
+        .collect();
+    v.sort_by_key(|x| std::cmp::Reverse(x.0));
+    v
+}
+
+/// drop all but the newest `keep`, and leftovers of a write that didn't finish.
+/// the reaper runs it too
+pub fn prune(state: &std::path::Path, keep: usize) {
+    for (_, p) in kept(state).into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+    for e in std::fs::read_dir(logs_dir(state))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+    {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|d| d > Duration::from_secs(600));
+        if e.file_name().to_string_lossy().ends_with(".json.new") && old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// a kept log: by id, or the newest one `owner` ran (any owner's when None).
+/// it's burner's own file, still read with the same strict types and caps
+pub fn load(state: &std::path::Path, id: Option<&str>, owner: Option<u32>) -> Option<NetLog> {
+    let read = |p: &std::path::Path| -> Option<NetLog> {
+        use std::io::Read;
+        let mut b = Vec::new();
+        std::fs::File::open(p)
+            .ok()?
+            .take(FILE_CAP as u64 * 2)
+            .read_to_end(&mut b)
+            .ok()?;
+        serde_json::from_slice(&b).ok()
+    };
+    match id {
+        Some(id) => {
+            if !crate::ledger::valid_id(id) {
+                return None;
+            }
+            read(&logs_dir(state).join(format!("{id}.json")))
+                .filter(|l| owner.is_none() || l.owner == owner)
+        }
+        None => kept(state)
+            .iter()
+            .filter_map(|(_, p)| read(p))
+            .find(|l| owner.is_none() || l.owner == owner),
+    }
+}
+
 // ---- words ----
 
 fn dest(e: &Event) -> String {
@@ -1380,6 +1483,46 @@ mod tests {
         );
         assert_eq!(log.events[1].reason, Some(Reason::Host));
         assert_eq!(log.events[2].proto, Proto::Icmp);
+    }
+
+    #[test]
+    fn kept_logs() {
+        let dir = std::env::temp_dir().join(format!("burner-netlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut log = sample();
+        for i in 0..(KEEP + 3) {
+            log.id = format!("burner-{i:012x}");
+            log.owner = Some(if i == 1 { 1001 } else { 1000 });
+            store(&dir, &log).unwrap();
+            // mtimes a filesystem can tell apart
+            let t = std::time::SystemTime::now() - Duration::from_secs(1000 - i as u64);
+            let f = std::fs::File::options()
+                .write(true)
+                .open(dir.join("logs").join(format!("{}.json", log.id)))
+                .unwrap();
+            f.set_modified(t).unwrap();
+        }
+        prune(&dir, KEEP);
+        assert_eq!(kept(&dir).len(), KEEP);
+        let newest = format!("burner-{:012x}", KEEP + 2);
+        assert_eq!(load(&dir, None, None).unwrap().id, newest);
+        assert_eq!(load(&dir, None, Some(1000)).unwrap().id, newest);
+        assert!(
+            load(&dir, Some("burner-000000000000"), None).is_none(),
+            "pruned"
+        );
+        assert!(load(&dir, Some("../../etc/passwd"), None).is_none());
+        assert!(
+            load(&dir, Some(&newest), Some(1001)).is_none(),
+            "someone else's"
+        );
+        let mode = std::fs::metadata(dir.join("logs").join(format!("{newest}.json")))
+            .unwrap()
+            .permissions();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(mode.mode() & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

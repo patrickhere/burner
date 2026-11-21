@@ -47,6 +47,8 @@ enum Cmd {
     },
     /// list running VMs
     Ls,
+    /// every connection a run's VM tried, allowed or blocked: yours, the newest without an ID
+    Log { id: Option<String> },
     /// stop a running VM
     Kill { id: String },
     /// list installed images
@@ -173,6 +175,7 @@ impl Cmd {
                 _ => "net show",
             },
             Cmd::Ls => "ls",
+            Cmd::Log { .. } => "log",
             Cmd::Kill { .. } => "kill",
             Cmd::Images => "images",
             Cmd::Version => "version",
@@ -244,7 +247,7 @@ fn command_word(args: &[String]) -> Option<&'static str> {
     };
     [
         "config", "doctor", "run", "shell", "explain", "net up", "net down", "net show", "ls",
-        "kill", "images", "setup", "version",
+        "log", "kill", "images", "setup", "version",
     ]
     .into_iter()
     .find(|c| *c == full)
@@ -352,6 +355,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         },
         Cmd::Explain(a) => explain_main(&cfg, &a, cli.json),
         Cmd::Ls => run::ls(&cfg),
+        Cmd::Log { id } => run::log(&cfg, id.as_deref()),
         Cmd::Kill { id } => run::kill(&cfg, &id),
         Cmd::Images if cli.json => Ok(json::reply("images", 0, Some(run::images_result(&cfg)))),
         Cmd::Images => {

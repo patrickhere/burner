@@ -270,6 +270,9 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
                 eprintln!("burner: {line}");
             }
         }
+        if let Err(e) = crate::netlog::store(&cfg.paths.state, &log) {
+            log_line(&format!("{id}: couldn't keep the network log: {e}"));
+        }
         record::set_network(log);
     }
     if died {
