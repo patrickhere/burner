@@ -57,7 +57,8 @@ pub fn output(argv: &[String]) -> Result<String, String> {
     let err = String::from_utf8_lossy(&out.stderr);
     Err(match err.lines().map(str::trim).find(|l| !l.is_empty()) {
         Some(line) => line.to_string(),
-        None => format!("{} exited with {}", join(argv), out.status),
+        None => envelope_error(&out.stdout)
+            .unwrap_or_else(|| format!("{} exited with {}", join(argv), out.status)),
     })
 }
 
@@ -86,8 +87,87 @@ pub struct Ls {
     pub used_mem: u32,
 }
 
+/// the envelope burner 0.3 and up prints, with ls's result inside
+#[derive(Deserialize)]
+struct Envelope<T> {
+    result: Option<T>,
+    #[serde(default)]
+    errors: Vec<Problem>,
+}
+
+#[derive(Deserialize)]
+struct Problem {
+    message: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LsResult {
+    vms: Vec<VmResult>,
+    max_vms: u32,
+    total_mem_mib: u32,
+    used_mem_mib: u32,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct VmResult {
+    id: String,
+    tag: Option<String>,
+    img: String,
+    vcpus: u32,
+    mem_mib: u32,
+    net: String,
+    status: String,
+    owner: Option<u32>,
+    age_secs: u64,
+    ttl_secs: u64,
+    ttl_left_secs: Option<u64>,
+}
+
+/// both shapes: the envelope from burner 0.3 and up, the bare object before
 pub fn parse_ls(s: &str) -> Result<Ls, String> {
-    serde_json::from_str(s.trim()).map_err(|e| format!("can't read burner ls --json: {e}"))
+    let bad = |e: serde_json::Error| format!("can't read burner ls --json: {e}");
+    let v: serde_json::Value = serde_json::from_str(s.trim()).map_err(bad)?;
+    if v.get("schema").is_none() {
+        return serde_json::from_value(v).map_err(bad);
+    }
+    let env: Envelope<LsResult> = serde_json::from_value(v).map_err(bad)?;
+    let Some(r) = env.result else {
+        return Err(env
+            .errors
+            .into_iter()
+            .next()
+            .map_or("burner ls --json gave no result".into(), |p| p.message));
+    };
+    Ok(Ls {
+        vms: r
+            .vms
+            .into_iter()
+            .map(|v| Vm {
+                id: v.id,
+                tag: v.tag.unwrap_or_else(|| "-".into()),
+                img: v.img,
+                vcpus: v.vcpus,
+                mem: v.mem_mib,
+                net: v.net,
+                status: v.status,
+                owner: v.owner,
+                age: v.age_secs,
+                ttl: v.ttl_secs,
+                ttl_left: v.ttl_left_secs,
+            })
+            .collect(),
+        max_vms: r.max_vms,
+        total_mem: r.total_mem_mib,
+        used_mem: r.used_mem_mib,
+    })
+}
+
+/// the first error in an envelope on stdout, for a burner that failed with --json
+fn envelope_error(stdout: &[u8]) -> Option<String> {
+    let env: Envelope<serde_json::Value> = serde_json::from_slice(stdout).ok()?;
+    env.errors.into_iter().next().map(|p| p.message)
 }
 
 /// one name per line, same rule burner uses for image names
@@ -275,6 +355,27 @@ mod tests {
         let ls = parse_ls(r#"{"vms":[{"id":"burner-0123456789ab","new":1}]}"#).unwrap();
         assert_eq!(ls.vms[0].img, "");
         assert_eq!(ls.max_vms, 0);
+    }
+
+    #[test]
+    fn ls_reads_the_envelope() {
+        let out = r#"{"schema":1,"burner":"0.3.0","command":"ls","host":null,"exit":0,"ok":true,
+            "result":{"vms":[{"id":"burner-0123456789ab","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,
+             "disk_gib":2,"net":"web","status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,
+             "ttl_secs":600,"ttl_left_secs":558}],"max_vms":2,"total_mem_mib":3072,"used_mem_mib":512},
+            "errors":[],"warnings":[]}"#;
+        let ls = parse_ls(out).unwrap();
+        assert_eq!((ls.max_vms, ls.total_mem, ls.used_mem), (2, 3072, 512));
+        let v = &ls.vms[0];
+        assert_eq!((v.tag.as_str(), v.mem, v.age, v.ttl), ("-", 512, 42, 600));
+        assert_eq!((v.owner, v.ttl_left), (Some(1000), Some(558)));
+        let failed = r#"{"schema":1,"burner":"0.3.0","command":"ls","host":null,"exit":1,"ok":false,
+            "result":null,"errors":[{"kind":"io","message":"ledger unreadable"}],"warnings":[]}"#;
+        assert_eq!(parse_ls(failed).unwrap_err(), "ledger unreadable");
+        assert_eq!(
+            envelope_error(failed.as_bytes()).as_deref(),
+            Some("ledger unreadable")
+        );
     }
 
     #[test]

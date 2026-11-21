@@ -4,13 +4,14 @@ use std::process::{Child, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use serde_json::json;
+use serde::Serialize;
 
 use super::EXIT_USAGE;
 #[cfg(target_os = "linux")]
 use super::{EXIT_SANDBOX, Exit};
 use crate::cgroup;
 use crate::config::Config;
+use crate::json;
 use crate::ledger::{self, Ident, Ledger, Status, valid_id};
 use crate::net;
 use crate::sys;
@@ -191,7 +192,52 @@ pub fn log_line(msg: &str) {
 
 // ---- ls, kill, reap ----
 
-pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
+#[derive(Serialize)]
+pub struct LsResult {
+    pub vms: Vec<LsVm>,
+    pub max_vms: u32,
+    pub total_mem_mib: u32,
+    pub used_mem_mib: u32,
+}
+
+#[derive(Serialize)]
+pub struct LsVm {
+    pub id: String,
+    pub tag: Option<String>,
+    pub img: String,
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub disk_gib: u32,
+    pub net: String,
+    pub status: &'static str,
+    pub owner: Option<u32>,
+    pub started_unix: u64,
+    pub age_secs: u64,
+    pub ttl_secs: u32,
+    pub ttl_left_secs: Option<u64>,
+}
+
+impl LsVm {
+    fn of(v: &ledger::Vm, now: f64, unix: u64) -> LsVm {
+        LsVm {
+            id: v.id.clone(),
+            tag: Some(v.tag.clone()).filter(|t| t != "-"),
+            img: v.img.clone(),
+            vcpus: v.vcpus,
+            mem_mib: v.mem_mib,
+            disk_gib: v.disk_gib,
+            net: v.net.clone(),
+            status: v.status.name(),
+            owner: v.owner,
+            started_unix: v.started,
+            age_secs: unix.saturating_sub(v.started),
+            ttl_secs: v.ttl_secs,
+            ttl_left_secs: v.deadline_boot.map(|d| (d - now).max(0.0) as u64),
+        }
+    }
+}
+
+pub fn ls(cfg: &Config) -> Result<ExitCode> {
     // no reaper timer on macOS: don't list VMs whose wrapper is long gone
     #[cfg(target_os = "macos")]
     let _ = reap(cfg);
@@ -202,21 +248,14 @@ pub fn ls(cfg: &Config, json_out: bool) -> Result<ExitCode> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if json_out {
-        let items: Vec<_> = vms
-            .iter()
-            .map(|v| {
-                json!({"id": v.id, "tag": v.tag, "img": v.img, "vcpus": v.vcpus, "mem": v.mem_mib, "disk": v.disk_gib,
-                       "net": v.net, "status": v.status.name(), "owner": v.owner, "age": unix.saturating_sub(v.started), "ttl": v.ttl_secs,
-                       "ttl_left": v.deadline_boot.map(|d| (d - now).max(0.0) as u64)})
-            })
-            .collect();
-        let used: u32 = vms.iter().map(|v| v.mem_mib).sum();
-        println!(
-            "{}",
-            json!({"vms": items, "max_vms": cfg.limits.max_vms, "total_mem": cfg.limits.total_mem_mib, "used_mem": used})
-        );
-        return Ok(ExitCode::SUCCESS);
+    if json::on() {
+        let res = LsResult {
+            vms: vms.iter().map(|v| LsVm::of(v, now, unix)).collect(),
+            max_vms: cfg.limits.max_vms,
+            total_mem_mib: cfg.limits.total_mem_mib,
+            used_mem_mib: vms.iter().map(|v| v.mem_mib).sum(),
+        };
+        return Ok(json::reply("ls", 0, Some(res)));
     }
     if vms.is_empty() {
         println!("no VMs running");
@@ -460,6 +499,35 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ls_json() {
+        let v = ledger::Vm {
+            id: "burner-3f9a1c2b7d10".into(),
+            tag: "-".into(),
+            img: "alpine".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            disk_gib: 2,
+            net: "web".into(),
+            ttl_secs: 600,
+            status: Status::Running,
+            owner: Some(1000),
+            started: 1_795_000_000,
+            deadline_boot: Some(658.4),
+            ..Default::default()
+        };
+        let r = LsResult {
+            vms: vec![LsVm::of(&v, 100.0, 1_795_000_042)],
+            max_vms: 2,
+            total_mem_mib: 3072,
+            used_mem_mib: 512,
+        };
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"vms":[{"id":"burner-3f9a1c2b7d10","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,"disk_gib":2,"net":"web","status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,"ttl_secs":600,"ttl_left_secs":558}],"max_vms":2,"total_mem_mib":3072,"used_mem_mib":512}"#
+        );
+    }
 
     #[test]
     fn stuck_wrappers() {

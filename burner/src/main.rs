@@ -261,7 +261,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Cmd::Ls => run::ls(&cfg, cli.json),
+        Cmd::Ls => run::ls(&cfg),
         Cmd::Kill { id } => run::kill(&cfg, &id),
         Cmd::Images => {
             for i in run::images(&cfg) {
