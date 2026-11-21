@@ -128,6 +128,8 @@ mount -t devtmpfs dev /dev 2>/dev/null
 exec < /dev/console > /dev/console 2>&1
 mkdir -p /dev/pts /tmp /run; mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null
+# shared memory for python's multiprocessing and anything else on sem_open
+mkdir -p /dev/shm; mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
 umount -l /rom 2>/dev/null
 hostname burner 2>/dev/null || echo burner > /proc/sys/kernel/hostname
 dns=$(sed -n 's/.*burner\.dns=\([0-9.,]*\).*/\1/p' /proc/cmdline)
