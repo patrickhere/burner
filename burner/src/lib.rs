@@ -26,6 +26,8 @@ pub mod net;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]
+pub mod remote;
+#[doc(hidden)]
 pub mod result;
 #[doc(hidden)]
 pub mod run;
