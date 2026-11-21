@@ -28,7 +28,7 @@ pub use admin::{kill, ls, reap};
 pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
-pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, main};
+pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, finished, json_target, main, refuse};
 pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main, shell_run_args, valid_name};
 
 pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};
@@ -98,7 +98,12 @@ pub(crate) fn watch_peer() {
     });
 }
 
-pub(crate) fn is_interrupted() -> bool {
+/// SIGINT, SIGTERM and SIGHUP count from here on instead of ending burner
+pub fn catch_signals() {
+    interrupted()
+}
+
+pub fn is_interrupted() -> bool {
     signals() > 0
 }
 

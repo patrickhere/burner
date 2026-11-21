@@ -267,7 +267,8 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         // config needs no root there, and isn't in the sudo rule
         Cmd::Config => remote::client::oneshot(&host, "config", words(&["config"]), Mode::User),
         Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),
-        Cmd::Run(_) | Cmd::Shell(_) | Cmd::Doctor => {
+        Cmd::Run(a) => remote::client::run(&host, a, &config),
+        Cmd::Shell(_) | Cmd::Doctor => {
             return usage(format!("burner {name} doesn't go over -H yet"));
         }
         _ => {

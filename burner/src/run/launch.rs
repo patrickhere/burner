@@ -68,7 +68,7 @@ fn quiet() -> bool {
 
 /// where the json goes, if anywhere. for burner -H it goes back to the
 /// client as a record instead
-fn json_target(a: &RunArgs) -> Option<i32> {
+pub fn json_target(a: &RunArgs) -> Option<i32> {
     if a.remote.is_some() {
         None
     } else if quiet() {
@@ -151,7 +151,7 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
 }
 
 /// a usage error found after the fds were checked, before anything started
-pub(super) fn refuse(a: &RunArgs, kind: Kind, msg: String) -> ExitCode {
+pub fn refuse(a: &RunArgs, kind: Kind, msg: String) -> ExitCode {
     if !quiet() {
         eprintln!("burner: {msg}");
     }
@@ -174,7 +174,7 @@ pub fn config_failed(a: &RunArgs, e: &anyhow::Error, t0: Instant) -> ExitCode {
 
 /// the status line and the json, then the exit code. both on one fd: the
 /// json comes last
-fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
+pub fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
     let code = f.code;
     if let Some(fd) = a.status_fd {
         json::write_fd(fd, &f.status_line());

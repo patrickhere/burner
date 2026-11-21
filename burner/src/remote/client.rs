@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -16,9 +16,11 @@ use super::hosts::{self, Host};
 use super::probe::{self, Pick};
 use super::quote;
 use super::ssh::{self, Mode, Opts};
-use crate::exit::{EXIT_SANDBOX, EXIT_USAGE};
+use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_USAGE};
 use crate::json::{self, Kind};
 use crate::output::{Dest, Out};
+use crate::run::RunArgs;
+use crate::run::record::{self, RunOutcome};
 use crate::sys;
 
 /// what's kept of ssh's own words before the far end answered
@@ -437,7 +439,7 @@ pub fn oneshot(host: &Host, command: &'static str, mut args: Vec<String>, mode: 
     if let Some(h) = errs {
         let _ = h.join();
     }
-    let until = Instant::now() + std::time::Duration::from_secs(30);
+    let until = Instant::now() + Duration::from_secs(30);
     out.drain(until);
     err_out.drain(until);
     let code = st.as_ref().ok().and_then(exit_of);
@@ -480,6 +482,282 @@ pub fn oneshot(host: &Host, command: &'static str, mut args: Vec<String>, mode: 
         json::write_fd(1, &line);
     }
     ExitCode::from(code)
+}
+
+/// how a run or a shell over -H ended, from what came back
+pub(super) struct End {
+    pub(super) code: u8,
+    /// the far end's json, when it said how the run ended
+    pub(super) env: Option<Value>,
+    pub(super) raw: Option<String>,
+    /// why the client decides it instead
+    pub(super) failed: Option<(RunOutcome, Failed)>,
+}
+
+/// waits for ssh, and on a signal here passes SIGTERM on to it: a ctrl-c
+/// reached it already, a kill aimed at burner didn't. ssh going is what
+/// stops the VM on the far end
+pub(super) fn wait_ssh(child: &mut Child) -> Option<ExitStatus> {
+    let mut sent: Option<Instant> = None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return Some(st),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        if crate::run::is_interrupted() {
+            match sent {
+                None => {
+                    // SAFETY: kill(2) on our own child, which we haven't reaped
+                    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                    sent = Some(Instant::now());
+                }
+                Some(t) if t.elapsed() > Duration::from_secs(3) => {
+                    let _ = child.kill();
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// what a run's records and ssh's exit say, as an exit code and outcome
+pub(super) fn decide(c: &Conn, s: &Seen, ssh: Option<i32>, what: &str) -> End {
+    let name = &c.host.name;
+    let failed = |o: RunOutcome, f: Failed| End {
+        code: EXIT_SANDBOX,
+        env: None,
+        raw: None,
+        failed: Some((o, f)),
+    };
+    // a ctrl-c while ssh connects is an interruption, not a host that's down
+    if s.wrap.is_none() && s.nobin.is_none() && !crate::run::is_interrupted() {
+        let f = c.ssh_failed(&s.pre, ssh);
+        let o = if f.kind == Kind::RemoteError {
+            RunOutcome::RemoteError
+        } else {
+            RunOutcome::Unreachable
+        };
+        return failed(o, f);
+    }
+    if let Some(f) = remote_failed(c, s, what) {
+        return failed(RunOutcome::RemoteError, f);
+    }
+    if let Some(raw) = &s.status {
+        let env: Option<Value> = serde_json::from_str(raw).ok();
+        let code = env
+            .as_ref()
+            .and_then(|e| e.get("exit"))
+            .and_then(Value::as_u64)
+            .filter(|c| *c <= 255);
+        if let (Some(env), Some(code)) = (env, code) {
+            return End {
+                code: code as u8,
+                env: Some(env),
+                raw: Some(raw.clone()),
+                failed: None,
+            };
+        }
+        return failed(
+            RunOutcome::RemoteError,
+            Failed::new(
+                Kind::RemoteError,
+                format!("{name}: a run's end without an exit code"),
+            ),
+        );
+    }
+    let id = s.start.as_deref();
+    if crate::run::is_interrupted() {
+        let msg = match id {
+            Some(id) => format!("interrupted, {id} on {name} stops when burner there sees ssh go"),
+            None => format!("interrupted, nothing started on {name}"),
+        };
+        return End {
+            code: EXIT_INTERRUPTED,
+            env: None,
+            raw: None,
+            failed: Some((RunOutcome::Interrupted, Failed::new(Kind::Interrupted, msg))),
+        };
+    }
+    let version = s.wrap.as_ref().map(|w| w.3.clone()).unwrap_or_default();
+    match (id, ssh) {
+        // the far end refused the arguments before anything started: clap,
+        // or a protocol it doesn't speak
+        (None, Some(2)) => failed(
+            RunOutcome::RemoteError,
+            Failed::new(
+                Kind::RemoteError,
+                format!(
+                    "{name} runs {} and this is burnervm {}, and it didn't take the arguments ({}). update burner on {name}",
+                    if version.is_empty() {
+                        "another burner"
+                    } else {
+                        &version
+                    },
+                    env!("CARGO_PKG_VERSION"),
+                    s.first_line.as_deref().unwrap_or("no reason given")
+                ),
+            ),
+        ),
+        (Some(id), _) => failed(
+            RunOutcome::Lost,
+            Failed::new(
+                Kind::Lost,
+                format!(
+                    "lost the connection to {name} while {id} was running. burner there stops it once it notices, burner -H {name} ls shows it"
+                ),
+            ),
+        ),
+        (None, Some(255) | None) => failed(
+            RunOutcome::Lost,
+            Failed::new(
+                Kind::Lost,
+                format!("lost the connection to {name} before the run started"),
+            ),
+        ),
+        (None, Some(rc)) => failed(
+            RunOutcome::RemoteError,
+            Failed::new(
+                Kind::RemoteError,
+                format!(
+                    "{name}: burner there ({version}) ended with {rc} without saying how the run went"
+                ),
+            ),
+        ),
+    }
+}
+
+/// the end of a run or shell over -H, here: the far end's own json with the
+/// host filled in, or the client's when the far end never said. the status
+/// line is made here either way, from parsed fields
+pub(super) fn finish_run_with_id(
+    a: &RunArgs,
+    t0: Instant,
+    end: End,
+    host: &str,
+    id: Option<&str>,
+) -> ExitCode {
+    let code = end.code;
+    match (end.failed, end.env, end.raw) {
+        (Some((outcome, f)), _, _) => {
+            if !json::on() {
+                eprintln!("burner: {}", f.msg);
+            }
+            let why = json::Problem {
+                kind: f.kind,
+                message: f.msg,
+            };
+            let fin = record::client_end(t0, code, outcome, id, why);
+            crate::run::finished(a, fin)
+        }
+        (None, Some(env), Some(raw)) => {
+            if let Some(fd) = a.status_fd() {
+                json::write_fd(
+                    fd,
+                    &record::status_line_of(&env, code, t0.elapsed().as_secs_f64()),
+                );
+            }
+            if let Some(fd) = crate::run::json_target(a)
+                && let Some(line) = forward_json(&raw, host)
+            {
+                json::write_fd(fd, &line);
+            }
+            ExitCode::from(code)
+        }
+        _ => ExitCode::from(EXIT_SANDBOX),
+    }
+}
+
+/// `burner -H HOST run`: stdin goes to ssh as it is, the command's output
+/// comes back escaped on a terminal and raw into a pipe, and the far end's
+/// records say how it ended
+pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
+    json::set_host(&host.name);
+    crate::run::catch_signals();
+    let t0 = Instant::now();
+    if let Some(code) = crate::run::check_fds(a, t0) {
+        return code;
+    }
+    if let Err(msg) = a.check_local() {
+        return crate::run::refuse(a, Kind::Usage, msg);
+    }
+    if a.result_tar() {
+        return crate::run::refuse(a, Kind::Usage, "--result tar doesn't go over -H yet".into());
+    }
+    let ended = |end: End| finish_run_with_id(a, t0, end, &host.name, None);
+    let failed = |o: RunOutcome, f: Failed| End {
+        code: if f.kind == Kind::Usage {
+            EXIT_USAGE
+        } else {
+            EXIT_SANDBOX
+        },
+        env: None,
+        raw: None,
+        failed: Some((o, f)),
+    };
+    let c = match Conn::open(host) {
+        Ok(c) => c,
+        Err(f) => return ended(failed(RunOutcome::Unreachable, f)),
+    };
+    let mut args = a.remote_argv(&c.nonce, json::on());
+    args.extend(config.iter().cloned());
+    let o = Opts {
+        no_stdin: !a.reads_stdin(),
+        ..Default::default()
+    };
+    let mut cmd = match c.command(o, Mode::Auto, &args) {
+        Ok(cmd) => cmd,
+        Err(f) if f.kind == Kind::Usage => return crate::run::refuse(a, Kind::Usage, f.msg),
+        Err(f) => return ended(failed(RunOutcome::Unreachable, f)),
+    };
+    cmd.stdin(if a.reads_stdin() {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    let mut child = match spawn(&mut cmd) {
+        Ok(ch) => ch,
+        Err(f) => return ended(failed(RunOutcome::Unreachable, f)),
+    };
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let err_out = Arc::new(Out::new(Dest::Stderr));
+    let errs = child
+        .stderr
+        .take()
+        .map(|e| read_records(e, &c.nonce, seen.clone(), err_out.clone()));
+    // with --json stdout is the json's, and the command's output goes to stderr
+    let live = Arc::new(Out::new(if json::on() {
+        Dest::Stderr
+    } else {
+        Dest::Stdout
+    }));
+    let outs = child.stdout.take().map(|mut so| {
+        let live = live.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while let Ok(n) = so.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                live.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300)));
+            }
+        })
+    });
+    let st = wait_ssh(&mut child);
+    for h in [errs, outs].into_iter().flatten() {
+        let _ = h.join();
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    live.drain(until);
+    err_out.drain(until);
+    let s = seen.lock().unwrap_or_else(|e| e.into_inner());
+    let end = decide(&c, &s, st.as_ref().and_then(exit_of), "run");
+    let id = s.start.clone();
+    drop(s);
+    finish_run_with_id(a, t0, end, &host.name, id.as_deref())
 }
 
 #[cfg(test)]
