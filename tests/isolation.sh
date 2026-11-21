@@ -1,6 +1,7 @@
 #!/bin/bash
 # isolation tests: what a hostile VM can and can't do to the host. run as a sudoer. prints PASS/FAIL per test.
 set -u
+SRC=$(cd "$(dirname "$0")/.." && pwd)
 cd /tmp || exit 1
 # the image every VM here boots: BURNER_TEST_IMG=debian sudo -E bash tests/isolation.sh
 IMG=${BURNER_TEST_IMG:-alpine}
@@ -261,6 +262,26 @@ s=$(date +%s); out=$(sudo burner run --img "$IMG" --ttl 20s -- 'echo before; sle
 [ "$rc" = 124 ] && [ "$(echo "$out" | head -n 1)" = before ] && [ $((e - s)) -le 30 ] \
   && ok "a job that really runs on still ends at the ttl with its output (rc $rc)" \
   || bad "ttl with output" "rc=$rc out=$out secs=$((e - s))"
+
+# 20b a stray that renames itself to look like the start of a stat line: a
+# newline, then a * that /work is full of files for. guest init's own sid()
+# runs in the VM under the image's /bin/sh and has to call it a stray ("?"),
+# not some session it would spare. the stray holds the output pipe, and the
+# run still ends with the job, not at the ttl
+crafted=$(sed -n '/^sid() {$/,/^}$/p' "$SRC/guest/init"; cat <<'EOF'
+cd /work && for i in $(seq 60); do : > "0$i"; done; : > 0
+sh -c 'echo ") S 1 1 *" > /proc/$$/comm; while :; do sleep 1; done' </dev/null &
+p=$!; sleep 1
+[ "$(head -n 1 "/proc/$p/comm")" = ") S 1 1 *" ] && echo crafted
+sid "$$"; echo "own=$s"
+sid "$p"; echo "stray=$s"
+EOF
+)
+s=$(date +%s); out=$(sudo burner run --img "$IMG" --ttl 40s -- "$crafted" </dev/null 2>&1); rc=$?; e=$(date +%s)
+[ "$(echo "$out" | head -n 1)" = crafted ] && echo "$out" | grep -qx 'own=[0-9][0-9]*' && echo "$out" | grep -qx 'stray=?' \
+  && [ "$rc" = 0 ] && [ $((e - s)) -le 20 ] \
+  && ok "a stray with a crafted name is still a stray, and the run ends with the job ($((e - s))s)" \
+  || bad "crafted stray" "rc=$rc out=$(echo "$out" | tr '\n' ' ') secs=$((e - s))"
 
 # 21 a stopped wrapper (ctrl-z) doesn't hold its slot: a minute past the
 # deadline the reaper kills it, and the pass after that frees the VM
