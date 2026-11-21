@@ -5,6 +5,8 @@
 
 use std::net::Ipv4Addr;
 
+use crate::netmodel::Reason;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Web,
@@ -45,28 +47,86 @@ pub fn parse_cidr(s: &str) -> Option<(Ipv4Addr, u8)> {
     (p <= 32).then_some((ip, p))
 }
 
+/// why the policy said no. reason() is the connection log's word for it,
+/// as_str() the words macnet -v has always used
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refused {
+    /// the host's addresses couldn't be read, so nothing goes
+    HostUnreadable,
+    /// one of the host's own addresses
+    Host,
+    /// a network the host is on
+    HostNet,
+    Special,
+    Config,
+    PublicIp,
+    VmNet,
+    /// not the default way out, in route::check's words
+    Route(&'static str),
+    NotResolver,
+    Port,
+    Mail,
+}
+
+impl Refused {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Refused::HostUnreadable => "can't read the host's addresses",
+            Refused::Host | Refused::HostNet => "the host's own address or network",
+            Refused::Special | Refused::Config | Refused::PublicIp | Refused::VmNet => {
+                "blocked range"
+            }
+            Refused::Route(why) => why,
+            Refused::NotResolver => "not a configured resolver",
+            Refused::Port => "port closed in web mode",
+            Refused::Mail => "mail port closed in open mode",
+        }
+    }
+
+    // the connection log's, next
+    #[allow(dead_code)]
+    pub fn reason(self) -> Reason {
+        match self {
+            Refused::HostUnreadable | Refused::Host => Reason::Host,
+            Refused::Special => Reason::Special,
+            Refused::Config => Reason::Config,
+            Refused::PublicIp => Reason::PublicIp,
+            Refused::VmNet => Reason::VmSubnet,
+            Refused::Route(_) | Refused::HostNet => Reason::Route,
+            Refused::NotResolver => Reason::NotResolver,
+            Refused::Port => Reason::Port,
+            Refused::Mail => Reason::Mail,
+        }
+    }
+}
+
 pub struct Policy {
     pub mode: Mode,
     pub resolvers: Vec<Ipv4Addr>,
-    blocked: Vec<(Ipv4Addr, u8)>,
+    /// (range, what it is), checked in order
+    blocked: Vec<(Ipv4Addr, u8, Refused)>,
     route: fn(Ipv4Addr) -> Result<u16, &'static str>,
 }
 
 impl Policy {
-    /// extra: --block entries. guest_net: the guest's own network, never a destination
+    /// extra: --block entries, public: the address net.block_public_ip found,
+    /// guest_net: the guest's own network, never a destination
     pub fn new(
         mode: Mode,
         resolvers: Vec<Ipv4Addr>,
         extra: &[(Ipv4Addr, u8)],
+        public: Option<Ipv4Addr>,
         guest_net: (Ipv4Addr, u8),
     ) -> Policy {
+        let mut blocked = vec![(guest_net.0, guest_net.1, Refused::VmNet)];
+        blocked.extend(public.map(|ip| (ip, 32, Refused::PublicIp)));
+        blocked.extend(extra.iter().map(|&(n, p)| (n, p, Refused::Config)));
         // the same list the linux filter is built from
-        let mut blocked: Vec<_> = crate::net::SPECIAL
-            .iter()
-            .map(|s| (s.net, s.prefix))
-            .collect();
-        blocked.extend_from_slice(extra);
-        blocked.push(guest_net);
+        blocked.extend(
+            crate::net::SPECIAL
+                .iter()
+                .map(|s| (s.net, s.prefix, Refused::Special)),
+        );
         Policy {
             mode,
             resolvers,
@@ -77,43 +137,46 @@ impl Policy {
 
     /// the interface a guest tcp connection to dst:port goes out on, if it may
     /// go out at all, else why not
-    pub fn tcp(&self, dst: Ipv4Addr, port: u16) -> Result<u16, &'static str> {
+    pub fn tcp(&self, dst: Ipv4Addr, port: u16) -> Result<u16, Refused> {
         let index = self.reachable(dst)?;
         if port == 53 {
             return self.resolver(dst).map(|()| index);
         }
         match self.mode {
             Mode::Web if port == 80 || port == 443 => Ok(index),
-            Mode::Web => Err("port closed in web mode"),
-            Mode::Open if MAIL.contains(&port) => Err("mail port closed in open mode"),
+            Mode::Web => Err(Refused::Port),
+            Mode::Open if MAIL.contains(&port) => Err(Refused::Mail),
             Mode::Open => Ok(index),
         }
     }
 
     /// the interface a guest udp datagram to dst:53 goes out on, if it may
-    pub fn dns(&self, dst: Ipv4Addr) -> Result<u16, &'static str> {
+    pub fn dns(&self, dst: Ipv4Addr) -> Result<u16, Refused> {
         let index = self.reachable(dst)?;
         self.resolver(dst).map(|()| index)
     }
 
-    fn resolver(&self, dst: Ipv4Addr) -> Result<(), &'static str> {
+    fn resolver(&self, dst: Ipv4Addr) -> Result<(), Refused> {
         if self.resolvers.contains(&dst) {
             Ok(())
         } else {
-            Err("not a configured resolver")
+            Err(Refused::NotResolver)
         }
     }
 
-    fn reachable(&self, dst: Ipv4Addr) -> Result<u16, &'static str> {
+    fn reachable(&self, dst: Ipv4Addr) -> Result<u16, Refused> {
         // read fresh every time: interfaces come and go (wifi, vpn, docker)
-        let host = host_nets().ok_or("can't read the host's addresses")?;
+        let host = host_nets().ok_or(Refused::HostUnreadable)?;
+        if host.iter().any(|&(n, p)| p == 32 && n == dst) {
+            return Err(Refused::Host);
+        }
         if host.iter().any(|&(n, p)| inside(dst, n, p)) {
-            return Err("the host's own address or network");
+            return Err(Refused::HostNet);
         }
-        if self.blocked.iter().any(|&(n, p)| inside(dst, n, p)) {
-            return Err("blocked range");
+        if let Some(&(_, _, why)) = self.blocked.iter().find(|&&(n, p, _)| inside(dst, n, p)) {
+            return Err(why);
         }
-        (self.route)(dst)
+        (self.route)(dst).map_err(Refused::Route)
     }
 }
 
@@ -197,6 +260,7 @@ mod tests {
             Mode::Web,
             vec![Ipv4Addr::new(9, 9, 9, 9), Ipv4Addr::new(1, 1, 1, 1)],
             &[(Ipv4Addr::new(140, 82, 121, 0), 24)],
+            Some(Ipv4Addr::new(81, 2, 3, 4)),
             (Ipv4Addr::new(172, 29, 217, 0), 30),
         ))
     }
@@ -218,6 +282,7 @@ mod tests {
             Mode::Open,
             vec![Ipv4Addr::new(9, 9, 9, 9)],
             &[],
+            None,
             (Ipv4Addr::new(172, 29, 217, 0), 30),
         ));
         let gh = Ipv4Addr::new(140, 82, 112, 3);
@@ -267,6 +332,7 @@ mod tests {
             Mode::Web,
             vec![Ipv4Addr::new(192, 168, 1, 1)],
             &[],
+            None,
             (Ipv4Addr::new(172, 29, 217, 0), 30),
         );
         assert!(p.dns(Ipv4Addr::new(192, 168, 1, 1)).is_err());
@@ -286,6 +352,111 @@ mod tests {
         p.route = |_| Err("not routed through the default route");
         assert!(p.tcp(Ipv4Addr::new(140, 82, 112, 3), 443).is_err());
         assert!(p.dns(Ipv4Addr::new(9, 9, 9, 9)).is_err());
+    }
+
+    #[test]
+    fn reasons_and_the_old_words() {
+        let p = web();
+        let r = |ip: &str, port| p.tcp(ip.parse().unwrap(), port).unwrap_err();
+        assert_eq!(r("169.254.169.254", 80), Refused::Special);
+        assert_eq!(r("140.82.121.4", 443), Refused::Config);
+        assert_eq!(r("81.2.3.4", 443), Refused::PublicIp);
+        assert_eq!(r("172.29.217.1", 443), Refused::VmNet);
+        assert_eq!(r("140.82.112.3", 22), Refused::Port);
+        assert_eq!(r("8.8.8.8", 53), Refused::NotResolver);
+        // what -v says, as before
+        assert_eq!(Refused::Special.as_str(), "blocked range");
+        assert_eq!(Refused::Config.as_str(), "blocked range");
+        assert_eq!(Refused::Host.as_str(), "the host's own address or network");
+        assert_eq!(Refused::Port.as_str(), "port closed in web mode");
+        assert_eq!(Refused::Mail.as_str(), "mail port closed in open mode");
+        assert_eq!(Refused::NotResolver.as_str(), "not a configured resolver");
+        assert_eq!(
+            Refused::Route("not routed through the default route").as_str(),
+            "not routed through the default route"
+        );
+        assert_eq!(Refused::VmNet.reason(), Reason::VmSubnet);
+    }
+
+    /// the model explain and the log use says the same as the policy that
+    /// decides, case by case
+    #[test]
+    fn the_model_agrees() {
+        use crate::netmodel::{Model, Platform, Proto, Verdict};
+        let p = web();
+        let cfg = crate::config::Config {
+            net: crate::config::Net {
+                block: vec!["140.82.121.0/24".into()],
+                ..crate::config::Config::default().net
+            },
+            ..crate::config::Config::default()
+        };
+        let mut blocked = Vec::new();
+        for s in crate::net::SPECIAL {
+            blocked.push(crate::net::Blocked {
+                net: s.net,
+                prefix: s.prefix,
+                why: crate::net::Why::Special { label: s.label },
+            });
+        }
+        let b = |n: [u8; 4], prefix, why| crate::net::Blocked {
+            net: Ipv4Addr::from(n),
+            prefix,
+            why,
+        };
+        blocked.push(b([140, 82, 121, 0], 24, crate::net::Why::Config));
+        blocked.push(b([81, 2, 3, 4], 32, crate::net::Why::PublicIp));
+        blocked.push(b([172, 29, 217, 0], 24, crate::net::Why::Subnet));
+        // and this mac's own, which the policy reads live
+        for a in host_addrs().unwrap() {
+            let dev = a.dev.clone();
+            blocked.push(b(
+                a.ip.octets(),
+                32,
+                crate::net::Why::HostAddr { dev: dev.clone() },
+            ));
+            if let Some(p) = a.prefix {
+                let net = Ipv4Addr::from(u32::from(a.ip) & mask(p));
+                blocked.push(b(net.octets(), p, crate::net::Why::HostNet { dev }));
+            }
+        }
+        let mut m = Model::new(&cfg, crate::net::Mode::Web, Platform::Mac, blocked);
+        m.resolvers = p.resolvers.clone();
+        for (ip, port) in [
+            ("140.82.112.3", 443),
+            ("140.82.112.3", 80),
+            ("140.82.112.3", 22),
+            ("140.82.112.3", 25),
+            ("9.9.9.9", 53),
+            ("8.8.8.8", 53),
+            ("169.254.169.254", 80),
+            ("140.82.121.4", 443),
+            ("81.2.3.4", 443),
+            ("10.1.0.63", 22),
+            ("100.100.100.100", 53),
+        ]
+        .into_iter()
+        .chain(
+            host_addrs()
+                .unwrap()
+                .into_iter()
+                .filter(|a| !a.ip.is_loopback())
+                .map(|a| (Box::leak(a.ip.to_string().into_boxed_str()) as &str, 443)),
+        ) {
+            let dst: Ipv4Addr = ip.parse().unwrap();
+            let e = m.expect(dst, Proto::Tcp, port);
+            match p.tcp(dst, port) {
+                Ok(_) => assert_eq!(e.verdict, Verdict::Allowed, "{ip}:{port}"),
+                Err(why) => {
+                    assert_eq!(e.verdict, Verdict::Blocked, "{ip}:{port}");
+                    // the policy's vm network is the guest's /30, the
+                    // model's the whole subnet: both block it
+                    if why != Refused::VmNet {
+                        assert_eq!(e.reason, Some(why.reason()), "{ip}:{port}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

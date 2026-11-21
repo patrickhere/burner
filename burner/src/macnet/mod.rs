@@ -41,6 +41,9 @@ pub struct MacnetArgs {
     /// an extra range the guest must never reach, repeatable
     #[arg(long)]
     block: Vec<String>,
+    /// the public address net.block_public_ip found, blocked too
+    #[arg(long)]
+    public_ip: Option<Ipv4Addr>,
     /// the guest's address and prefix (what burner's ip= hands it)
     #[arg(long, default_value = "172.29.217.2/30")]
     guest: String,
@@ -89,7 +92,7 @@ fn start(a: MacnetArgs) -> io::Result<()> {
             "--gateway must be another address on the --guest network",
         ));
     }
-    let pol = Policy::new(mode, a.resolver, &block, (ip, prefix));
+    let pol = Policy::new(mode, a.resolver, &block, a.public_ip, (ip, prefix));
     sandbox::enter()?;
     let args = Link {
         fd: a.fd,
@@ -164,7 +167,7 @@ pub fn spawn(
                 "net.block_public_ip is on but there's no public address for this network",
             )
         })?;
-        cmd.args(["--block", &format!("{ip}/32")]);
+        cmd.args(["--public-ip", &ip.to_string()]);
     }
     cmd.process_group(group as libc::pid_t);
     let fds = sys::open_fds()?;

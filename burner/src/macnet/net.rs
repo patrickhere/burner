@@ -562,7 +562,7 @@ impl Gw<'_> {
         let index = match self.pol.tcp(dst, port) {
             Ok(i) => i,
             Err(why) => {
-                self.log(format_args!("tcp {dst}:{port} refused: {why}"));
+                self.log(format_args!("tcp {dst}:{port} refused: {}", why.as_str()));
                 return;
             }
         };
@@ -728,7 +728,7 @@ impl Gw<'_> {
             let index = match self.pol.dns(dst) {
                 Ok(i) => i,
                 Err(why) => {
-                    self.log(format_args!("dns {dst} refused: {why}"));
+                    self.log(format_args!("dns {dst} refused: {}", why.as_str()));
                     continue;
                 }
             };
