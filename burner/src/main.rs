@@ -268,7 +268,8 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         Cmd::Config => remote::client::oneshot(&host, "config", words(&["config"]), Mode::User),
         Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),
         Cmd::Run(a) => remote::client::run(&host, a, &config),
-        Cmd::Shell(_) | Cmd::Doctor => {
+        Cmd::Shell(a) => remote::pty::shell(&host, &run::shell_run_args(a), &config),
+        Cmd::Doctor => {
             return usage(format!("burner {name} doesn't go over -H yet"));
         }
         _ => {

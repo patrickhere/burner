@@ -191,7 +191,7 @@ pub(super) struct Seen {
 }
 
 impl Seen {
-    fn take(&mut self, r: Record) {
+    pub(super) fn take_record(&mut self, r: Record) {
         match r {
             Record::Wrap {
                 os,
@@ -262,7 +262,7 @@ pub(super) fn read_records(
             let mut s = seen.lock().unwrap_or_else(|e| e.into_inner());
             // a record ends the text before it: hand that over first
             for r in recs.drain(..) {
-                s.take(r);
+                s.take_record(r);
                 s.release(&out);
             }
             if !text.is_empty() {

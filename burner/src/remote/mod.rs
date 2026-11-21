@@ -7,5 +7,6 @@ pub mod client;
 pub mod frame;
 pub mod hosts;
 pub mod probe;
+pub mod pty;
 pub mod quote;
 pub mod ssh;

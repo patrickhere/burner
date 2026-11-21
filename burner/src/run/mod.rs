@@ -24,6 +24,7 @@ pub mod record;
 #[cfg(target_os = "linux")]
 pub use admin::reaper_age;
 pub use admin::{kill, ls, reap};
+pub(crate) use console::Escape;
 #[cfg(target_os = "linux")]
 pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
