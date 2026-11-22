@@ -242,10 +242,13 @@ impl Watch {
     /// on before they were read, so it's never more than was really
     /// outstanding. a live reader passes each message on within
     /// milliseconds: owed with nothing at all passed on between two reads
-    /// is a stall once it lasts STALL_AFTER. when nflog drops messages the
-    /// reader says so, and what's owed then counts as lost. a filter
-    /// reload makes the counters again from zero: what they say then was
-    /// all sent since the last read
+    /// is a stall once it lasts STALL_AFTER. what the reader says nflog
+    /// dropped is taken off what's owed, by its count: its socket holds 4M,
+    /// far more than the log rules' limits let a VM send, so a reader that
+    /// keeps up doesn't drop any. a filter reload makes the counters again
+    /// from zero: what they say then was all sent since the last read, and
+    /// what was sent between the last read and the reload is only in the
+    /// counters the reload threw away
     fn tick(
         &mut self,
         now: Instant,
@@ -266,12 +269,9 @@ impl Watch {
             c.sent() - self.counts.sent()
         };
         let passed = i128::from(before.saturating_sub(self.before));
-        self.owed = (self.owed + sent - passed).max(0);
-        let said_lost = lost > self.lost;
-        if said_lost {
-            self.owed = 0;
-        }
-        let moved = after > self.after || said_lost;
+        let said_lost = i128::from(lost.saturating_sub(self.lost));
+        self.owed = (self.owed + sent - passed - said_lost).max(0);
+        let moved = after > self.after || said_lost > 0;
         if self.owed > 0 && !moved {
             self.quiet_since.get_or_insert(now);
         } else {
@@ -784,10 +784,16 @@ mod tests {
         assert_eq!(w.tick(at(3), 0, c(10), 0, 0), Fine);
         assert_eq!(w.tick(at(6), 0, c(20), 0, 0), Fine);
         assert_eq!(w.tick(at(9), 0, c(30), 0, 0), Stalled);
-        // nflog dropped some and the reader said so: what's owed is lost
+        // nflog dropped some and the reader said how many: not owed
         let mut w = new(100, 100);
-        assert_eq!(w.tick(at(3), 100, c(140), 120, 1), Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), 120, c(140), 120, 1) == Fine));
+        assert_eq!(w.tick(at(3), 100, c(140), 120, 20), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), 120, c(140), 120, 20) == Fine));
+        // one lost, said so, and then stuck with the other unread: owed
+        let mut w = new(0, 0);
+        assert_eq!(w.tick(at(3), 0, c(2), 0, 1), Fine);
+        assert_eq!(w.tick(at(6), 0, c(2), 0, 1), Fine);
+        assert_eq!(w.tick(at(9), 0, c(2), 0, 1), Fine);
+        assert_eq!(w.tick(at(12), 0, c(2), 0, 1), Stalled);
         // a reload: the counters start over. the 3 since were passed on
         let mut w = new(50, 50);
         assert_eq!(w.tick(at(3), 50, c(3), 53, 0), Fine);
