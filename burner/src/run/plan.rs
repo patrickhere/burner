@@ -206,6 +206,15 @@ impl RunArgs {
         opt("ttl", self.ttl.clone());
         opt("tag", self.tag.clone());
         opt("net", (!self.net_default).then(|| self.net.clone()));
+        // the summary is printed there, on the stderr that comes back here
+        opt(
+            "log",
+            match self.log {
+                LogMode::Summary => None,
+                LogMode::None => Some("none".into()),
+                LogMode::Full => Some("full".into()),
+            },
+        );
         if self.shell {
             v.push(self.img.clone());
             return v;
@@ -680,6 +689,30 @@ mod tests {
                 "--", "x"
             ]
         );
+    }
+
+    #[test]
+    fn remote_argv_takes_the_log_mode() {
+        let n = "0123456789abcdef0123456789abcdef";
+        for (mode, want) in [
+            ("none", Some("none")),
+            ("full", Some("full")),
+            ("summary", None),
+        ] {
+            let argv = parse(&["--log", mode, "--", "x"]).remote_argv(n, false);
+            let at = argv.iter().position(|w| w == "--log");
+            assert_eq!(at.map(|i| argv[i + 1].as_str()), want, "{mode}");
+            let back = parse(&argv[1..].iter().map(String::as_str).collect::<Vec<_>>());
+            assert!(back.log == parse(&["--log", mode, "--", "x"]).log);
+        }
+        #[derive(clap::Parser)]
+        struct S {
+            #[command(flatten)]
+            a: ShellArgs,
+        }
+        let s = <S as clap::Parser>::try_parse_from(["shell", "--log", "none", "debian"]).unwrap();
+        let sh = shell_run_args(&s.a).remote_argv(n, false);
+        assert_eq!(sh[3..], ["--log", "none", "debian"]);
     }
 
     #[test]
