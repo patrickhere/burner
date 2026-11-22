@@ -133,7 +133,7 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 ## the other commands
 
 ```json
-// ls
+// ls: through sudo only the caller's VMs, root sees every one. max_vms and the mem totals are the machine's
 {"vms":[{"id":"burner-3f9a1c2b7d10","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,"disk_gib":2,"net":"web",
          "status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,"ttl_secs":600,"ttl_left_secs":558}],
  "max_vms":2,"total_mem_mib":3072,"used_mem_mib":512}

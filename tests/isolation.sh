@@ -183,10 +183,28 @@ for _ in $(seq 40); do vid=$(sudo burner ls | awk '$2 == "victim2" && /running/ 
 [ -n "$vid" ] && [ "$(cat "$T/k2.rc")" = 130 ] && grep -q 'killed by burner kill' "$T/k2.err" && ! grep -q 'VM ended before' "$T/k2.err" \
   && ok "sudo burner kill during boot: rc 130, no console dump" || bad "kill during boot" "vid=$vid rc=$(cat "$T/k2.rc") err=$(tr '\n' ' ' < "$T/k2.err" | head -c 300)"
 
+# 12b ls and kill: root's, like log, so without sudo they say so with exit 2.
+# through sudo ls shows only the caller's VMs, under a header row; root sees
+# every one, and a VM another user started can't be killed by this one
+burner ls >/dev/null 2>"$T/nr.ls"; r1=$?
+burner kill burner-000000000000 >/dev/null 2>"$T/nr.kill"; r2=$?
+( sudo env SUDO_UID=4242 burner run --img "$IMG" --tag elses -- 'sleep 300' </dev/null >/dev/null 2>&1 ) &
+ov=""
+for _ in $(seq 40); do ov=$(sudo env -u SUDO_UID burner ls | awk '$2 == "elses" {print $1}'); [ -n "$ov" ] && break; sleep 0.25; done
+mine=$(sudo burner ls); minej=$(sudo burner ls --json)
+sudo burner kill "$ov" >/dev/null 2>&1; rk=$?
+head=$(sudo env -u SUDO_UID burner ls | head -n 1)
+[ -n "$ov" ] && sudo env -u SUDO_UID burner kill "$ov" >/dev/null; wait
+[ "$r1" = 2 ] && grep -q 'burner ls needs root' "$T/nr.ls" && [ "$r2" = 2 ] && grep -q 'burner kill needs root' "$T/nr.kill" \
+  && [ -n "$ov" ] && ! grep -q "$ov" <<<"$mine$minej" && [ "$rk" = 1 ] \
+  && [ "$(echo "$head" | awk '{print $1, $2, $NF}')" = "ID TAG LEFT" ] \
+  && ok "ls and kill need root (2); through sudo ls lists only yours and kill won't stop another user's VM" \
+  || bad "ls and kill owners" "noroot=$r1,$r2 other=$ov kill=$rk head=$head mine=$(head -c 200 <<<"$mine")"
+
 # 13 argument fuzzing: all must be refused with rc 2 before any VM starts
 fz=0
 for a in "--img ../alpine" "--img alpine/../x" "--img ALPINE" "--tag A_B" "--tag $(printf 'x%.0s' {1..40})" \
-         "--cpus 99" "--cpus 0" "--mem 99999" "--mem 1" "--ttl 2h" "--ttl 1s" "--ttl 5x" "--disk 0" "--disk 50" \
+         "--cpus 99" "--cpus 0" "--mem 99999" "--mem 1" "--mem 2T" "--disk 1500M" "--ttl 2h" "--ttl 1s" "--ttl 5x" "--disk 0" "--disk 50" \
          "--net lan" "--in auto" "--result zip" "--bogus 1"; do
   # shellcheck disable=SC2086
   sudo burner run $a -- true </dev/null >/dev/null 2>&1; r=$?

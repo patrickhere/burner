@@ -563,7 +563,7 @@ fi
 # hosts.lo never answers, so every run here also goes past it
 vms_gone() {
     for _ in $(seq 30); do
-        [ "$(sudo -n burner ls 2>/dev/null)" = "no VMs running" ] && return 0
+        case "$(sudo -n burner ls 2>/dev/null)" in "no VMs of yours running" | "no VMs running") return 0 ;; esac
         sleep 1
     done
     return 1

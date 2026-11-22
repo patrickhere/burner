@@ -259,7 +259,94 @@ impl LsVm {
     }
 }
 
+/// through sudo, the caller. None for root itself, which sees every VM
+fn sudo_caller() -> Option<u32> {
+    std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok())
+}
+
+/// ls and kill read and change the ledger, which is root's on linux
+#[cfg(target_os = "linux")]
+fn needs_root(cmd: &str, what: &str) -> Option<ExitCode> {
+    (!sys::is_root()).then(|| {
+        json::fail(
+            cmd,
+            EXIT_USAGE,
+            Kind::NotRoot,
+            format!("burner {cmd} needs root, like the VMs it {what} (sudo burner {cmd})"),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn needs_root(_cmd: &str, _what: &str) -> Option<ExitCode> {
+    None
+}
+
+/// an age or a time left: 42s, 4m12s, 1h03m, 2d05h
+fn short_secs(s: u64) -> String {
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        3600..86400 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d{:02}h", s / 86400, s % 86400 / 3600),
+    }
+}
+
+/// 512M, or 2G when it's whole GiB
+fn short_mib(m: u32) -> String {
+    if m >= 1024 && m.is_multiple_of(1024) {
+        format!("{}G", m / 1024)
+    } else {
+        format!("{m}M")
+    }
+}
+
+/// the text table: a header, then one row per VM, columns as wide as
+/// their widest cell
+fn ls_table(vms: &[LsVm]) -> String {
+    let mut rows = vec![
+        [
+            "ID", "TAG", "IMG", "CPU", "MEM", "DISK", "NET", "STATUS", "AGE", "LEFT",
+        ]
+        .map(String::from),
+    ];
+    for v in vms {
+        rows.push([
+            v.id.clone(),
+            v.tag.clone().unwrap_or_default(),
+            v.img.clone(),
+            v.vcpus.to_string(),
+            short_mib(v.mem_mib),
+            format!("{}G", v.disk_gib),
+            v.net.clone(),
+            v.status.into(),
+            short_secs(v.age_secs),
+            v.ttl_left_secs.map_or("-".into(), short_secs),
+        ]);
+    }
+    let mut width = [0; 10];
+    for r in &rows {
+        for (w, c) in width.iter_mut().zip(r) {
+            *w = (*w).max(c.len());
+        }
+    }
+    let mut out = String::new();
+    for r in &rows {
+        let line: Vec<String> = r
+            .iter()
+            .zip(width)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
+        out += line.join("  ").trim_end();
+        out += "\n";
+    }
+    out
+}
+
 pub fn ls(cfg: &Config) -> Result<ExitCode> {
+    if let Some(code) = needs_root("ls", "lists") {
+        return Ok(code);
+    }
     // no reaper timer on macOS: don't list VMs whose wrapper is long gone
     #[cfg(target_os = "macos")]
     let _ = reap(cfg);
@@ -270,34 +357,28 @@ pub fn ls(cfg: &Config) -> Result<ExitCode> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // the room left is the machine's, every user's VMs count
+    let used_mem_mib = vms.iter().map(|v| v.mem_mib).sum();
+    // through sudo it's the caller's VMs, like kill and log; root sees all
+    let caller = sudo_caller();
+    let mine: Vec<LsVm> = vms
+        .iter()
+        .filter(|v| caller.is_none_or(|c| v.owner == Some(c)))
+        .map(|v| LsVm::of(v, now, unix))
+        .collect();
     if json::on() {
         let res = LsResult {
-            vms: vms.iter().map(|v| LsVm::of(v, now, unix)).collect(),
+            vms: mine,
             max_vms: cfg.limits.max_vms,
             total_mem_mib: cfg.limits.total_mem_mib,
-            used_mem_mib: vms.iter().map(|v| v.mem_mib).sum(),
+            used_mem_mib,
         };
         return Ok(json::reply("ls", 0, Some(res)));
     }
-    if vms.is_empty() {
-        println!("no VMs running");
-    }
-    for v in vms {
-        let left = v
-            .deadline_boot
-            .map(|d| format!("{}s", (d - now).max(0.0) as u64))
-            .unwrap_or("-".into());
-        println!(
-            "{}  {:<12} {:<10} {}cpu {}M  net={}  {}  age={}s  ttl_left={left}",
-            v.id,
-            v.tag,
-            v.img,
-            v.vcpus,
-            v.mem_mib,
-            v.net,
-            v.status.name(),
-            unix.saturating_sub(v.started)
-        );
+    match (mine.is_empty(), caller) {
+        (true, Some(_)) => println!("no VMs of yours running"),
+        (true, None) => println!("no VMs running"),
+        (false, _) => print!("{}", ls_table(&mine)),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -357,8 +438,11 @@ pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
         Some(id) if valid_id(id) => id.as_str(),
         _ => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, KILL_USAGE)),
     };
+    if let Some(code) = needs_root("kill", "stops") {
+        return Ok(code);
+    }
     // through sudo you can only kill what you started. real root can kill anything
-    let caller: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
+    let caller = sudo_caller();
     // nothing is printed while the ledger is locked: a stalled stderr would hold it
     let refused = {
         let led = Ledger::open(&cfg.paths.state)?;
@@ -627,6 +711,50 @@ mod tests {
             serde_json::to_string(&r).unwrap(),
             r#"{"vms":[{"id":"burner-3f9a1c2b7d10","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,"disk_gib":2,"net":"web","status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,"ttl_secs":600,"ttl_left_secs":558}],"max_vms":2,"total_mem_mib":3072,"used_mem_mib":512}"#
         );
+    }
+
+    #[test]
+    fn ls_text() {
+        assert_eq!(
+            [0, 42, 60, 252, 3599, 3600, 3780, 86399, 86400, 183600].map(short_secs),
+            [
+                "0s", "42s", "1m00s", "4m12s", "59m59s", "1h00m", "1h03m", "23h59m", "1d00h",
+                "2d03h"
+            ]
+        );
+        assert_eq!(
+            [512, 1024, 1536, 3072].map(short_mib),
+            ["512M", "1G", "1536M", "3G"]
+        );
+        let vm = |id: &str, tag: Option<&str>, left: Option<u64>| LsVm {
+            id: id.into(),
+            tag: tag.map(String::from),
+            img: "alpine".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            disk_gib: 2,
+            net: "none".into(),
+            status: "running",
+            owner: Some(1000),
+            started_unix: 0,
+            age_secs: 252,
+            ttl_secs: 600,
+            ttl_left_secs: left,
+        };
+        let t = ls_table(&[
+            vm("burner-3f9a1c2b7d10", Some("tests"), Some(348)),
+            vm("burner-0123456789ab", None, None),
+        ]);
+        assert_eq!(
+            t,
+            "ID                   TAG    IMG     CPU  MEM   DISK  NET   STATUS   AGE    LEFT\n\
+             burner-3f9a1c2b7d10  tests  alpine  1    512M  2G    none  running  4m12s  5m48s\n\
+             burner-0123456789ab         alpine  1    512M  2G    none  running  4m12s  -\n"
+        );
+        // what the suites match on: the id first, the tag as its own word
+        let row = t.lines().nth(1).unwrap();
+        assert!(row.starts_with("burner-") && row.contains(" tests "));
+        assert_eq!(row.split_whitespace().nth(1), Some("tests"));
     }
 
     #[test]
