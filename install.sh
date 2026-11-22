@@ -70,7 +70,7 @@ vms_running() {
 # burner registers every VM in the ledger with this lock held, before it
 # starts. held, with the ledger empty, no VM can start until it's let go.
 # burner itself (reap, doctor, net) takes it too, so it's let go before those
-lock_vms() {
+lock_vms() { # [what to run first when it finds VMs]
     # paths.state, where the installed burner keeps its ledger
     state=""
     if [ -x "$BIN" ]; then
@@ -85,11 +85,16 @@ lock_vms() {
     exec 9<> "$state/ledger.lock"
     flock -w 60 9 || die "couldn't lock the VM ledger, a burner command seems stuck"
     if [ -z "$force" ] && [ -n "$(ls -A "$state/vms" 2>/dev/null)" ]; then
+        unlock_vms
+        if [ -n "${1:-}" ]; then "$1"; fi
         die "VMs are running (sudo burner ls). stop them first, or --force to go on anyway"
     fi
 }
 unlock_vms() {
     exec 9>&-
+}
+services_back() {
+    systemctl enable --now burner-net.service burner-reap.timer >/dev/null 2>&1 || true
 }
 
 # sudo ./install.sh --uninstall: everything this script put on the machine, except
@@ -102,12 +107,13 @@ uninstall() {
     fi
     systemctl disable --now burner-reap.timer burner-net.service 2>/dev/null || true
     if [ -x "$BIN" ]; then "$BIN" net down >/dev/null 2>&1 || true; fi
+    # checked again with the ledger locked: nothing may start from here on. a
+    # VM that started since gets its services back and stops the uninstall.
+    # burner goes first, so nothing can start a VM once the lock file goes
+    lock_vms services_back
     rm -f /etc/systemd/system/burner-net.service /etc/systemd/system/burner-reap.service \
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
-    # checked again with the ledger locked: nothing may start from here on.
-    # burner goes first, so nothing can start a VM once the lock file goes
-    lock_vms
     rm -f "$BIN" "$TUI"
     rm -rf "$ROOT" /run/burner
     rm -f "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
