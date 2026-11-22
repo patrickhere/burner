@@ -81,7 +81,6 @@ jobs:
     timeout-minutes: 30
     env:
       ARCH: ${{ matrix.arch }}
-      BURNER_ROOT: ${{ runner.temp }}/burner
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,6 +91,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mmdebstrap
           mkdir -p out
+          # the runner context isn't allowed in a job's env, so it's set here
+          echo "BURNER_ROOT=$RUNNER_TEMP/burner" >> "$GITHUB_ENV"
       - name: guest kernel
         if: matrix.arch == 'aarch64'
         run: |
