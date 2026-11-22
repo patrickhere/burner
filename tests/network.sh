@@ -330,7 +330,9 @@ sudo burner log --list --json > "$T/rl.list" 2>/dev/null; lrc=$?
 sudo burner log "$rid" --json > "$T/rl.log" 2>/dev/null
 sudo burner log "$nid" --json > "$T/rn.log" 2>/dev/null
 sudo burner log "$rid" > "$T/rl.txt" 2>/dev/null
-python3 -I - "$T" "$rid" "$nid" "$(id -u)" "$lrc" <<'PY'
+# the owner is who sudo says ran it: you, or root when the suite runs as root
+owner=$(sudo sh -c 'echo "${SUDO_UID:-0}"')
+python3 -I - "$T" "$rid" "$nid" "$owner" "$lrc" <<'PY'
 import json, sys
 t, rid, nid, me, lrc = sys.argv[1:]
 runs = json.load(open(t + "/rl.list"))["result"]["runs"]
@@ -353,8 +355,8 @@ head -n 1 "$T/rl.txt" | grep -qE "^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2
 check $? "run log: burner log opens with date, host, image, exit and command" "$(head -n 2 "$T/rl.txt" | cut -c 1-120 | tr '\n' ' ')"
 grep -q '^burner:   reached: github.com' "$T/rl.err"
 check $? "summary: says where the run went (reached: github.com)" "$(grep '^burner: ' "$T/rl.err" | tr '\n' ' ')"
-rec=$(sudo sh -c 'ls /var/lib/burner/logs/*/"$1".json' sh "$rid" 2>/dev/null | head -n 1)
-[ -n "$rec" ] && [ "$(sudo stat -c '%U %a' "$rec" 2>/dev/null)" = "root 600" ] && [ "$(sudo stat -c '%U %a' "$(dirname "$rec")" 2>/dev/null)" = "root 700" ] \
+rec=/var/lib/burner/logs/$owner/$rid.json
+[ "$(sudo stat -c '%U %a' "$rec" 2>/dev/null)" = "root 600" ] && [ "$(sudo stat -c '%U %a' "$(dirname "$rec")" 2>/dev/null)" = "root 700" ] \
   && [ "$(sudo stat -c '%a' /var/lib/burner/logs)" = 700 ] && ! sudo test -e "/run/burner/logs/$rid.json"
 check $? "run log: kept in /var/lib/burner/logs, root only, nothing in the state dir" "rec=$rec $(sudo ls -la /var/lib/burner/logs 2>&1 | head -n 3 | tr '\n' ' ')"
 # without sudo: only your -H copies, and a line on how to see this machine's.

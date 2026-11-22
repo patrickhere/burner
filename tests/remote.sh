@@ -9,7 +9,8 @@
 #
 # BURNER picks the client binary (default: burner on PATH). nothing outside a
 # temp dir is touched: the sshd, its keys, known_hosts, ssh config and
-# hosts.toml all live there and go at the end
+# hosts.toml all live there and go at the end. on a mac the client's copies
+# of -H runs go in burner's own log store, and the stand-ins' go at the end
 set -u
 FAKE_ONLY=0
 [ "${1:-}" = --fake-only ] && FAKE_ONLY=1
@@ -31,6 +32,8 @@ SSHD_PID=
 cleanup() {
     [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null
     rm -rf "$T"
+    # a mac keeps -H copies in burner's own store: the stand-ins' ids go
+    [ "$(uname -s)" = Darwin ] && rm -f "$HOME/Library/Application Support/burner/logs/$(id -u)"/burner-{0123456789ab,feedfacecafe}@*.json
 }
 trap cleanup EXIT
 pass=0; fail=0
@@ -637,10 +640,6 @@ BURNER_HOST=fake "$B" -H local log --list --from fake2 >"$T/lg3" 2>&1; rlo=$?
   && [ "$rlo" = 0 ] && grep -q '^burner-feedfacecafe  .*  fake2  evil?31m  web' "$T/lg3" && ! grep -q 'fake log' "$T/lg3" \
   && ok "copy: log --list goes over -H and BURNER_HOST, -H local lists the copies here" \
   || bad "log --list over -H" "h=$rl env=$re local=$rlo $(short "$T/lg") $(short "$T/lg3")"
-# a mac keeps these in burner's own store: the test's copies go
-if [ "$(uname -s)" = Darwin ]; then
-    rm -f "$copies"/burner-0123456789ab@*.json "$copies"/burner-feedfacecafe@*.json
-fi
 
 if [ "$FAKE_ONLY" = 1 ]; then
     echo "---- $pass passed, $fail failed"

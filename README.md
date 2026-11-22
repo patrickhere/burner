@@ -36,7 +36,7 @@ that's linux with kvm (x86_64 or arm), or any apple silicon mac (M1 and newer, m
 - `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https plus dns and ping only, or any port but mail. the LAN, the host and other VMs are always blocked
-- after a run with a network, a few lines on stderr say what it tried: connections out, what was blocked and why, dns lookups. `burner log` keeps every run, with its command, exit and connections, see [what a VM tried](#what-a-vm-tried)
+- after a run with a network, a few lines on stderr say what it tried: connections out, what was blocked and why, dns lookups. `burner log` keeps your recent runs, with their command, exit and connections, see [what a VM tried](#what-a-vm-tried)
 - `burner explain` says what a VM could reach on this host and why the rest is blocked, `burner doctor --probe` boots a VM that tries it for real
 - `burner ls`, `burner kill ID`, `burner images`, `burner doctor`, `burner log`, `burner explain`, `burner version`. `--json` on any of them gives one JSON document instead ([docs/json.md](docs/json.md))
 
