@@ -81,6 +81,11 @@ as_root() {
     if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
 }
 
+# the same where nothing may ask for a password, on the way out
+as_root_n() {
+    if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi
+}
+
 # a question on the terminal, even with this script on stdin. nothing when
 # there's no terminal to ask on
 ask() { # prompt
@@ -227,26 +232,36 @@ install_packages() {
     fi
 }
 
+# as root into root's own temp dir: what's checked is what root unpacks and
+# runs, nobody else can swap it in between
 download() {
     base="https://github.com/$REPO/releases/download/$version"
-    curl -fsSL -o "$tmp/$name.tar.gz" "$base/$name.tar.gz"
-    curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
-    (cd "$tmp" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c -)
+    as_root curl -fsSL -o "$tmp/$name.tar.gz" "$base/$name.tar.gz"
+    as_root curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS"
+    # shellcheck disable=SC2016 # the inner sh expands them
+    as_root sh -c 'cd "$1" && grep " $2.tar.gz\$" SHA256SUMS | sha256sum -c -' sh "$tmp" "$name"
 }
 
+# into $SHARE/.new, so the release that's there stays whole until this one
+# is installed
 unpack() {
     # kept, so tools/build-image is there for more images later
     # explicit mode: a root umask of 077 would make it unreadable to the build step
     as_root install -d -m 0755 "$SHARE"
-    as_root rm -rf "${SHARE:?}/$name"
-    as_root tar -xzf "$tmp/$name.tar.gz" -C "$SHARE" --no-same-owner
+    as_root rm -rf "$SHARE/.new"
+    as_root install -d -m 0755 "$SHARE/.new"
+    as_root tar -xzf "$tmp/$name.tar.gz" -C "$SHARE/.new" --no-same-owner
     # install.sh keeps it for burner setup, which checks the images against it
-    as_root install -m 0644 "$tmp/SHA256SUMS" "$SHARE/$name/SHA256SUMS"
+    as_root install -m 0644 "$tmp/SHA256SUMS" "$SHARE/.new/$name/SHA256SUMS"
 }
 
 # once it's installed: current is this release, previous the one before, and
 # any older one goes. sudo $SHARE/previous/install.sh goes back to it
 switch() {
+    as_root rm -rf "$SHARE/.old"
+    if [ -e "$SHARE/$name" ]; then as_root mv -T "$SHARE/$name" "$SHARE/.old"; fi
+    as_root mv -T "$SHARE/.new/$name" "$SHARE/$name"
+    as_root rm -rf "$SHARE/.new" "$SHARE/.old"
     was=$(readlink "$SHARE/current" 2>/dev/null) || was=""
     if [ -n "$was" ] && [ "$was" != "$name" ] && [ -d "$SHARE/$was" ]; then
         as_root ln -sfn "$was" "$SHARE/previous.new"
@@ -267,7 +282,7 @@ switch() {
 # whether this release has an image for this cpu and a burner setup that
 # fetches it (linux setup is new in 0.3.1)
 in_release() { # image
-    grep -q "  $1-$arch\.ext4\.gz\$" "$tmp/SHA256SUMS" \
+    as_root grep -q "  $1-$arch\.ext4\.gz\$" "$tmp/SHA256SUMS" \
         && as_root /usr/local/bin/burner setup --help >/dev/null 2>&1
 }
 
@@ -333,8 +348,8 @@ main() {
 
     LOG=$(mktemp /tmp/burner-install-XXXXXX)
     KEEP_LOG=""
-    tmp=$(mktemp -d)
-    trap 'rm -rf "$tmp"; [ -n "$KEEP_LOG" ] || rm -f "$LOG"' EXIT
+    tmp=$(as_root mktemp -d /tmp/burner-get-XXXXXX)
+    trap 'as_root_n rm -rf "$tmp"; [ -n "$KEEP_LOG" ] || rm -f "$LOG"' EXIT
     # an upgrade stops for running VMs before downloading anything. install.sh
     # checks again
     if [ -z "$force" ] && [ -x /usr/local/bin/burner ] \
@@ -379,7 +394,7 @@ main() {
 
     name="burner-$version-$arch-linux"
     run "downloading $version" download
-    size=$(du -k "$tmp/$name.tar.gz" | awk '{printf "%.1f MB", $1 / 1024}')
+    size=$(as_root du -k "$tmp/$name.tar.gz" | awk '{printf "%.1f MB", $1 / 1024}')
     ok "downloaded $version" "$size, sha256 matches"
 
     run "unpacking" unpack
@@ -394,7 +409,7 @@ main() {
     for u in $allow; do opts="$opts --allow $u"; done
     [ -z "$force" ] || opts="$opts --force"
     # shellcheck disable=SC2086 # one word per option
-    run "installing" as_root "$SHARE/$name/install.sh" $opts
+    run "installing" as_root "$SHARE/.new/$name/install.sh" $opts
     fc=$(sed -n 's/^firecracker v\([0-9.]*\).*/\1/p' "$LOG" | tail -n 1)
     ok "$label" "firecracker ${fc:-ok}, systemd units, reaper"
     run "keeping $version and the release before it" switch
