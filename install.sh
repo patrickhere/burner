@@ -71,12 +71,18 @@ vms_running() {
 # starts. held, with the ledger empty, no VM can start until it's let go.
 # burner itself (reap, doctor, net) takes it too, so it's let go before those
 lock_vms() {
-    [ -d /run/burner ] || return 0
+    # paths.state, where the installed burner keeps its ledger
+    state=""
+    if [ -x "$BIN" ]; then
+        state=$("$BIN" config 2>/dev/null | sed -n '/^\[paths\]/,/^\[/s/^state = "\(.*\)"$/\1/p')
+    fi
+    state=${state:-/run/burner}
+    [ -d "$state" ] || return 0
     command -v flock >/dev/null 2>&1 || die "needs flock (util-linux)"
-    (umask 077 && : >> /run/burner/ledger.lock)
-    exec 9<> /run/burner/ledger.lock
+    (umask 077 && : >> "$state/ledger.lock")
+    exec 9<> "$state/ledger.lock"
     flock -w 60 9 || die "couldn't lock the VM ledger, a burner command seems stuck"
-    if [ -z "$force" ] && [ -n "$(ls -A /run/burner/vms 2>/dev/null)" ]; then
+    if [ -z "$force" ] && [ -n "$(ls -A "$state/vms" 2>/dev/null)" ]; then
         die "VMs are running (sudo burner ls). stop them first, or --force to go on anyway"
     fi
 }
