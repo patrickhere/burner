@@ -76,6 +76,8 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 | `network` | the connection log, below. null for `--net none` |
 | `files`, `processes` | reserved, null |
 
+`outcome`, `rc` and `guest_*` are the guest's word. the job runs as root in the VM and can write what guest init reports back, so it can make a poweroff look like a clean exit or pick its own exit code. burner checks what it can from the host: a `timeout` only counts once the host's clock got to the guest's limit, and `killed`, `interrupted`, `busy` and the `-H` outcomes are burner's own.
+
 ## the connection log
 
 `result.network` of a run or shell with a network, and `result` of `burner log --json`:

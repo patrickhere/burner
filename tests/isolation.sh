@@ -262,6 +262,12 @@ s=$(date +%s); out=$(sudo burner run --img "$IMG" --ttl 20s -- 'echo before; sle
 [ "$rc" = 124 ] && [ "$(echo "$out" | head -n 1)" = before ] && [ $((e - s)) -le 30 ] \
   && ok "a job that really runs on still ends at the ttl with its output (rc $rc)" \
   || bad "ttl with output" "rc=$rc out=$out secs=$((e - s))"
+# the job can write guest init's timed_out itself. before the limit, by the
+# host's clock, it doesn't count: the run is the command's own exit 3
+sudo burner run --img "$IMG" --ttl 60s --json-fd 2 -- ': > /result/timed_out; exit 3' </dev/null >/dev/null 2>"$T/fake-to.err"; rc=$?
+oc=$(tail -n 1 "$T/fake-to.err" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["result"]["outcome"])' 2>/dev/null)
+[ "$rc" = 3 ] && [ "$oc" = exited ] && ok "a timed_out the job wrote before the limit is ignored (rc $rc, $oc)" \
+  || bad "a forged timed_out" "rc=$rc outcome=$oc"
 
 # 20b a stray that renames itself to look like the start of a stat line: a
 # newline, then a * that /work is full of files for. guest init's own sid()

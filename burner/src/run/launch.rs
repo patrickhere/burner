@@ -50,6 +50,12 @@ fn guest_limit(ttl: u32) -> u32 {
     ttl.saturating_sub((ttl / 4).clamp(5, 30)).max(1)
 }
 
+/// whether a run that ran this long (host clock, from just before the VMM
+/// started) got to the guest's limit. a second's slack for the guest's clock
+fn reached_limit(ttl: u32, ran: f64) -> bool {
+    ran + 1.0 >= f64::from(guest_limit(ttl))
+}
+
 /// what the VM's cgroup may use on top of guest RAM: firecracker itself, plus
 /// host page cache from writes to its disks, which is charged to the same cgroup
 #[cfg(target_os = "linux")]
@@ -694,13 +700,22 @@ fn run_vm(
                 );
                 code = EXIT_SANDBOX;
             }
-            if meta.timed_out {
+            // the job runs as root in the VM and can write result/timed_out
+            // itself, so it only counts once the host's clock got that far
+            let ran = f64::from(p.ttl) - deadline.left().as_secs_f64();
+            if meta.timed_out && reached_limit(p.ttl, ran) {
                 let msg = format!(
                     "stopped at the {}s time limit, the output and /out up to then are above",
                     p.ttl
                 );
                 ends(RunOutcome::Timeout, Kind::Timeout, msg);
                 code = EXIT_TIMEOUT;
+            } else if meta.timed_out {
+                let msg = format!(
+                    "the guest said the command hit its time limit after {ran:.0}s of {}s, ignored",
+                    guest_limit(p.ttl)
+                );
+                json::note_warning(Kind::Result, msg, false);
             }
             // an image built from another burner's guest init: its results can't be trusted
             if meta.rc.is_some() && meta.proto != Some(GUEST_PROTO) {
@@ -1648,6 +1663,10 @@ mod tests {
         assert_eq!(guest_limit(60), 45);
         assert_eq!(guest_limit(3600), 3570);
         assert_eq!(guest_limit(3), 1);
+        assert!(reached_limit(60, 45.2));
+        assert!(reached_limit(60, 44.5), "a guest clock a little ahead");
+        assert!(!reached_limit(60, 30.0));
+        assert!(!reached_limit(600, 2.0));
     }
 
     #[test]
