@@ -1462,6 +1462,18 @@ pub fn resolver_checks(
     blocked: Option<&[Blocked]>,
     platform: crate::netmodel::Platform,
 ) -> Vec<(Severity, String)> {
+    checks_asking(cfg, blocked, platform, |ip| {
+        ask_resolver(ip, Duration::from_secs(2))
+    })
+}
+
+/// resolver_checks with the question asked by `ask`, for tests
+fn checks_asking(
+    cfg: &Config,
+    blocked: Option<&[Blocked]>,
+    platform: crate::netmodel::Platform,
+    ask_one: fn(Ipv4Addr) -> std::result::Result<Duration, String>,
+) -> Vec<(Severity, String)> {
     let mut out = Vec::new();
     if cfg.net.resolvers.is_empty() {
         out.push((
@@ -1480,16 +1492,42 @@ pub fn resolver_checks(
             ),
         ));
     }
+    // behind a full tunnel's halves: blocked like every address while the
+    // vpn is up. a warning, the way the vpn's own line is, since no other
+    // resolver would do better
+    let behind: Vec<String> = cfg
+        .net
+        .resolvers
+        .iter()
+        .filter(|ip| !bad.iter().any(|(b, _)| b == *ip))
+        .filter(|ip| {
+            blocked.is_some_and(|b| {
+                b.iter().any(|x| {
+                    matches!(&x.why, Why::Route { dev, .. } if x.prefix == 1 && is_vpn_dev(dev))
+                        && u32::from(**ip) & config::mask(1) == u32::from(x.net)
+                })
+            })
+        })
+        .map(|ip| ip.to_string())
+        .collect();
+    if !behind.is_empty() {
+        out.push((
+            Severity::Warn,
+            format!(
+                "{} behind the full-tunnel vpn's routes, so VMs get no dns while it's up",
+                if behind.len() == 1 {
+                    format!("net.resolvers {} is", behind[0])
+                } else {
+                    format!("net.resolvers {} are", behind.join(" and "))
+                }
+            ),
+        ));
+    }
     // every one, blocked or not: what answers here is a fact of its own
     let ask: Vec<Ipv4Addr> = cfg.net.resolvers.clone();
     let answers: Vec<(Ipv4Addr, std::result::Result<Duration, String>)> = ask
         .iter()
-        .map(|&ip| {
-            (
-                ip,
-                std::thread::spawn(move || ask_resolver(ip, Duration::from_secs(2))),
-            )
-        })
+        .map(|&ip| (ip, std::thread::spawn(move || ask_one(ip))))
         .collect::<Vec<_>>()
         .into_iter()
         .map(|(ip, h)| {
@@ -2146,6 +2184,24 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux).is_empty());
+        // doctor says the resolvers are behind it, as a warning like the vpn's
+        let c = |b: &[Blocked]| {
+            checks_asking(&cfg, Some(b), crate::netmodel::Platform::Linux, |_| {
+                Err("not asked".into())
+            })
+            .into_iter()
+            .filter(|(_, m)| m.contains("behind the full-tunnel") || m.contains("can't reach it"))
+            .collect::<Vec<_>>()
+        };
+        let got = c(&b);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].0, Severity::Warn);
+        assert!(
+            got[0]
+                .1
+                .starts_with("net.resolvers 9.9.9.9 and 1.1.1.1 are behind"),
+            "{got:?}"
+        );
         // one half alone isn't a tunnel: 9.9.9.9 and 1.1.1.1 behind it fail
         let one = r#"[{"dst":"0.0.0.0/1","gateway":"10.8.0.1","dev":"tun0","flags":[]},
             {"dst":"default","gateway":"192.168.1.1","dev":"eth0","flags":[]}]"#;
