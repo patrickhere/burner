@@ -193,6 +193,10 @@ jobs:
             "$d/$b" --version
           done
           otool -L "$d/burner" | tee /dev/stderr | grep -q "$(brew --prefix)/opt/libkrun/lib/libkrun"
+          # what the formula runs at install for the completions and man pages
+          for sh in bash zsh fish; do "$d/burner" completions "$sh" | grep -q burner; done
+          "$d/burner" __man "$RUNNER_TEMP/man" >/dev/null
+          [ -s "$RUNNER_TEMP/man/burner-run.1" ]
           COPYFILE_DISABLE=1 tar -C pkg --uid 0 --gid 0 --uname root --gname wheel -cf - "$name" | gzip -9n > "$name.tar.gz"
           tar -tzvf "$name.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
