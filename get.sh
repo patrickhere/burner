@@ -426,6 +426,9 @@ main() {
     opts=""
     for u in $allow; do opts="$opts --allow $u"; done
     [ -z "$force" ] || opts="$opts --force"
+    # a version change marks the images for a refresh before anything is
+    # installed, and they stay marked until it went through
+    [ "v$old" = "$version" ] || as_root touch "$SHARE/.refresh-images"
     # shellcheck disable=SC2086 # one word per option
     run "installing" as_root "$SHARE/.new/$name/install.sh" $opts
     fc=$(sed -n 's/^firecracker v\([0-9.]*\).*/\1/p' "$LOG" | tail -n 1)
@@ -436,11 +439,10 @@ main() {
 
     # a new release brings its images along: more than the guest init can
     # change between them (bash in alpine, debian's disk in 0.3.1)
-    # marked until they're through, so a run that stops before then (a
-    # failed fetch, ctrl-c) leaves the next one, already on this release, to
-    # bring them along
+    # marked (above) until they're through, so a run that stops before then
+    # (a failed fetch, ctrl-c) leaves the next one, already on this release,
+    # to bring them along
     upgraded=""
-    [ "v$old" = "$version" ] || as_root touch "$SHARE/.refresh-images"
     [ -e "$SHARE/.refresh-images" ] && upgraded=1
     if ! as_root /usr/local/bin/burner images 2>/dev/null | grep -qx alpine \
         || grep -q 'rebuild alpine' "$LOG" || { [ -n "$upgraded" ] && in_release alpine; }; then
