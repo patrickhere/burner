@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader, Read};
 #[cfg(target_os = "macos")]
 use std::net::Ipv4Addr;
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -63,6 +63,10 @@ struct Live {
     platform: Platform,
     started_unix: u64,
     coll: Arc<Mutex<Option<Collector>>>,
+    /// what the producer itself said was lost, in the collector's lost.
+    /// the linux watchdog's
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    said: Arc<AtomicU64>,
     last: Arc<Mutex<Instant>>,
     stopping: Arc<AtomicBool>,
     died: Arc<AtomicBool>,
@@ -86,6 +90,7 @@ fn live<T>(f: impl FnOnce(&mut Option<Live>) -> T) -> T {
 fn pump(
     src: impl Read,
     coll: Arc<Mutex<Option<Collector>>>,
+    said: Arc<AtomicU64>,
     last: Arc<Mutex<Instant>>,
     ready: Arc<AtomicBool>,
     on_eof: impl FnOnce(),
@@ -125,12 +130,23 @@ fn pump(
             continue;
         }
         match std::str::from_utf8(&buf[..buf.len() - 1]) {
-            Ok(s) => c.take(s, now),
+            Ok(s) => {
+                let lost = c.lost;
+                c.take(s, now);
+                // what the producer says itself was lost, kept apart from
+                // the gaps in nflog's numbering, under the collector's lock
+                if s.starts_with(LOST_LINE) {
+                    said.fetch_add(c.lost.saturating_sub(lost), Ordering::SeqCst);
+                }
+            }
             Err(_) => c.invalid += 1,
         }
     }
     on_eof();
 }
+
+/// how a producer's own word on lost messages starts
+const LOST_LINE: &str = "{\"k\":\"lost\"";
 
 /// what the reader has passed on: the messages the counters count. other
 /// lines (ready, junk, a packet from the wrong address, what it says was
@@ -159,6 +175,29 @@ fn stat_stopped(stat: &str) -> bool {
     stat.rsplit_once(')')
         .and_then(|(_, rest)| rest.split_whitespace().next())
         .is_some_and(|st| st == "T" || st == "t")
+}
+
+/// what the reader had done at one moment
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Default)]
+struct Seen {
+    /// messages passed on
+    passed: u64,
+    /// messages lost by the gaps in nflog's numbering: exact, and only
+    /// ever messages sent before the one that showed the gap
+    gaps: u64,
+    /// everything said lost, its own overflow notes too, which say one
+    /// whatever was dropped and can be the same message as a gap
+    lost: u64,
+}
+
+#[cfg(target_os = "linux")]
+fn seen(c: &Collector, said: &AtomicU64) -> Seen {
+    Seen {
+        passed: passed_on(c),
+        gaps: c.lost.saturating_sub(said.load(Ordering::SeqCst)),
+        lost: c.lost,
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -204,12 +243,10 @@ impl Counts {
 struct Watch {
     /// the counters at the last good read
     counts: Counts,
-    /// what the reader had passed on just before that read started
-    before: u64,
+    /// what the reader had done just before that read started
+    before: Seen,
     /// and once it was done
-    after: u64,
-    /// what the reader had said was lost then
-    lost: u64,
+    after: Seen,
     /// messages sent that the reader hadn't passed on by then
     owed: i128,
     /// when that read started
@@ -222,41 +259,33 @@ struct Watch {
 impl Watch {
     /// from a read before the VM started, so every message after it is
     /// the VM's
-    fn new(now: Instant, counts: Counts, passed: u64, lost: u64) -> Watch {
+    fn new(now: Instant, counts: Counts, seen: Seen) -> Watch {
         Watch {
             counts,
-            before: passed,
-            after: passed,
-            lost,
+            before: seen,
+            after: seen,
             owed: 0,
             at: now,
             quiet_since: None,
         }
     }
 
-    /// one read that started at `now`, with `before` passed on then, the
-    /// counters (None when they couldn't be read), and `after` passed on
-    /// and `lost` said lost once it was done.
+    /// one read that started at `now`, with what the reader had done
+    /// `before` it, the counters (None when they couldn't be read), and
+    /// what it had done `after`.
     ///
     /// what's owed is what the counters say was sent less what was passed
-    /// on before they were read, so it's never more than was really
-    /// outstanding. a live reader passes each message on within
-    /// milliseconds: owed with nothing at all passed on between two reads
-    /// is a stall once it lasts STALL_AFTER. what the reader says nflog
-    /// dropped is taken off what's owed, by its count: its socket holds 4M,
-    /// far more than the log rules' limits let a VM send, so a reader that
-    /// keeps up doesn't drop any. a filter reload makes the counters again
-    /// from zero: what they say then was all sent since the last read, and
-    /// what was sent between the last read and the reload is only in the
-    /// counters the reload threw away
-    fn tick(
-        &mut self,
-        now: Instant,
-        before: u64,
-        counts: Option<Counts>,
-        after: u64,
-        lost: u64,
-    ) -> Health {
+    /// on or lost in a numbering gap before they were read, so it's never
+    /// more than was really outstanding. a live reader passes each message
+    /// on within milliseconds: owed with nothing at all passed on or said
+    /// lost between two reads is a stall once it lasts STALL_AFTER.
+    /// overflow notes don't come off what's owed, since they don't say how
+    /// many: its socket holds 4M, far more than the log rules' limits let
+    /// a VM send, so a reader that keeps up never overflows. a filter
+    /// reload makes the counters again from zero: what they say then was
+    /// all sent since the last read, and what was sent between the last
+    /// read and the reload is only in the counters the reload threw away
+    fn tick(&mut self, now: Instant, before: Seen, counts: Option<Counts>, after: Seen) -> Health {
         let Some(c) = counts else {
             if now.duration_since(self.at) >= BLIND_AFTER {
                 return Health::Blind;
@@ -268,16 +297,16 @@ impl Watch {
         } else {
             c.sent() - self.counts.sent()
         };
-        let passed = i128::from(before.saturating_sub(self.before));
-        let said_lost = i128::from(lost.saturating_sub(self.lost));
-        self.owed = (self.owed + sent - passed - said_lost).max(0);
-        let moved = after > self.after || said_lost > 0;
+        let done = i128::from(before.passed.saturating_sub(self.before.passed))
+            + i128::from(before.gaps.saturating_sub(self.before.gaps));
+        self.owed = (self.owed + sent - done).max(0);
+        let moved = after.passed > self.after.passed || after.lost > self.after.lost;
         if self.owed > 0 && !moved {
             self.quiet_since.get_or_insert(now);
         } else {
             self.quiet_since = None;
         }
-        (self.counts, self.before, self.after, self.lost, self.at) = (c, before, after, lost, now);
+        (self.counts, self.before, self.after, self.at) = (c, before, after, now);
         self.health(now)
     }
 
@@ -346,7 +375,7 @@ fn watchdog(tap: &str, id: &str, mut w: Watch, l: &Watched) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|c| (passed_on(c), c.lost))
+            .map(|c| seen(c, &l.said))
     };
     loop {
         let until = Instant::now() + WATCH_EVERY;
@@ -357,15 +386,13 @@ fn watchdog(tap: &str, id: &str, mut w: Watch, l: &Watched) {
             std::thread::sleep(Duration::from_millis(100));
         }
         let now = Instant::now();
-        let Some((before, _)) = passed() else { return };
+        let Some(before) = passed() else { return };
         let c = live_counts(tap);
-        let Some((after, lost)) = passed() else {
-            return;
-        };
+        let Some(after) = passed() else { return };
         if l.stopping.load(Ordering::SeqCst) {
             return;
         }
-        let why = match w.tick(now, before, c, after, lost) {
+        let why = match w.tick(now, before, c, after) {
             _ if stopped(l.pid) => READER_STALLED,
             Health::Fine => continue,
             Health::Stalled => READER_STALLED,
@@ -384,6 +411,7 @@ struct Watched {
     /// the reader's
     pid: u32,
     coll: Arc<Mutex<Option<Collector>>>,
+    said: Arc<AtomicU64>,
     stopping: Arc<AtomicBool>,
     stalled: Arc<Mutex<Option<&'static str>>>,
 }
@@ -400,6 +428,7 @@ pub(super) fn watch_linux(tap: &str) -> anyhow::Result<()> {
             Watched {
                 pid: l.child.as_ref()?.id(),
                 coll: l.coll.clone(),
+                said: l.said.clone(),
                 stopping: l.stopping.clone(),
                 stalled: l.stalled.clone(),
             },
@@ -408,12 +437,12 @@ pub(super) fn watch_linux(tap: &str) -> anyhow::Result<()> {
         return Ok(());
     };
     let now = Instant::now();
-    let (got, lost) = l
+    let got = l
         .coll
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .map_or((0, 0), |c| (passed_on(c), c.lost));
+        .map_or(Seen::default(), |c| seen(c, &l.said));
     let Some(start) = live_counts(tap) else {
         return Err(super::exit(
             crate::exit::EXIT_SANDBOX,
@@ -421,7 +450,7 @@ pub(super) fn watch_linux(tap: &str) -> anyhow::Result<()> {
             "the network log's counters can't be read, no network without them",
         ));
     };
-    let w = Watch::new(now, start, got, lost);
+    let w = Watch::new(now, start, got);
     let tap = tap.to_string();
     let t = std::thread::spawn(move || watchdog(&tap, &id, w, &l));
     live(|l| {
@@ -497,9 +526,11 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
     let stopping = Arc::new(AtomicBool::new(false));
     let died = Arc::new(AtomicBool::new(false));
     let ready = Arc::new(AtomicBool::new(false));
+    let said = Arc::new(AtomicU64::new(0));
     let thread = {
-        let (coll, last, stopping, died, ready, id) = (
+        let (coll, said, last, stopping, died, ready, id) = (
             coll.clone(),
+            said.clone(),
             last.clone(),
             stopping.clone(),
             died.clone(),
@@ -507,7 +538,7 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
             id.to_string(),
         );
         std::thread::spawn(move || {
-            pump(out, coll, last, ready, || {
+            pump(out, coll, said, last, ready, || {
                 if !stopping.load(Ordering::SeqCst) {
                     died.store(true, Ordering::SeqCst);
                     crate::cgroup::kill(&id);
@@ -540,6 +571,7 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
             platform: Platform::Linux,
             started_unix: unix_now(),
             coll,
+            said,
             last,
             stopping,
             died,
@@ -570,11 +602,12 @@ pub(super) fn start_mac(
         Instant::now(),
     ))));
     let last = Arc::new(Mutex::new(Instant::now()));
+    let said = Arc::new(AtomicU64::new(0));
     let thread = {
-        let (coll, last) = (coll.clone(), last.clone());
+        let (coll, said, last) = (coll.clone(), said.clone(), last.clone());
         let f = std::fs::File::from(events);
         let ready = Arc::new(AtomicBool::new(false));
-        std::thread::spawn(move || pump(f, coll, last, ready, || {}))
+        std::thread::spawn(move || pump(f, coll, said, last, ready, || {}))
     };
     live(|l| {
         *l = Some(Live {
@@ -583,6 +616,7 @@ pub(super) fn start_mac(
             platform: Platform::Mac,
             started_unix: unix_now(),
             coll,
+            said,
             last,
             stopping: Arc::new(AtomicBool::new(true)),
             died: Arc::new(AtomicBool::new(false)),
@@ -740,6 +774,9 @@ mod tests {
                 ..Counts::default()
             })
         };
+        // passed on, lost in numbering gaps, all said lost
+        let s = |passed: u64, gaps: u64, lost: u64| Seen { passed, gaps, lost };
+        let p = |passed: u64| s(passed, 0, 0);
         let new = |n: u64, passed: u64| {
             Watch::new(
                 t0,
@@ -747,62 +784,67 @@ mod tests {
                     tries: n,
                     ..Counts::default()
                 },
-                passed,
-                0,
+                p(passed),
             )
         };
         // a quiet VM: never
         let mut w = new(4, 4);
-        assert!((1..20).all(|i| w.tick(at(3 * i), 4, c(4), 4, 0) == Fine));
+        assert!((1..20).all(|i| w.tick(at(3 * i), p(4), c(4), p(4)) == Fine));
         // a reader that keeps up, one message a read, each passed on just
         // after the counters were read
         let mut w = new(0, 0);
-        assert!((1..20).all(|i| w.tick(at(3 * i), i - 1, c(i), i, 0) == Fine));
+        assert!((1..20).all(|i| w.tick(at(3 * i), p(i - 1), c(i), p(i)) == Fine));
         // one attempt before the first read and nothing passed on: the
         // starting point came before the VM, so it's owed at 3, a stall at 9
         let mut w = new(0, 0);
-        assert_eq!(w.tick(at(3), 0, c(1), 0, 0), Fine);
-        assert_eq!(w.tick(at(6), 0, c(1), 0, 0), Fine);
-        assert_eq!(w.tick(at(9), 0, c(1), 0, 0), Stalled);
+        assert_eq!(w.tick(at(3), p(0), c(1), p(0)), Fine);
+        assert_eq!(w.tick(at(6), p(0), c(1), p(0)), Fine);
+        assert_eq!(w.tick(at(9), p(0), c(1), p(0)), Stalled);
         // two sent, one passed on, then it's stuck: owed from 6, stalled at 12
         let mut w = new(0, 0);
-        assert_eq!(w.tick(at(3), 0, c(2), 1, 0), Fine);
-        assert_eq!(w.tick(at(6), 1, c(2), 1, 0), Fine);
-        assert_eq!(w.tick(at(9), 1, c(2), 1, 0), Fine);
-        assert_eq!(w.tick(at(12), 1, c(2), 1, 0), Stalled);
+        assert_eq!(w.tick(at(3), p(0), c(2), p(1)), Fine);
+        assert_eq!(w.tick(at(6), p(1), c(2), p(1)), Fine);
+        assert_eq!(w.tick(at(9), p(1), c(2), p(1)), Fine);
+        assert_eq!(w.tick(at(12), p(1), c(2), p(1)), Stalled);
         // one passed on a few ms after its read: owed for one read, not more
         let mut w = new(5, 5);
-        assert_eq!(w.tick(at(3), 5, c(6), 5, 0), Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), 6, c(6), 6, 0) == Fine));
+        assert_eq!(w.tick(at(3), p(5), c(6), p(5)), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(6), c(6), p(6)) == Fine));
         // passed on between the counters' read and the end of it: before
         // didn't have it, after does, so nothing is owed after
         let mut w = new(5, 5);
-        assert_eq!(w.tick(at(3), 5, c(6), 6, 0), Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), 6, c(6), 6, 0) == Fine));
+        assert_eq!(w.tick(at(3), p(5), c(6), p(6)), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(6), c(6), p(6)) == Fine));
         // lines that aren't messages don't count: passed_on stays put
         let mut w = new(0, 0);
-        assert_eq!(w.tick(at(3), 0, c(10), 0, 0), Fine);
-        assert_eq!(w.tick(at(6), 0, c(20), 0, 0), Fine);
-        assert_eq!(w.tick(at(9), 0, c(30), 0, 0), Stalled);
-        // nflog dropped some and the reader said how many: not owed
+        assert_eq!(w.tick(at(3), p(0), c(10), p(0)), Fine);
+        assert_eq!(w.tick(at(6), p(0), c(20), p(0)), Fine);
+        assert_eq!(w.tick(at(9), p(0), c(30), p(0)), Stalled);
+        // nflog dropped 20, the numbering shows which: not owed
         let mut w = new(100, 100);
-        assert_eq!(w.tick(at(3), 100, c(140), 120, 20), Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), 120, c(140), 120, 20) == Fine));
-        // one lost, said so, and then stuck with the other unread: owed
+        assert_eq!(w.tick(at(3), p(100), c(140), s(120, 20, 21)), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), s(120, 20, 21), c(140), s(120, 20, 21)) == Fine));
+        // an overflow note and a gap for the same message, then stuck with
+        // the last unread: the note doesn't come off, so the last is owed
         let mut w = new(0, 0);
-        assert_eq!(w.tick(at(3), 0, c(2), 0, 1), Fine);
-        assert_eq!(w.tick(at(6), 0, c(2), 0, 1), Fine);
-        assert_eq!(w.tick(at(9), 0, c(2), 0, 1), Fine);
-        assert_eq!(w.tick(at(12), 0, c(2), 0, 1), Stalled);
+        assert_eq!(w.tick(at(3), p(0), c(4), s(2, 1, 2)), Fine);
+        assert_eq!(w.tick(at(6), s(2, 1, 2), c(4), s(2, 1, 2)), Fine);
+        assert_eq!(w.tick(at(9), s(2, 1, 2), c(4), s(2, 1, 2)), Fine);
+        assert_eq!(w.tick(at(12), s(2, 1, 2), c(4), s(2, 1, 2)), Stalled);
+        // a loss shown after the counters' read, of a message they didn't
+        // have yet: it comes off at the next read, which has both
+        let mut w = new(0, 0);
+        assert_eq!(w.tick(at(3), p(0), c(0), s(1, 1, 1)), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), s(1, 1, 1), c(2), s(1, 1, 1)) == Fine));
         // a reload: the counters start over. the 3 since were passed on
         let mut w = new(50, 50);
-        assert_eq!(w.tick(at(3), 50, c(3), 53, 0), Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), 53, c(3), 53, 0) == Fine));
+        assert_eq!(w.tick(at(3), p(50), c(3), p(53)), Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(53), c(3), p(53)) == Fine));
         // and when they weren't, that's owed like any other
         let mut w = new(50, 50);
-        w.tick(at(3), 50, c(3), 50, 0);
-        w.tick(at(6), 50, c(3), 50, 0);
-        assert_eq!(w.tick(at(9), 50, c(3), 50, 0), Stalled);
+        w.tick(at(3), p(50), c(3), p(50));
+        w.tick(at(6), p(50), c(3), p(50));
+        assert_eq!(w.tick(at(9), p(50), c(3), p(50)), Stalled);
         // a flood past the limit while the counters were read: over was read
         // first, so the sum came out high, with the reader busy. the next
         // read, with the flood over, takes it back
@@ -812,22 +854,22 @@ mod tests {
             over: 400,
             ..Counts::default()
         };
-        assert_eq!(w.tick(at(3), 0, Some(busy), 590, 0), Fine);
+        assert_eq!(w.tick(at(3), p(0), Some(busy), p(590)), Fine);
         let done = Counts {
             tries: 1000,
             over: 410,
             ..Counts::default()
         };
-        assert!((2..10).all(|i| w.tick(at(3 * i), 590, Some(done), 590, 0) == Fine));
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(590), Some(done), p(590)) == Fine));
         // counters that can't be read: fine for a while, then nobody can tell
         let mut w = new(0, 0);
-        assert!((1..10).all(|i| w.tick(at(3 * i), 0, None, 0, 0) == Fine));
-        assert_eq!(w.tick(at(30), 0, None, 0, 0), Blind);
+        assert!((1..10).all(|i| w.tick(at(3 * i), p(0), None, p(0)) == Fine));
+        assert_eq!(w.tick(at(30), p(0), None, p(0)), Blind);
         // and a stall seen before they went unreadable still counts
         let mut w = new(0, 0);
-        w.tick(at(3), 0, c(1), 0, 0);
-        assert_eq!(w.tick(at(6), 0, None, 0, 0), Fine);
-        assert_eq!(w.tick(at(9), 0, None, 0, 0), Stalled);
+        w.tick(at(3), p(0), c(1), p(0));
+        assert_eq!(w.tick(at(6), p(0), None, p(0)), Fine);
+        assert_eq!(w.tick(at(9), p(0), None, p(0)), Stalled);
     }
 
     #[test]
@@ -867,9 +909,11 @@ mod tests {
         let eof = Arc::new(AtomicBool::new(false));
         let e = eof.clone();
         let ready = Arc::new(AtomicBool::new(false));
+        let said = Arc::new(AtomicU64::new(0));
         pump(
             &input[..],
             coll.clone(),
+            said.clone(),
             Arc::new(Mutex::new(Instant::now())),
             ready.clone(),
             move || e.store(true, Ordering::SeqCst),
@@ -881,5 +925,7 @@ mod tests {
         // the producer closed, so it's cut off too
         assert_eq!(c.invalid, 4);
         assert_eq!(c.lost, 4);
+        // the producer's own word, kept apart from numbering gaps
+        assert_eq!(said.load(Ordering::SeqCst), 4);
     }
 }
