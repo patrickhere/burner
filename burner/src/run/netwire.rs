@@ -1,8 +1,8 @@
 //! one run's connection log while it's being recorded: the producer (the
 //! nflog reader on linux, macnet on macOS), the thread that folds its lines,
 //! and what happens at the end. the log never decides anything about the
-//! run but this: on linux, a reader that dies while the VM runs stops the
-//! VM, so nothing goes unrecorded
+//! run but this: on linux, a reader that dies or stalls while the VM runs
+//! stops the VM, so nothing goes unrecorded
 
 use std::io::{BufRead, BufReader, Read};
 #[cfg(target_os = "macos")]
@@ -29,6 +29,19 @@ const READY_WAIT: Duration = Duration::from_secs(10);
 pub const READER_DIED: &str =
     "the network log reader stopped, VM stopped so nothing goes unrecorded";
 
+/// and when it was there but stopped reading
+pub const READER_STALLED: &str =
+    "the network log reader stalled, VM stopped so nothing goes unrecorded";
+
+/// how often the watchdog reads the slot's counters
+#[cfg(target_os = "linux")]
+const WATCH_EVERY: Duration = Duration::from_secs(3);
+
+/// how long the reader may say nothing while the counters say the kernel
+/// sent it messages
+#[cfg(any(target_os = "linux", test))]
+const STALL_AFTER: Duration = Duration::from_secs(5);
+
 struct Live {
     id: String,
     mode: Mode,
@@ -38,8 +51,11 @@ struct Live {
     last: Arc<Mutex<Instant>>,
     stopping: Arc<AtomicBool>,
     died: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
     child: Option<Child>,
     thread: Option<JoinHandle<()>>,
+    /// linux: the stall watchdog
+    watch: Option<JoinHandle<()>>,
 }
 
 static LIVE: Mutex<Option<Live>> = Mutex::new(None);
@@ -98,6 +114,93 @@ fn pump(
         }
     }
     on_eof();
+}
+
+/// the stall watchdog's view between two reads of the counters
+#[cfg(any(target_os = "linux", test))]
+struct Watch {
+    /// messages the kernel had sent the reader at the last read
+    sent: Option<u64>,
+    /// just before that read
+    at: Instant,
+    /// more were sent after a read the reader has said nothing since:
+    /// (that read, when it was seen)
+    owed: Option<(Instant, Instant)>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl Watch {
+    fn new(now: Instant) -> Watch {
+        Watch {
+            sent: None,
+            at: now,
+            owed: None,
+        }
+    }
+
+    /// one read at `now` (taken before the counters were): `sent` by the
+    /// counters, None when they can't be read, and the reader's last line.
+    /// true when the reader is stalled. a live reader passes each message
+    /// on within milliseconds, so it has always spoken since a read that
+    /// came before messages it was sent. a filter reload sets the counters
+    /// back, which only lowers `sent`
+    fn tick(&mut self, now: Instant, sent: Option<u64>, last: Instant) -> bool {
+        if self.owed.is_some_and(|(since, _)| last > since) {
+            self.owed = None;
+        }
+        if self.owed.is_none()
+            && let (Some(before), Some(n)) = (self.sent, sent)
+            && n > before
+            && last <= self.at
+        {
+            self.owed = Some((self.at, now));
+        }
+        self.sent = sent;
+        self.at = now;
+        self.owed
+            .is_some_and(|(_, seen)| now.duration_since(seen) >= STALL_AFTER)
+    }
+}
+
+/// linux: every few seconds, the messages the slot's counters say the
+/// kernel sent the reader (attempts but the ones over the limit, let-outs
+/// and replies). if more came and the reader says nothing for STALL_AFTER,
+/// it's stopped (SIGSTOP) or stuck: the VM is stopped as for a dead one
+#[cfg(target_os = "linux")]
+fn watchdog(
+    tap: &str,
+    id: &str,
+    last: &Mutex<Instant>,
+    stopping: &AtomicBool,
+    stalled: &AtomicBool,
+) {
+    let mut w = Watch::new(Instant::now());
+    loop {
+        let until = Instant::now() + WATCH_EVERY;
+        while Instant::now() < until {
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let now = Instant::now();
+        let sent = crate::net::log_counts(tap).map(|c| {
+            c.tries
+                .saturating_sub(c.over)
+                .saturating_add(c.up)
+                .saturating_add(c.down)
+        });
+        let heard = *last.lock().unwrap_or_else(|e| e.into_inner());
+        if stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        if w.tick(now, sent, heard) {
+            stalled.store(true, Ordering::SeqCst);
+            crate::cgroup::kill(id);
+            super::admin::log_line(&format!("{id}: {READER_STALLED}"));
+            return;
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -201,6 +304,17 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
             "the network log reader didn't start, no network without it",
         ));
     }
+    let stalled = Arc::new(AtomicBool::new(false));
+    let watch = {
+        let (last, stopping, stalled, id, tap) = (
+            last.clone(),
+            stopping.clone(),
+            stalled.clone(),
+            id.to_string(),
+            s.tap,
+        );
+        std::thread::spawn(move || watchdog(&tap, &id, &last, &stopping, &stalled))
+    };
     live(|l| {
         *l = Some(Live {
             id: id.into(),
@@ -211,8 +325,10 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
             last,
             stopping,
             died,
+            stalled,
             child: Some(child),
             thread: Some(thread),
+            watch: Some(watch),
         })
     });
     Ok(())
@@ -252,8 +368,10 @@ pub(super) fn start_mac(
             last,
             stopping: Arc::new(AtomicBool::new(true)),
             died: Arc::new(AtomicBool::new(false)),
+            stalled: Arc::new(AtomicBool::new(false)),
             child: None,
             thread: Some(thread),
+            watch: None,
         })
     });
 }
@@ -305,19 +423,29 @@ pub(super) fn stop() {
 /// linux, at each step of starting the VM: a reader that's gone by now
 /// cancels the launch. after the VMM is in its cgroup, a death kills it there
 pub(super) fn alive() -> anyhow::Result<()> {
-    if died() {
+    if let Some(why) = died() {
         return Err(super::exit(
             crate::exit::EXIT_SANDBOX,
             crate::json::Kind::Net,
-            READER_DIED,
+            why,
         ));
     }
     Ok(())
 }
 
-/// whether the reader died under a running VM
-pub(super) fn died() -> bool {
-    live(|l| l.as_ref().is_some_and(|l| l.died.load(Ordering::SeqCst)))
+/// whether the reader died or stalled under a running VM, and what the
+/// run says about it
+pub(super) fn died() -> Option<&'static str> {
+    live(|l| {
+        let l = l.as_ref()?;
+        if l.died.load(Ordering::SeqCst) {
+            Some(READER_DIED)
+        } else if l.stalled.load(Ordering::SeqCst) {
+            Some(READER_STALLED)
+        } else {
+            None
+        }
+    })
 }
 
 /// what --log prints after a run, each line to go after "burner: "
@@ -355,7 +483,7 @@ fn counts(cfg: &Config, id: &str) -> Option<crate::netlog::NetCounts> {
 pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
     stop();
     let mut l = live(|l| l.take())?;
-    if let Some(t) = l.thread.take() {
+    for t in [l.thread.take(), l.watch.take()].into_iter().flatten() {
         let _ = t.join();
     }
     let c = l.coll.lock().unwrap_or_else(|e| e.into_inner()).take()?;
@@ -383,6 +511,48 @@ pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn stalls() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // quiet VM, quiet reader: never
+        let mut w = Watch::new(t0);
+        assert!((1..20).all(|i| !w.tick(at(3 * i), Some(7), t0)));
+        // a live reader speaks right after each message
+        let mut w = Watch::new(t0);
+        assert!((1..20).all(|i| !w.tick(at(3 * i), Some(i), at(3 * i - 1))));
+        // messages after the first read, then nothing from the reader: owed
+        // at 6, stalled once 5s have passed since
+        let mut w = Watch::new(t0);
+        assert!(!w.tick(at(3), Some(10), t0));
+        assert!(!w.tick(at(6), Some(12), at(2)));
+        assert!(!w.tick(at(9), Some(14), at(2)));
+        assert!(w.tick(at(12), Some(16), at(2)));
+        // the reader catching up in time clears it
+        let mut w = Watch::new(t0);
+        w.tick(at(3), Some(10), t0);
+        w.tick(at(6), Some(12), at(2));
+        assert!(!w.tick(at(9), Some(12), at(8)));
+        assert!(!w.tick(at(15), Some(12), at(8)));
+        // a line that came between the counters' read and the tick isn't
+        // owed: it was sent after `at`, and so was the reader's answer
+        let mut w = Watch::new(t0);
+        w.tick(at(3), Some(10), t0);
+        let r = at(3) + Duration::from_millis(20);
+        assert!((2..10).all(|i| !w.tick(at(3 * i), Some(11), r)));
+        // counters that can't be read, or set back by a reload, owe nothing
+        let mut w = Watch::new(t0);
+        w.tick(at(3), Some(50), t0);
+        assert!(!w.tick(at(6), None, t0));
+        assert!(!w.tick(at(9), Some(3), t0));
+        assert!((4..10).all(|i| !w.tick(at(3 * i), Some(3), t0)));
+        // nflog's own loss leaves a gap in the counts that never closes, but
+        // nothing more is sent after it, so nothing is owed
+        let mut w = Watch::new(t0);
+        w.tick(at(3), Some(100), at(2));
+        assert!((2..10).all(|i| !w.tick(at(3 * i), Some(140), at(4))));
+    }
 
     #[test]
     fn long_lines_are_skipped_whole() {

@@ -351,8 +351,7 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
         }
         record::set_network(log);
     }
-    if died {
-        let msg = super::netwire::READER_DIED;
+    if let Some(msg) = died {
         record::set_outcome(
             RunOutcome::SandboxError,
             None,

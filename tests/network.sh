@@ -300,6 +300,21 @@ wait "$dp"
 grep -qx 'rc=125' "$T/death.txt" && grep -q 'network log reader stopped, VM stopped' "$T/death.txt" && [ -z "$(sudo burner ls | grep -v '^no VMs')" ]
 check $? "log: a dead reader stops its VM (125)" "$(tr '\n' ' ' < "$T/death.txt")"
 
+# a reader that's there but stopped (SIGSTOP) while its VM keeps trying: the
+# counters say messages went out and the reader says nothing, so the
+# watchdog stops the VM the same way, within its 3s reads and 5s of silence
+( sudo burner run --img "$IMG" --net web --ttl 2m -- "$PRE"'i=0; while :; do i=$((i + 1)); timeout 1 tcp 10.254.8.$((i % 200 + 1)) 80; sleep 0.2; done' </dev/null > "$T/stall.txt" 2>&1; echo "rc=$?" >> "$T/stall.txt" ) &
+sp=$!
+for _ in $(seq 30); do pgrep -u burner-parse -f -- __read-netlog >/dev/null && break; sleep 1; done
+sleep 3
+s0=$(date +%s)
+sudo pkill -STOP -u burner-parse -f -- __read-netlog
+wait "$sp"
+s1=$(date +%s)
+grep -qx 'rc=125' "$T/stall.txt" && grep -q 'network log reader stalled, VM stopped' "$T/stall.txt" && [ $((s1 - s0)) -le 30 ] \
+  && [ -z "$(sudo burner ls | grep -v '^no VMs')" ] && [ -z "$(pgrep -u burner-parse -f -- __read-netlog)" ]
+check $? "log: a stalled reader (SIGSTOP) stops its VM (125, $((s1 - s0))s)" "$(tr '\n' ' ' < "$T/stall.txt") left=$(pgrep -u burner-parse -f -- __read-netlog | tr '\n' ' ')"
+
 # the same while the VM is still starting: the reader killed as soon as it
 # shows up, before or after it said it's ready. the run never goes on
 # without it, it ends 125 either way
