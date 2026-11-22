@@ -20,6 +20,9 @@ SHARE=/usr/local/share/burner
 ui() {
     TTY=""
     [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ] && TTY=1
+    # questions only need someone at a terminal, with or without color
+    ASK=""
+    [ -t 1 ] && ASK=1
     if [ -n "$TTY" ]; then
         B=$(printf '\033[1m') D=$(printf '\033[2m') R=$(printf '\033[0m')
         F=$(printf '\033[38;5;208m') G=$(printf '\033[32m') Y=$(printf '\033[33m') E=$(printf '\033[31m')
@@ -89,7 +92,7 @@ as_root_n() {
 # a question on the terminal, even with this script on stdin. nothing when
 # there's no terminal to ask on
 ask() { # prompt
-    [ -n "$TTY" ] && (: </dev/tty) 2>/dev/null || return 1
+    [ -n "$ASK" ] && (: </dev/tty) 2>/dev/null || return 1
     printf '  %s?%s %s ' "$F" "$R" "$1" >/dev/tty
     read -r answer </dev/tty || return 1
 }
