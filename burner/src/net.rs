@@ -1328,7 +1328,9 @@ pub fn tunnels(routes: &[RouteLine]) -> Vec<Tunnel> {
     for r in routes.iter().filter(|r| is_vpn_dev(&r.dev)) {
         let t = if r.prefix == 0 && r.table == "main" {
             Tunnel::Default { dev: r.dev.clone() }
-        } else if r.prefix == 0 && r.table != "local" {
+        } else if r.prefix == 0 && r.table != "local" && r.table != RT_TABLE {
+            // burner's own VM table is the uplink's default route, a vpn's
+            // too once the uplink moved there
             Tunnel::Policy {
                 dev: r.dev.clone(),
                 table: r.table.clone(),
@@ -2058,6 +2060,19 @@ pub(crate) mod tests {
         assert!(t(HOMELAB_ROUTES).is_empty());
         assert!(t(r#"[{"dst":"0.0.0.0/1","dev":"tun0","flags":[]}]"#).is_empty());
         assert!(t("not json").is_empty());
+        // once the uplink is the vpn, burner's own table names it: that's
+        // the vpn's default route in main, not policy routing around it
+        let mut moved: Vec<RouteLine> = route_lines(OPENVPN_DEFAULT.as_bytes());
+        moved.push(RouteLine {
+            dst: Ipv4Addr::UNSPECIFIED,
+            prefix: 0,
+            dev: "tun0".into(),
+            table: RT_TABLE.into(),
+        });
+        assert_eq!(
+            tunnels(&moved),
+            vec![Tunnel::Default { dev: "tun0".into() }]
+        );
         assert!(!is_vpn_dev("bn3") && !is_vpn_dev("eth0") && is_vpn_dev("utun4"));
         let w = tunnel_words(
             &Tunnel::Halves {
