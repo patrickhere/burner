@@ -22,6 +22,7 @@
 - `tests/remote.sh`: burner -H over ssh to localhost, with a stand-in for the far end or the real burner
 - a debian 13 image next to alpine, `--img debian` or `burner shell debian`, with python3, curl, sudo and gpg (no git). on linux `tools/build-image debian` builds it with mmdebstrap from a pinned snapshot.debian.org timestamp, and the build fails unless every package matches the lock file for that arch. on a mac `burner setup debian` fetches it, checked against the release and the homebrew formula's pin. the release carries it for x86_64 and aarch64, with its package list
 - `burner setup` takes image names, `burner setup alpine debian`. no names is alpine, as before
+- `--img debian` (or alpine) on a box that doesn't have it says how to get it: `tools/build-image debian` on linux, `burner setup debian` on a mac
 - commands in a run use the image's `/bin/sh`: busybox ash on alpine, dash on debian
 - a run ends about a tenth of a second sooner: guest init no longer starts a `cat` for every process when it looks for leftovers after the job
 - guest init mounts `/dev/shm`, falls back to `xterm-256color` when the image has no terminfo entry for your terminal (kitty, ghostty), and checks at build time that an image has every tool it needs
