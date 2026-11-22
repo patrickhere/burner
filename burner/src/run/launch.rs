@@ -244,12 +244,26 @@ pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
         }
     };
     let f = record::finish(t0, code, failed);
+    if no_net_hint(cfg, a, &f) {
+        eprintln!("burner: this run had no network (--net web for http and https)");
+    }
     crate::runlog::keep(crate::runlog::Ended::Here {
         cfg,
         args: a,
         fin: &f,
     });
     finished(a, f)
+}
+
+/// a run left at --net none whose command failed: maybe it wanted the
+/// network. only when this machine allows web
+fn no_net_hint(cfg: &Config, a: &RunArgs, f: &record::Finished) -> bool {
+    !a.shell
+        && !quiet()
+        && a.net_default()
+        && f.outcome == RunOutcome::Exited
+        && f.rc.is_some_and(|rc| rc != 0)
+        && net::Mode::parse(&cfg.limits.net).is_some_and(|m| m >= net::Mode::Web)
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {

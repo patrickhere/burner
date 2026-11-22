@@ -43,9 +43,10 @@ pub struct RunArgs {
     /// a label for burner ls
     #[arg(long)]
     tag: Option<String>,
-    /// network: none, web (http/https, dns, ping) or open (any port but mail). never the LAN
-    #[arg(long, default_value = "none")]
-    net: String,
+    /// network: none (the default), web (http/https, dns, ping) or open (any
+    /// port but mail). never the LAN
+    #[arg(long)]
+    net: Option<String>,
     /// the older one-line form of --json-fd: outcome, rc, exit, id and secs
     #[arg(long, value_name = "FD")]
     pub(super) status_fd: Option<i32>,
@@ -77,9 +78,6 @@ pub struct RunArgs {
     cmd: Vec<String>,
     #[arg(skip)]
     pub(super) shell: bool,
-    /// --net wasn't given: lower it to limits.net instead of refusing
-    #[arg(skip)]
-    net_default: bool,
 }
 
 #[derive(Args)]
@@ -183,7 +181,15 @@ impl RunArgs {
 
     /// --net as given, before limits.net lowers a default
     pub fn net(&self) -> &str {
-        &self.net
+        self.net
+            .as_deref()
+            .unwrap_or(if self.shell { "web" } else { "none" })
+    }
+
+    /// --net wasn't given: a shell's default is lowered to limits.net
+    /// instead of refused, and a run that fails says it had no network
+    pub(super) fn net_default(&self) -> bool {
+        self.net.is_none()
     }
 
     /// the command as the VM's sh gets it, empty for a shell
@@ -211,8 +217,8 @@ impl RunArgs {
         if let Some(t) = &self.ttl {
             parse_ttl(t, u32::MAX).map_err(|e| e.to_string())?;
         }
-        if net::Mode::parse(&self.net).is_none() {
-            return Err(format!("--net {:?}: use none, web or open", self.net));
+        if net::Mode::parse(self.net()).is_none() {
+            return Err(format!("--net {:?}: use none, web or open", self.net()));
         }
         if !valid_name(&self.img) {
             return Err(format!("unknown image {:?} (burner images)", self.img));
@@ -258,7 +264,8 @@ impl RunArgs {
         opt("disk", self.disk.map(|n| n.to_string()));
         opt("ttl", self.ttl.clone());
         opt("tag", self.tag.clone());
-        opt("net", (!self.net_default).then(|| self.net.clone()));
+        // only when given: the far end's default is the same
+        opt("net", self.net.clone());
         // the summary is printed there, on the stderr that comes back here
         opt(
             "log",
@@ -315,7 +322,6 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         input: Input::None,
         result: None,
         tag: a.tag.clone(),
-        net_default: a.net.is_none(),
         status_fd: None,
         json_fd: a.json_fd,
         log: a.log,
@@ -323,7 +329,7 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         json_mark: a.json_mark.clone(),
         wait: a.wait.clone(),
         remote: a.remote.clone(),
-        net: a.net.clone().unwrap_or_else(|| "web".into()),
+        net: a.net.clone(),
         cmd: vec!["true".into()],
         shell: true,
     }
@@ -596,14 +602,15 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         None if a.shell => 3600.min(max_ttl),
         None => d.ttl_secs.unwrap_or(600).clamp(10, max_ttl),
     };
-    let mut net = net::Mode::parse(&a.net)
-        .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net)))?;
+    let mut net = net::Mode::parse(a.net())
+        .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net())))?;
     let ceiling = net::Mode::parse(&cfg.limits.net).unwrap_or(net::Mode::None);
     if net > ceiling {
-        if !a.net_default {
+        if !a.net_default() {
             return Err(usage(format!(
                 "--net {} is more than this machine allows (limits.net = {})",
-                a.net, cfg.limits.net
+                a.net(),
+                cfg.limits.net
             )));
         }
         net = ceiling;
@@ -819,8 +826,7 @@ mod tests {
         assert_eq!(
             j[3..],
             [
-                "--net", "none", "--img", "alpine", "--in", "tar", "--result", "tar", "--json",
-                "--", "x"
+                "--img", "alpine", "--in", "tar", "--result", "tar", "--json", "--", "x"
             ]
         );
     }
