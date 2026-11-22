@@ -254,8 +254,8 @@ pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
         }
     };
     let f = record::finish(t0, code, failed);
-    if no_net_hint(cfg, a, &f) {
-        eprintln!("burner: this run had no network (--net web for http and https)");
+    if let Some(hint) = no_net_hint(cfg, a, &f) {
+        json::note_warning(Kind::NoNet, hint, !quiet());
     }
     crate::runlog::keep(crate::runlog::Ended::Here {
         cfg,
@@ -266,14 +266,22 @@ pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
 }
 
 /// a run left at --net none whose command failed: maybe it wanted the
-/// network. only when this machine allows web
-fn no_net_hint(cfg: &Config, a: &RunArgs, f: &record::Finished) -> bool {
-    !a.shell
-        && !quiet()
-        && a.net_default()
-        && f.outcome == RunOutcome::Exited
-        && f.rc.is_some_and(|rc| rc != 0)
-        && net::Mode::parse(&cfg.limits.net).is_some_and(|m| m >= net::Mode::Web)
+/// network
+fn no_net_hint(cfg: &Config, a: &RunArgs, f: &record::Finished) -> Option<&'static str> {
+    if a.shell
+        || !a.net_default()
+        || f.outcome != RunOutcome::Exited
+        || f.rc.is_none_or(|rc| rc == 0)
+    {
+        return None;
+    }
+    Some(
+        if net::Mode::parse(&cfg.limits.net).is_some_and(|m| m >= net::Mode::Web) {
+            "this run had no network (--net web for http and https)"
+        } else {
+            "this run had no network, and this machine allows none (limits.net)"
+        },
+    )
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {

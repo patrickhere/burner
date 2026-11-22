@@ -201,7 +201,7 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 
 errors: `usage`, `not_root`, `root`, `no_tty`, `unknown_image`, `config`, `unsupported` (not on this OS), `busy`, `no_reaper`, `no_public_ip`, `disk_full`, `sandbox`, `guest`, `input`, `timeout`, `interrupted`, `killed`, `poweroff`, `reboot`, `result_lost` (the result tar didn't get to you, or over `-H` didn't check out when it was parsed again here), `not_found`, `not_owner`, `still_stopping`, `doctor_failed`, `net`, `io` (anything else), and over `-H` `unreachable`, `remote_error`, `lost`, the same as the outcomes.
 
-warnings: `queued` (waited for a slot), `output` (output cut or dropped), `vmm` (the VMM's own log, or a VM that stopped before the job), `oom`, `image` (an image's guest init or defaults), `result` (something in the result was dropped), `shell` (how a shell ended when that wasn't a failure), `unverified` (setup: what wasn't checked).
+warnings: `queued` (waited for a slot), `output` (output cut or dropped), `vmm` (the VMM's own log, or a VM that stopped before the job), `oom`, `image` (an image's guest init or defaults), `result` (something in the result was dropped), `shell` (how a shell ended when that wasn't a failure), `unverified` (setup: what wasn't checked), `no_net` (a run without `--net` whose command exited non-zero: it had no network).
 
 ## --status-fd
 
