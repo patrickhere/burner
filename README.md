@@ -69,10 +69,10 @@ the usual `curl ... | bash`, with the script running in a VM instead of on your 
 curl -fsSL https://example.com/install.sh | sudo burner run --net web --in stdin -- bash
 ```
 
-your machine downloads the script and the VM runs it, with http, https and dns out and nothing else. or let the VM fetch it too, so the script never lands on your machine at all:
+your machine downloads the script and the VM runs it, with http, https and dns out and nothing else. a download that breaks off halfway still hands the VM half a script and the pipe still says 0, so `set -o pipefail` in your shell makes that show. or let the VM fetch it too, so the script never lands on your machine at all, and only runs once it's all there:
 
 ```
-sudo burner run --net web -- 'curl -fsSL https://example.com/install.sh | bash'
+sudo burner run --net web -- 'curl -fsSLo /tmp/install.sh https://example.com/install.sh && bash /tmp/install.sh'
 ```
 
 both images have bash. an installer that expects glibc or apt wants `--img debian`, and a big one `--disk 8 --ttl 30m`. burner exits with the script's exit code, and the summary on stderr says where it went:
