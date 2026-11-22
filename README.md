@@ -47,7 +47,7 @@ tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d
 
 exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
-the image is plain alpine with git and curl, so the first example installs node itself. there's a debian 13 image too, `--img debian` or `burner shell debian`, for install scripts and `apt install` steps that expect debian. it has python3, curl, sudo and gpg but no git (`apt-get install -y git` with `--net web`). build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
+the image is plain alpine with git, curl and bash, so the first example installs node itself. there's a debian 13 image too, `--img debian` or `burner shell debian`, for install scripts and `apt install` steps that expect debian. it has python3, curl, sudo and gpg but no git (`apt-get install -y git` with `--net web`). installers that expect glibc: `--img debian`, alpine has musl. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
 
 defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml`). an image's `defaults.toml` can change the defaults:
 
@@ -55,7 +55,7 @@ defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml
 |---|---|---|
 | cpus | 1 | 2 |
 | memory | 512M | 3072M per VM, 3072M for all VMs together |
-| scratch disk | 2G | 8G |
+| scratch disk | 2G, 4G on debian | 8G |
 | time | 10 min for run, 60 min for shell | 30 min for run, 60 for shell |
 | network | none for run, web for shell | web, `open` only if you set `net = "open"` |
 | VMs at once | | 2, the rest wait |
@@ -196,7 +196,7 @@ an image is `images/NAME/packages`, one alpine package per line. `tools/build-im
 
 an image with an `images/NAME/base` file is debian instead, like `images/debian`. `base` names the suite and a snapshot.debian.org timestamp (`debian trixie 20261121T000000Z`), and `tools/build-image NAME` builds it with mmdebstrap from that snapshot: debian's Essential set and apt, plus one debian package per line from `packages`. it needs mmdebstrap on the host, `sudo apt install mmdebstrap` on debian and ubuntu or `sudo dnf install mmdebstrap` on fedora. apt checks the snapshot against the keys in `keys.asc` only, and the build fails unless every package and version matches `lock-x86_64` or `lock-aarch64`, so a debian image built anywhere from the same base has the same packages in it. the snapshot moves once per burner release: after bumping `base`, `BURNER_RELOCK=1 tools/build-image NAME` writes the lock for that arch. in a VM, apt uses debian's own mirrors and gets today's packages.
 
-a few things work differently on debian. commands run under the image's `/bin/sh`, which is dash there and busybox ash on alpine, so use `bash -c '...'` when you need bash. an `--in tar` with `../` in a name fails with 125 and `input_error`, since GNU tar refuses it where busybox drops the `../`. what apt installs goes on the scratch disk, so give big installs `--disk 4` or more.
+a few things work differently on debian. commands run under the image's `/bin/sh`, which is dash there and busybox ash on alpine, so use `bash -c '...'` when you need bash. an `--in tar` with `../` in a name fails with 125 and `input_error`, since GNU tar refuses it where busybox drops the `../`. what apt installs goes on the scratch disk, which is 4G on debian, so give big installs `--disk 8`.
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, which starts out empty: put only what you change there. `burner config` shows every setting with the defaults filled in.
 

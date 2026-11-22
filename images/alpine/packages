@@ -2,3 +2,4 @@
 git
 curl
 ca-certificates
+bash                # install scripts piped to bash, about 1M
