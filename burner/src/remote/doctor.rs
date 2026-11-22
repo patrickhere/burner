@@ -281,6 +281,15 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
             format!("ssh'd in as uid {uid}, burner runs without sudo"),
         );
     } else {
+        // the rule install.sh --allow writes, and how to get it there
+        let rule_user = if c.pick.conf.user.is_empty() {
+            "USER"
+        } else {
+            c.pick.conf.user.as_str()
+        };
+        let allow = format!(
+            "sudo /usr/local/share/burner/current/install.sh --allow {rule_user} there (install.sh in burner's source for a cargo install)"
+        );
         // log and explain are lines of their own in the example rule, and
         // only those two commands need them
         let optional = |c: &str| c == "log" || c == "explain";
@@ -319,7 +328,7 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
                 Level::Fail,
                 "sudo",
                 format!(
-                    "no NOPASSWD rule there for burner {}: -H needs one, see dist/sudoers.example",
+                    "no NOPASSWD rule there for burner {}: -H needs one. {allow} writes it",
                     no.join(", ")
                 ),
             );
@@ -329,19 +338,26 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
                 Level::Warn,
                 "sudo",
                 format!(
-                    "the sudo rule there doesn't cover burner {}, so -H {name} {} won't work: \
-                     add their lines from dist/sudoers.example",
+                    "the sudo rule there doesn't cover burner {}, so -H {name} {} won't work: rerun {allow}",
                     no_opt.join(" or "),
                     no_opt.join(" and ")
                 ),
             );
         }
+        // the rule from 0.3.1 on has doctor and doctor --json; one from
+        // before doesn't, and doctor then runs without root there
         if s.sudo.iter().any(|(c, ok)| c == "doctor" && !ok) {
-            r.line(
-                Level::Warn,
-                "doctor",
-                format!("burner doctor needs root there and the sudo rule doesn't cover it: ssh -t {} sudo burner doctor", c.pick.addr),
-            );
+            let detail = if config.is_empty() {
+                format!(
+                    "the sudo rule there is older than burner 0.3.1 and doesn't cover burner doctor, \
+                     so it ran without root and skipped some checks: rerun {allow}"
+                )
+            } else {
+                "the sudo rule doesn't cover burner doctor with --config, so it ran without root \
+                 there and skipped some checks"
+                    .to_string()
+            };
+            r.line(Level::Warn, "doctor", detail);
         }
     }
     if let Some(b) = &s.broken {
@@ -377,6 +393,44 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
         }
     }
     done(r)
+}
+
+/// the far end as a hint needs it: its OS as its wrapper says (Darwin,
+/// Linux) and the address that answered, as user@addr when hosts.toml names
+/// a user. None when no address answers or it says nothing within ~10s
+pub fn far_end(host: &Host) -> Option<(String, String)> {
+    let c = Conn::open(host).ok()?;
+    let o = Opts {
+        no_stdin: true,
+        batch: true,
+        ..Default::default()
+    };
+    let mut cmd = c.command(o, Mode::User, &["version".to_string()]).ok()?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().ok()?;
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let sink = Arc::new(Out::new(Dest::Null));
+    let errs = child
+        .stderr
+        .take()
+        .map(|e| client::read_records(e, &c.nonce, seen.clone(), sink));
+    let until = std::time::Instant::now() + host.timeout + Duration::from_secs(10);
+    let read = errs.and_then(|h| client::join_until(h, until));
+    let _ = child.kill();
+    let _ = child.wait();
+    read?;
+    let s = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if s.broken.is_some() {
+        return None;
+    }
+    let (os, ..) = s.wrap.clone()?;
+    let addr = match &host.user {
+        Some(u) => format!("{u}@{}", c.pick.addr),
+        None => c.pick.addr.clone(),
+    };
+    Some((os, addr))
 }
 
 fn done(r: Report) -> ExitCode {

@@ -396,7 +396,8 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         Cmd::Doctor(a) if !a.probe => remote::doctor::doctor(&host, &config),
         Cmd::Doctor(_) => {
             return usage(format!(
-                "burner doctor --probe runs on the machine itself, not over -H (ssh -t {h} sudo burner doctor --probe)"
+                "burner doctor --probe runs on the machine itself, not over -H ({})",
+                run_there(&host, &typed_words()).1
             ));
         }
         // the summary after a run over -H names a log that's kept there
@@ -423,11 +424,63 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         },
         _ => {
             let what = name.split(' ').next().unwrap_or(name);
+            let (os, there) = run_there(&host, &typed_words());
+            if what == "net" && os.as_deref() == Some("Darwin") {
+                return usage(format!(
+                    "burner net is for linux: {h} is a mac, where each VM's network is a process of its own and there's nothing to set up"
+                ));
+            }
             return usage(format!(
-                "burner {what} runs on the machine itself, not over -H (ssh {h} sudo burner {name}, or -H local here)"
+                "burner {what} runs on the machine itself, not over -H ({there}, or -H local here)"
             ));
         }
     })
+}
+
+/// the command line as typed, without -H, --json and --config, quoted for a
+/// shell: what to run on the host itself
+fn typed_words() -> String {
+    words_there(std::env::args().skip(1))
+}
+
+fn words_there(mut args: impl Iterator<Item = String>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--" => {
+                out.push(a);
+                out.extend(args.by_ref());
+            }
+            "-H" | "--host" | "--config" => {
+                args.next();
+            }
+            "--json" => {}
+            _ if a.starts_with("--host=") || a.starts_with("--config=") => {}
+            _ if a.starts_with("-H") => {}
+            _ => out.push(a),
+        }
+    }
+    remote::frame::printable(&remote::quote::line(&out), 200)
+}
+
+/// how to run it on the host itself: `ssh mini burner setup debian` on a
+/// mac, `ssh -t mini sudo burner setup debian` on linux. the far end is
+/// asked which it is; when it doesn't answer, the hint says both. also the
+/// OS it said
+fn run_there(host: &remote::hosts::Host, words: &str) -> (Option<String>, String) {
+    let burner = host.burner.as_deref().unwrap_or("burner");
+    let burner = remote::frame::printable(&remote::quote::remote(burner), 200);
+    match remote::doctor::far_end(host) {
+        Some((os, addr)) if os == "Darwin" => (Some(os), format!("ssh {addr} {burner} {words}")),
+        Some((os, addr)) => (Some(os), format!("ssh -t {addr} sudo {burner} {words}")),
+        None => (
+            None,
+            format!(
+                "ssh -t {} sudo {burner} {words}, without the sudo on a mac",
+                host.name
+            ),
+        ),
+    }
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -584,5 +637,28 @@ mod tests {
         assert_eq!(w(&["net", "sideways"]), None);
         assert_eq!(w(&["reap", "--json"]), None);
         assert_eq!(w(&["--json"]), None);
+    }
+
+    #[test]
+    fn words_for_the_host_itself() {
+        let w = |a: &[&str]| words_there(a.iter().map(|s| s.to_string()));
+        assert_eq!(w(&["-H", "mini", "setup", "debian"]), "setup debian");
+        assert_eq!(
+            w(&[
+                "--json",
+                "--host=mini",
+                "--config",
+                "/x",
+                "doctor",
+                "--probe",
+                "-Hmini"
+            ]),
+            "doctor --probe"
+        );
+        assert_eq!(w(&["net", "up", "--config=/etc/x.toml"]), "net up");
+        assert_eq!(
+            w(&["setup", "it's", "\u{1b}]0;x"]),
+            "setup 'it'\\''s' '?]0;x'"
+        );
     }
 }
