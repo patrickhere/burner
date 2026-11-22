@@ -1,6 +1,6 @@
 [package]
 name = "burnervm"
-version = "0.2.1"
+version = "0.3.0"
 description = "throwaway linux VMs on your own hardware: firecracker microVMs you get a shell in or run a command in, deleted when you're done"
 readme = "../README.md"
 keywords = ["firecracker", "microvm", "sandbox", "kvm", "vm"]
