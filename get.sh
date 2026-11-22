@@ -436,8 +436,12 @@ main() {
 
     # a new release brings its images along: more than the guest init can
     # change between them (bash in alpine, debian's disk in 0.3.1)
+    # marked until they're through, so a run that stops before then (a
+    # failed fetch, ctrl-c) leaves the next one, already on this release, to
+    # bring them along
     upgraded=""
-    [ "v$old" = "$version" ] || upgraded=1
+    [ "v$old" = "$version" ] || as_root touch "$SHARE/.refresh-images"
+    [ -e "$SHARE/.refresh-images" ] && upgraded=1
     if ! as_root /usr/local/bin/burner images 2>/dev/null | grep -qx alpine \
         || grep -q 'rebuild alpine' "$LOG" || { [ -n "$upgraded" ] && in_release alpine; }; then
         image alpine
@@ -459,6 +463,8 @@ main() {
             image debian
         fi
     fi
+
+    as_root rm -f "$SHARE/.refresh-images"
 
     # the first sentence of each doctor warning, doctor itself has the rest
     warns=$(as_root /usr/local/bin/burner doctor 2>/dev/null | sed -n 's/^warn *[a-z]* *//p')
