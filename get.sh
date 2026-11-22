@@ -193,6 +193,7 @@ mac_uninstall() {
 linux_uninstall() {
     [ -x "$SHARE/current/install.sh" ] || die "there's no $SHARE/current/install.sh, so burner wasn't installed by this script." \
         "run sudo ./install.sh --uninstall from the release you installed by hand."
+    roots_alone "$SHARE/current/install.sh" || die "$SHARE/current/install.sh isn't root's alone, so it won't run it as root"
     # an install.sh before 0.3.1 doesn't know --purge, that part is done here then
     how=--uninstall
     if [ -n "$purge" ] && grep -q -- '--purge)' "$SHARE/current/install.sh"; then how=--purge; fi
@@ -242,15 +243,10 @@ download() {
     as_root sh -c 'cd "$1" && grep " $2.tar.gz\$" SHA256SUMS | sha256sum -c -' sh "$tmp" "$name"
 }
 
-# into $SHARE/.new, so the release that's there stays whole until this one
-# is installed
-unpack() {
-    # kept, so tools/build-image is there for more images later
-    # explicit mode: a root umask of 077 would make it unreadable to the build step
-    as_root install -d -m 0755 "$SHARE"
-    # root runs install.sh from in there: nobody else may be able to write it
-    # or anything above it, the path as written or where it leads
-    for p in "$SHARE" "$(readlink -f "$SHARE")"; do
+# root runs install.sh from $SHARE: nobody else may be able to write a path
+# there or any dir above it, as written or where it leads
+roots_alone() { # path
+    for p in "$1" "$(readlink -f "$1")"; do
         while [ -n "$p" ] && [ "$p" != / ]; do
             [ "$(stat -c %u "$p")" = 0 ] || { echo "$p isn't owned by root" >&2; return 1; }
             case "$(stat -c %A "$p")" in
@@ -259,6 +255,15 @@ unpack() {
             p=$(dirname "$p")
         done
     done
+}
+
+# into $SHARE/.new, so the release that's there stays whole until this one
+# is installed
+unpack() {
+    # kept, so tools/build-image is there for more images later
+    # explicit mode: a root umask of 077 would make it unreadable to the build step
+    as_root install -d -m 0755 "$SHARE"
+    roots_alone "$SHARE" || return 1
     as_root rm -rf "$SHARE/.new"
     as_root install -d -m 0755 "$SHARE/.new"
     as_root tar -xzf "$tmp/$name.tar.gz" -C "$SHARE/.new" --no-same-owner
@@ -270,6 +275,7 @@ unpack() {
 # at in .old: back it goes
 recover_share() {
     [ -d "$SHARE/.old" ] || return 0
+    roots_alone "$SHARE/.old" || die "$SHARE isn't root's alone, so this won't touch it"
     cur=$(readlink "$SHARE/current" 2>/dev/null) || return 0
     [ -e "$SHARE/$cur" ] || as_root mv -T "$SHARE/.old" "$SHARE/$cur"
 }
