@@ -44,6 +44,31 @@ jobs:
             file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
             "$f" --version
           done
+      # what install.sh and the formula install: completions for each shell
+      # and a man page per command, none of them for a hidden one
+      - name: completions and man pages
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          b="target/$TARGET/release/burner"
+          for sh in bash zsh fish elvish powershell; do
+            "$b" completions "$sh" > "$RUNNER_TEMP/comp-$sh"
+            grep -q 'burner' "$RUNNER_TEMP/comp-$sh"
+            if grep -qwE '__man|__parse-result|__read-netlog|reap' "$RUNNER_TEMP/comp-$sh"; then
+              echo "$sh completions offer a hidden command" >&2
+              exit 1
+            fi
+          done
+          bash -n "$RUNNER_TEMP/comp-bash"
+          "$b" __man "$RUNNER_TEMP/man"
+          for p in burner burner-run burner-shell burner-setup burner-completions; do
+            [ -s "$RUNNER_TEMP/man/$p.1" ] || { echo "no $p.1" >&2; exit 1; }
+          done
+          for f in "$RUNNER_TEMP/man"/*; do
+            case "${f##*/}" in
+              *__* | *reap*) echo "a man page for a hidden command: $f" >&2; exit 1 ;;
+            esac
+          done
       - name: package
         env:
           TAG: ${{ github.ref_name }}

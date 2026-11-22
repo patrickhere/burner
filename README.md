@@ -225,6 +225,8 @@ an image with an `images/NAME/base` file is debian instead, like `images/debian`
 
 a few things work differently on debian. commands run under the image's `/bin/sh`, which is dash there and busybox ash on alpine, so use `bash -c '...'` when you need bash. an `--in tar` with `../` in a name fails with 125 and `input_error`, since GNU tar refuses it where busybox drops the `../`. what apt installs goes on the scratch disk, which is 4G on debian, so give big installs `--disk 8`.
 
+`install.sh` also puts completions for bash, zsh and fish and a man page per command (`man burner-run`) under `/usr/local/share`, made by the burner it installs, and homebrew does the same on a mac. `burner completions SHELL` prints them for anywhere else, elvish and powershell included.
+
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, which starts out empty: put only what you change there. `burner config` shows every setting with the defaults filled in.
 
 ## upgrade and uninstall

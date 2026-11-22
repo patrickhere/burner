@@ -3,8 +3,8 @@
 # checkout after `cargo build --release`:
 #   sudo ./install.sh
 # downloads firecracker, the jailer and a guest kernel (pinned and checksummed),
-# creates the burner-parse user, installs the binary and systemd
-# units, then runs burner doctor. everything is downloaded and checked before
+# creates the burner-parse user, installs the binary, its completions and man
+# pages and the systemd units, then runs burner doctor. everything is downloaded and checked before
 # anything already installed is replaced. safe to run again to upgrade.
 #   --force         upgrade even with VMs running
 #   --allow USER    let USER run VMs through sudo with no password, the rule
@@ -20,6 +20,11 @@ KERNEL_VERSION=6.1.188
 ROOT=/var/lib/burner
 BIN=/usr/local/bin/burner
 TUI=/usr/local/bin/burner-tui
+# completions and man pages, made by the binary itself
+COMP_BASH=/usr/local/share/bash-completion/completions/burner
+COMP_ZSH=/usr/local/share/zsh/site-functions/_burner
+COMP_FISH=/usr/local/share/fish/vendor_completions.d/burner.fish
+MAN1=/usr/local/share/man/man1
 
 RULE=/etc/sudoers.d/burner
 # the first line of a rule this script wrote, so it knows to keep it current
@@ -76,7 +81,7 @@ uninstall() {
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
     rm -rf "$ROOT" /run/burner
-    rm -f "$BIN" "$TUI"
+    rm -f "$BIN" "$TUI" "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
     for u in burner-parse burner; do
         if id "$u" >/dev/null 2>&1; then userdel "$u"; fi
     done
@@ -208,6 +213,17 @@ if [ -n "$allow" ]; then
     command -v visudo >/dev/null 2>&1 || die "--allow needs sudo installed (visudo checks the rule)"
 fi
 
+# completions and man pages from this release's burner, so they have its flags
+extras=""
+mkdir "$work/comp"
+if "$bin" completions bash > "$work/comp/bash" 2>/dev/null && "$bin" completions zsh > "$work/comp/zsh" 2>/dev/null \
+    && "$bin" completions fish > "$work/comp/fish" 2>/dev/null && "$bin" __man "$work/man" >/dev/null 2>&1 \
+    && [ -s "$work/man/burner.1" ]; then
+    extras=1
+else
+    echo "$bin made no completions or man pages, so they're left out"
+fi
+
 # VMs run as uids from jail.uid_base, no account needed. a burner user from an
 # older install stays until --uninstall: VMs started before the upgrade run as it
 account burner-parse
@@ -284,6 +300,25 @@ fi
 # the tui is optional, it only runs the burner binary
 if [ -f "$tui" ] && [ -x "$tui" ]; then
     put 0755 "$tui" "$TUI"
+fi
+# every user's shell reads these, so only into dirs nobody else can write
+extra() { # src dest
+    install -d -m 0755 "$(dirname "$2")"
+    if (root_only "$(dirname "$2")") 2>/dev/null; then
+        put 0644 "$1" "$2"
+    else
+        echo "left out $2: $(dirname "$2") isn't root's alone"
+    fi
+}
+if [ -n "$extras" ]; then
+    extra "$work/comp/bash" "$COMP_BASH"
+    extra "$work/comp/zsh" "$COMP_ZSH"
+    extra "$work/comp/fish" "$COMP_FISH"
+    # a page for a command this release doesn't have goes
+    rm -f "$MAN1/burner.1" "$MAN1"/burner-*.1
+    for f in "$work/man"/burner*.1; do
+        extra "$f" "$MAN1/$(basename "$f")"
+    done
 fi
 
 install -d -m 0755 /etc/burner

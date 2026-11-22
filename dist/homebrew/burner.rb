@@ -60,6 +60,11 @@ class Burner < Formula
     end
     # hypervisor.framework only makes VMs for a binary signed with this entitlement
     system "codesign", "--force", "--sign", "-", "--entitlements", entitlements, bin/"burner"
+    # completions and man pages from burner's own command line, so they
+    # always have this version's flags
+    generate_completions_from_executable(bin/"burner", "completions")
+    system bin/"burner", "__man", buildpath/"man"
+    man1.install Dir[buildpath/"man/*.1"]
     resource("guest-kernel").stage { pkgshare.install "vmlinux-aarch64" }
     resource("alpine-image").stage { pkgshare.install "alpine-aarch64.ext4.gz" }
     # the debian image isn't fetched here, so brew install doesn't download it
@@ -88,6 +93,9 @@ class Burner < Formula
     assert_match "com.apple.security.hypervisor",
                  shell_output("codesign -d --entitlements - --xml #{bin}/burner 2>/dev/null")
     assert_match "https:// or file://", shell_output("#{bin}/burner setup --from ftp://example.com 2>&1", 1)
+    assert_match "_burner", shell_output("#{bin}/burner completions bash")
+    assert_path_exists man1/"burner.1"
+    assert_path_exists man1/"burner-run.1"
     assert_path_exists pkgshare/"vmlinux-aarch64"
     assert_path_exists pkgshare/"alpine-aarch64.ext4.gz"
     pin = (pkgshare/"pins").read
