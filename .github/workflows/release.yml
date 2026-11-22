@@ -32,9 +32,12 @@ jobs:
         with:
           persist-credentials: false
       - name: toolchain
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal -c clippy,rustfmt -t ${{ matrix.target }}
-          rustup default stable
+          # the one rust-toolchain.toml pins, which cargo picks up from there
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt -t "$TARGET"
           sudo apt-get install -y -qq musl-tools
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: static binary
@@ -169,8 +172,8 @@ jobs:
       - name: toolchain and libkrun
         run: |
           [ "$(uname -m)" = arm64 ]
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt
           # runners ship with brew's auto update off and an older formula list
           brew update --quiet
           brew install libkrun

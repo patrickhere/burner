@@ -1,0 +1,7 @@
+# the rust ci and the releases build with, so a release doesn't change with
+# whatever stable is that day. ci checks the oldest supported one, rust-version
+# in Cargo.toml, on its own
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -32,9 +32,12 @@ jobs:
         with:
           persist-credentials: false
       - name: toolchain
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal -c clippy,rustfmt -t ${{ matrix.target }}
-          rustup default stable
+          # the one rust-toolchain.toml pins, which cargo picks up from there
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt -t "$TARGET"
           sudo apt-get install -y -qq musl-tools
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -95,8 +98,8 @@ jobs:
           persist-credentials: false
       - name: toolchain and shells
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get install -y -qq zsh fish dash ksh
           else
@@ -115,5 +118,15 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck install.sh get.sh guest/init tools/build-image tools/formula-shas burner/src/remote/wrap.sh
+      # keys.asc is all apt trusts when the debian image is built, so it has to
+      # hold exactly the keys images/debian/keys.fingerprints pins
+      - name: debian keys match the pinned fingerprints
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --show-keys --with-colons images/debian/keys.asc | awk -F: '$1 == "fpr" { print $10 }' | sort > "$RUNNER_TEMP/have"
+          grep -v '^#' images/debian/keys.fingerprints | awk 'NF { print $1 }' | sort > "$RUNNER_TEMP/want"
+          [ -s "$RUNNER_TEMP/want" ]
+          diff "$RUNNER_TEMP/want" "$RUNNER_TEMP/have" || { echo "keys.asc and keys.fingerprints differ" >&2; exit 1; }
       # the suites run as a user with sudo and redirect on purpose
       - run: shellcheck -S warning -e SC2024 tests/*.sh
