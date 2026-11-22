@@ -15,7 +15,7 @@
 - the network suite checks dns rebinding (a name that points at a blocked address is blocked like the address), ipv6 (no address or route in a VM, taps drop it), and the log (every blocked target is in it, it can't be forged, it survives hostile dns and floods)
 - a filter loaded by an older burner is reloaded by the reaper, and a new run says to run `burner net up` instead of failing on it
 - the sudoers example lets `burner log` and `burner explain` through
-- remote hosts: `burner -H HOST run`, `shell`, `ls`, `kill`, `images`, `config`, `doctor` and `version` over ssh, as you, with your own keys and ssh config. hosts go in `~/.config/burner/hosts.toml`, each with several addresses tried at once (a LAN one and a tailnet one), or `-H` takes any ssh host. `BURNER_HOST` for a whole shell, `-H local` for here
+- remote hosts: `burner -H HOST run`, `shell`, `ls`, `log`, `kill`, `images`, `explain`, `config`, `doctor` and `version` over ssh, as you, with your own keys and ssh config. hosts go in `~/.config/burner/hosts.toml`, each with several addresses tried at once (a LAN one and a tailnet one), or `-H` takes any ssh host. `BURNER_HOST` for a whole shell, `-H local` for here
 - what a remote host sends back is checked here: output escaped, a shell's terminal filtered and reset here, `~.` handled here, a result tar parsed again here, and the exit code from a line only burner there can write. remote failures are 125 with outcome `unreachable`, `remote_error` or `lost`, never ssh's 255
 - `burner -H HOST doctor` checks the way there and shows that host's own doctor. `burner hosts [--check]` lists hosts.toml
 - burner-tui takes `-H HOST` and switches hosts with `h`

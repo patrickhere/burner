@@ -142,6 +142,7 @@ case $cmd in
         esac
         exit 0 ;;
     images) echo alpine; exit 0 ;;
+    log|explain) echo "fake $cmd${all% }"; exit 0 ;;
     doctor) echo "ok    fake         a stand-in burner"; echo works; exit 0 ;;
     shell)
         rec "start {\"id\":\"$id\"}"
@@ -463,6 +464,17 @@ fi
   && ok "net and reap stay local, a kill id like a flag and -H as root are refused: exit 2" \
   || bad "refusals" "net=$rn reap+kill=$rr root=$rroot"
 
+# F15b log and explain go over -H, their argv rebuilt from what was parsed
+"$B" -H fake log burner-0123456789ab >"$T/lg" 2>&1; rl=$?
+"$B" -H fake explain --net open --rules >"$T/ex" 2>&1; rx=$?
+"$B" -H fake log ../../x >/dev/null 2>&1; rb=$?
+"$B" -H fake explain --net lan >/dev/null 2>&1; rxb=$?
+"$B" -H fake doctor --probe >/dev/null 2>"$T/e"; rp=$?
+[ "$rl" = 0 ] && grep -qx "fake log burner-0123456789ab" "$T/lg" && [ "$rx" = 0 ] && grep -qx "fake explain --net open --rules" "$T/ex" \
+  && [ "$rb" = 2 ] && [ "$rxb" = 2 ] && [ "$rp" = 2 ] && grep -q "doctor --probe runs on the machine itself" "$T/e" \
+  && ok "log and explain go over -H as parsed, a bad log id, a bad --net and doctor --probe don't: exit 2" \
+  || bad "log and explain over -H" "log=$rl explain=$rx badid=$rb badnet=$rxb probe=$rp $(short "$T/lg") $(short "$T/ex")"
+
 # F16 BURNER_HOST picks the host, -H local overrides it
 BURNER_HOST=fake "$B" run -- code9 </dev/null >/dev/null 2>&1; re=$?
 BURNER_HOST=fake "$B" -H local version >"$T/v" 2>&1; rl=$?
@@ -647,6 +659,14 @@ PY
 r=$?
 [ "$rc" = 0 ] && [ "$r" = 0 ] && ok "real: the network summary on stderr and a big log in the json over -H" \
   || bad "real network log" "rc=$rc $(short "$T/nl.err")"
+
+# R10 burner -H log has that run's log, kept there, and explain says what a
+# VM could reach there
+nid=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["result"]["id"])' "$T/nl.js" 2>/dev/null)
+"$B" -H lo log "$nid" --json >"$T/nl.log" 2>/dev/null; rl=$?
+"$B" -H lo explain --net web >"$T/nl.ex" 2>&1; rx=$?
+[ -n "$nid" ] && [ "$rl" = 0 ] && json_is "d['host'] == 'lo' and d['command'] == 'log' and d['result']['id'] == '$nid' and len(d['result']['events']) >= 300" < "$T/nl.log" \
+  && [ "$rx" = 0 ] && [ -s "$T/nl.ex" ] && ok "real: burner -H log and explain" || bad "real log/explain" "id=$nid log=$rl explain=$rx $(short "$T/nl.ex")"
 
 vms_gone && ok "no VMs left running" || bad "leftovers" "$(sudo -n burner ls)"
 echo "---- $pass passed, $fail failed"

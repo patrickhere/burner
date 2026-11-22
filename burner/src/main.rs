@@ -354,6 +354,27 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         Cmd::Run(a) => remote::client::run(&host, a, &config),
         Cmd::Shell(a) => remote::pty::shell(&host, &run::shell_run_args(a), &config),
         Cmd::Doctor(a) if !a.probe => remote::doctor::doctor(&host, &config),
+        Cmd::Doctor(_) => {
+            return usage(format!(
+                "burner doctor --probe runs on the machine itself, not over -H (ssh -t {h} sudo burner doctor --probe)"
+            ));
+        }
+        // the summary after a run over -H names a log that's kept there
+        Cmd::Log { id: Some(id) } if !burnervm::ledger::valid_id(id) => {
+            return usage("usage: burner log [burner-xxxxxxxxxxxx]".into());
+        }
+        Cmd::Log { id } => {
+            let mut w = vec!["log"];
+            w.extend(id.as_deref());
+            remote::client::oneshot(&host, "log", words(&w), Mode::Auto)
+        }
+        Cmd::Explain(a) => match a.remote_argv() {
+            Ok(argv) => {
+                let w: Vec<&str> = argv.iter().map(String::as_str).collect();
+                remote::client::oneshot(&host, "explain", words(&w), Mode::Auto)
+            }
+            Err(e) => return usage(e),
+        },
         _ => {
             let what = name.split(' ').next().unwrap_or(name);
             return usage(format!(

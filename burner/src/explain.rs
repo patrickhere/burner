@@ -21,6 +21,23 @@ pub struct ExplainArgs {
     rules: bool,
 }
 
+impl ExplainArgs {
+    /// explain's argv for burner -H, rebuilt from what was parsed
+    pub fn remote_argv(&self) -> Result<Vec<String>, String> {
+        let mut v = vec!["explain".to_string()];
+        if let Some(n) = &self.net {
+            if net::Mode::parse(n).is_none() {
+                return Err(format!("--net {n:?}: use none, web or open"));
+            }
+            v.extend(["--net".to_string(), n.clone()]);
+        }
+        if self.rules {
+            v.push("--rules".into());
+        }
+        Ok(v)
+    }
+}
+
 #[derive(Serialize, Debug)]
 pub struct Uplink {
     pub dev: String,

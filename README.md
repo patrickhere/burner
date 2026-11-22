@@ -204,7 +204,7 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
 
 ## remote hosts
 
-`burner -H HOST` runs any of `run`, `shell`, `ls`, `kill`, `images`, `config`, `doctor` and `version` on another machine over ssh, with your own keys, agent and `~/.ssh/config`. nothing listens anywhere and nothing new runs as root: the laptop only starts `ssh`, as you, and burner on the far end runs as it would there by hand.
+`burner -H HOST` runs any of `run`, `shell`, `ls`, `log`, `kill`, `images`, `explain`, `config`, `doctor` and `version` on another machine over ssh, with your own keys, agent and `~/.ssh/config`. nothing listens anywhere and nothing new runs as root: the laptop only starts `ssh`, as you, and burner on the far end runs as it would there by hand.
 
 ```
 burner -H mini shell
@@ -232,7 +232,8 @@ burner = "/usr/local/bin/burner"   # where it is there, if not the usual place
 - every connection goes out with agent, X11 and port forwarding off, ssh's own `~` escape off, and host keys checked strictly: a host ssh doesn't know yet, or one whose key changed, is refused and never added to known_hosts. a changed key on the first address stops there, it doesn't quietly move on to the next one. `ssh HOST` once to check and add a new host's key
 - on linux the far end runs burner through `sudo -n`, so the user you ssh in as needs the rule in `dist/sudoers.example`. a password prompt never comes up, `burner -H HOST doctor` says what the rule allows. ssh'd in as root it runs without sudo, and on a mac it runs as you. a mac host only needs Remote Login on, and works with nobody logged in at its screen
 - `burner -H HOST doctor` checks the way there (each address, ssh, burner's version on both ends, the sudo rule) and then shows that host's own doctor. `burner hosts` lists the file, `--check` tries every address
-- `burner -H` refuses to run as root or through sudo: root has other keys and another known_hosts. `net`, `reap` and `setup` don't go over -H, they're for the machine itself
+- a run's connection log stays on the host it ran on: the summary comes back on stderr like the rest, `--log` and `--json-fd` work as they do here, and `burner -H HOST log ID` shows the whole log. `log` and `explain` need the sudo rule's lines for them there
+- `burner -H` refuses to run as root or through sudo: root has other keys and another known_hosts. `net`, `reap`, `setup` and `doctor --probe` don't go over -H, they're for the machine itself
 
 a result over `-H` is only as trustworthy as the host it ran on. that host runs the VM and the burner that reports on it, so a compromised one can make up the output, the exit code, the json and the result tar, and burner here has no way to check them against what really happened. what burner does guarantee is that a hostile host can't reach past its own results into your machine:
 
