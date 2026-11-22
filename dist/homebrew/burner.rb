@@ -6,9 +6,9 @@ class Burner < Formula
   # TAG COMMIT prints the urls and the four sha256s for this file, each
   # checked against the release's build provenance or the tagged commit, not
   # taken from what github serves
-  url "https://github.com/patrickhere/burner/releases/download/v0.2.1/burner-v0.2.1-aarch64-macos.tar.gz"
-  version "0.2.1"
-  sha256 "3d237045f640331817b81c2cb790372b199762f71c5e4d7ef188aac9f8ee1e13"
+  url "https://github.com/patrickhere/burner/releases/download/v0.3.0/burner-v0.3.0-aarch64-macos.tar.gz"
+  version "0.3.0"
+  sha256 "2577d6caa01ae3c04a310c0bd6a3a4e2932e34e1011745c3c025099bea822c12"
   license any_of: ["MIT", "Apache-2.0"]
 
   head do
@@ -27,15 +27,15 @@ class Burner < Formula
   # the release afterwards don't get past brew. the kernel is the one
   # install.sh pins
   resource "guest-kernel" do
-    url "https://github.com/patrickhere/burner/releases/download/v0.2.1/vmlinux-aarch64",
+    url "https://github.com/patrickhere/burner/releases/download/v0.3.0/vmlinux-aarch64",
         using: :nounzip
     sha256 "7e7f3c7073c36e334e33e8a74ae744cea06c914f0ab9303b9e557e4106840da4"
   end
 
   resource "alpine-image" do
-    url "https://github.com/patrickhere/burner/releases/download/v0.2.1/alpine-aarch64.ext4.gz",
+    url "https://github.com/patrickhere/burner/releases/download/v0.3.0/alpine-aarch64.ext4.gz",
         using: :nounzip
-    sha256 "aeaed32e8bb66834f894bdc1789cc27048476570921e2c6c5afd6bacb80756e1"
+    sha256 "d6fabb6ae2e3e854691f0b4d14a30853a48d4505c5952ed8061203b36acc334c"
   end
 
   def install
@@ -65,7 +65,7 @@ class Burner < Formula
     # the debian image isn't fetched here, so brew install doesn't download it
     # for everyone. it's pinned all the same: burner setup debian fetches it
     # from the release and checks it against this
-    (pkgshare/"pins").write "0000000000000000000000000000000000000000000000000000000000000000  " \
+    (pkgshare/"pins").write "312fd0a4142dd55ced7679f1df30d9852b4397fb6f3f04c4f4c829bd8b8ec401  " \
                             "debian-aarch64.ext4.gz\n"
   end
 
