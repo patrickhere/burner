@@ -271,6 +271,18 @@ fn network(r: &mut Report, cfg: &Config) {
         );
     }
 
+    // a full-tunnel vpn: VMs either reach nothing or leave outside it
+    let up = cfg.uplink().ok();
+    for t in crate::explain::tunnel_notes(&net::tunnels_here(), up.as_deref()) {
+        r.line(Level::Warn, "vpn", t);
+    }
+    let blocked = net::blocked_sources(cfg).ok();
+    for (sev, msg) in
+        net::resolver_checks(cfg, blocked.as_deref(), crate::netmodel::Platform::Linux)
+    {
+        r.line(level(sev), "dns", msg);
+    }
+
     // ufw's forward policy drops VM traffic unless it has a rule for the subnet
     if is_root() {
         match net::ufw_rule_missing(cfg) {
@@ -294,6 +306,14 @@ fn network(r: &mut Report, cfg: &Config) {
             "forwarding",
             "ipv4 forwarding off, burner turns it on when it sets up the network",
         );
+    }
+}
+
+fn level(s: net::Severity) -> Level {
+    match s {
+        net::Severity::Ok => Level::Ok,
+        net::Severity::Warn => Level::Warn,
+        net::Severity::Fail => Level::Fail,
     }
 }
 

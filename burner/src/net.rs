@@ -1249,6 +1249,292 @@ pub fn taps_present(cfg: &Config) -> Vec<u32> {
         .collect()
 }
 
+/// a vpn's interface, by its name: tun and wireguard on linux, utun on a
+/// mac, tailscale, ppp and ipsec ones. burner's own taps never are
+pub fn is_vpn_dev(dev: &str) -> bool {
+    ["tun", "utun", "wg", "tailscale", "ppp", "ipsec", "gpd"]
+        .iter()
+        .any(|p| dev.starts_with(p))
+}
+
+/// one route as the tunnel check reads it: destination, prefix, interface
+/// and table (main on a mac)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouteLine {
+    pub dst: Ipv4Addr,
+    pub prefix: u8,
+    pub dev: String,
+    pub table: String,
+}
+
+/// a full-tunnel vpn, as the routes show it
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Tunnel {
+    /// 0.0.0.0/1 and 128.0.0.0/1 on dev: every address is behind a route
+    /// that isn't the default one, and those are blocked
+    Halves { dev: String },
+    /// the main table's default route is on dev
+    Default { dev: String },
+    /// linux: a default route on dev in a table of its own (wg-quick,
+    /// a tailscale exit node), picked by policy rules
+    Policy { dev: String, table: String },
+}
+
+/// the full-tunnel vpns these routes have, each interface once
+pub fn tunnels(routes: &[RouteLine]) -> Vec<Tunnel> {
+    let mut out = Vec::new();
+    let has = |dev: &str, net: [u8; 4], prefix: u8| {
+        routes
+            .iter()
+            .any(|r| r.dev == dev && r.prefix == prefix && r.dst == Ipv4Addr::from(net))
+    };
+    for r in routes.iter().filter(|r| is_vpn_dev(&r.dev)) {
+        let t = if r.prefix == 0 && r.table == "main" {
+            Tunnel::Default { dev: r.dev.clone() }
+        } else if r.prefix == 0 && r.table != "local" {
+            Tunnel::Policy {
+                dev: r.dev.clone(),
+                table: r.table.clone(),
+            }
+        } else if r.prefix == 1 && r.dst == Ipv4Addr::UNSPECIFIED && has(&r.dev, [128, 0, 0, 0], 1)
+        {
+            Tunnel::Halves { dev: r.dev.clone() }
+        } else {
+            continue;
+        };
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// what a full-tunnel vpn means for VMs, one line each, the same words in
+/// doctor and explain. uplink is the interface VM traffic leaves by
+pub fn tunnel_words(t: &Tunnel, uplink: Option<&str>) -> String {
+    match t {
+        Tunnel::Halves { dev } => format!(
+            "a full-tunnel vpn is up on {dev} (0.0.0.0/1 and 128.0.0.0/1): VMs can't reach anything while it's up, \
+             burner keeps VM traffic out of vpns"
+        ),
+        Tunnel::Default { dev } => format!(
+            "the default route is on {dev}, a vpn: VM traffic goes out through it, into whatever network it leads to"
+        ),
+        Tunnel::Policy { dev, table } => format!(
+            "{dev} has a default route in table {table} (a full-tunnel vpn by policy routing): VM packets use burner's \
+             own table, so VM traffic leaves outside the vpn, through {} from this host's own address",
+            uplink.unwrap_or("the uplink")
+        ),
+    }
+}
+
+/// `ip -j -4 route show table all`, for the tunnel check: the default
+/// routes are in it too, as 0.0.0.0/0
+pub fn route_lines(json: &[u8]) -> Vec<RouteLine> {
+    let v: serde_json::Value = serde_json::from_slice(json).unwrap_or_default();
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let dst = r["dst"].as_str()?;
+            let (dst, prefix) = match dst.split_once('/') {
+                _ if dst == "default" => (Ipv4Addr::UNSPECIFIED, 0),
+                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok().filter(|&p: &u8| p <= 32)?),
+                None => (dst.parse().ok()?, 32),
+            };
+            Some(RouteLine {
+                dst,
+                prefix,
+                dev: r["dev"].as_str().unwrap_or("?").to_string(),
+                table: match &r["table"] {
+                    serde_json::Value::String(t) => t.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => "main".into(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// the full-tunnel vpns on this host now. nothing when the routes can't be read
+#[cfg(target_os = "linux")]
+pub fn tunnels_here() -> Vec<Tunnel> {
+    helper("ip", &["-j", "-4", "route", "show", "table", "all"], None)
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| tunnels(&route_lines(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// net.resolvers that sit in a blocked range, with the range in words. VMs
+/// can never reach those. a full tunnel's halves are left out: they block
+/// everything, and the vpn's own line says so
+pub fn blocked_resolvers(
+    cfg: &Config,
+    blocked: &[Blocked],
+    platform: crate::netmodel::Platform,
+) -> Vec<(Ipv4Addr, String)> {
+    let full: Vec<Blocked> = blocked
+        .iter()
+        .filter(|b| !matches!(&b.why, Why::Route { .. } if b.prefix <= 1))
+        .cloned()
+        .collect();
+    let m = crate::netmodel::Model::new(cfg, Mode::Web, platform, full);
+    cfg.net
+        .resolvers
+        .iter()
+        .filter_map(|ip| m.range(*ip).map(|b| (*ip, crate::netmodel::describe(b).1)))
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Severity {
+    Ok,
+    Warn,
+    Fail,
+}
+
+/// doctor's dns lines: a resolver VMs can't reach is a FAIL, one that
+/// doesn't answer from here a warning. blocked is None when the blocked set
+/// couldn't be read
+pub fn resolver_checks(
+    cfg: &Config,
+    blocked: Option<&[Blocked]>,
+    platform: crate::netmodel::Platform,
+) -> Vec<(Severity, String)> {
+    let mut out = Vec::new();
+    if cfg.net.resolvers.is_empty() {
+        out.push((
+            Severity::Warn,
+            "net.resolvers is empty, so VMs with a network get no dns".to_string(),
+        ));
+        return out;
+    }
+    let bad = blocked.map_or_else(Vec::new, |b| blocked_resolvers(cfg, b, platform));
+    for (ip, why) in &bad {
+        out.push((
+            Severity::Fail,
+            format!(
+                "net.resolvers has {ip}, and VMs can't reach it: {why}. use resolvers outside the \
+                 blocked ranges, like 9.9.9.9 and 1.1.1.1"
+            ),
+        ));
+    }
+    let ask: Vec<Ipv4Addr> = cfg
+        .net
+        .resolvers
+        .iter()
+        .copied()
+        .filter(|ip| !bad.iter().any(|(b, _)| b == ip))
+        .collect();
+    let answers: Vec<(Ipv4Addr, std::result::Result<Duration, String>)> = ask
+        .iter()
+        .map(|&ip| {
+            (
+                ip,
+                std::thread::spawn(move || ask_resolver(ip, Duration::from_secs(2))),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|(ip, h)| {
+            (
+                ip,
+                h.join().unwrap_or_else(|_| Err("the check failed".into())),
+            )
+        })
+        .collect();
+    let good: Vec<String> = answers
+        .iter()
+        .filter_map(|(ip, a)| {
+            a.as_ref()
+                .ok()
+                .map(|t| format!("{ip} ({} ms)", t.as_millis()))
+        })
+        .collect();
+    let silent: Vec<String> = answers
+        .iter()
+        .filter_map(|(ip, a)| a.as_ref().err().map(|e| format!("{ip}: {e}")))
+        .collect();
+    if !good.is_empty() {
+        out.push((
+            Severity::Ok,
+            format!("{} answer from here", good.join(", ")),
+        ));
+    }
+    if !silent.is_empty() {
+        let what = if good.is_empty() && bad.is_empty() {
+            "none of net.resolvers answer dns from here, so VMs with a network get no dns"
+        } else {
+            "VMs get no dns from these, they don't answer from here"
+        };
+        out.push((
+            Severity::Warn,
+            format!(
+                "{what} ({}). a network that blocks outbound dns does this",
+                silent.join(", ")
+            ),
+        ));
+    }
+    out
+}
+
+/// one dns query from here: the root's NS records, which any resolver has.
+/// the time it took, or why there was no good answer
+pub fn ask_resolver(ip: Ipv4Addr, limit: Duration) -> std::result::Result<Duration, String> {
+    use std::net::UdpSocket;
+    let t0 = std::time::Instant::now();
+    let id: u16 = sys::random_hex(2)
+        .ok()
+        .and_then(|h| u16::from_str_radix(&h, 16).ok())
+        .unwrap_or(0x6275);
+    let mut q = Vec::with_capacity(17);
+    q.extend_from_slice(&id.to_be_bytes());
+    // recursion desired, one question: ". NS IN"
+    q.extend_from_slice(&[0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]);
+    q.extend_from_slice(&[0, 0, 2, 0, 1]);
+    let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| e.to_string())?;
+    s.connect((ip, 53)).map_err(|e| e.to_string())?;
+    s.send(&q).map_err(|e| e.to_string())?;
+    let mut buf = [0u8; 1500];
+    loop {
+        let left = limit.saturating_sub(t0.elapsed());
+        if left.is_zero() {
+            return Err(format!("no answer in {}s", limit.as_secs()));
+        }
+        s.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        let n = match s.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(format!("no answer in {}s", limit.as_secs()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                return Err("refused (nothing listens on 53 there)".into());
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        match answer_rcode(&buf[..n], id) {
+            Some(0) => return Ok(t0.elapsed()),
+            Some(rc) => return Err(format!("answered {}", crate::dns::rcode_name(rc))),
+            // someone else's datagram, or not a reply: keep waiting
+            None => continue,
+        }
+    }
+}
+
+/// a reply's rcode, if b is a dns reply to id
+fn answer_rcode(b: &[u8], id: u16) -> Option<u8> {
+    if b.len() < 12 || u16::from_be_bytes([b[0], b[1]]) != id || b[2] & 0x80 == 0 {
+        return None;
+    }
+    Some(b[3] & 0x0f)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1677,5 +1963,145 @@ pub(crate) mod tests {
         );
         assert_eq!(arp_mac("10.1.0.1 (10.1.0.1) -- no entry"), None);
         assert_eq!(arp_mac("? (10.1.0.1) at 2:0:0:0:0:0 on en0"), None);
+    }
+
+    /// openvpn with redirect-gateway def1 (or wg-quick with AllowedIPs
+    /// 0.0.0.0/1, 128.0.0.0/1): the halves in the main table, the server
+    /// through the lan
+    const OPENVPN_DEF1: &str = r#"[
+ {"dst":"0.0.0.0/1","gateway":"10.8.0.1","dev":"tun0","flags":[]},
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","metric":100,"flags":[]},
+ {"dst":"10.8.0.0/24","dev":"tun0","protocol":"kernel","scope":"link","prefsrc":"10.8.0.6","flags":[]},
+ {"dst":"128.0.0.0/1","gateway":"10.8.0.1","dev":"tun0","flags":[]},
+ {"dst":"185.65.135.1","gateway":"192.168.1.1","dev":"eth0","flags":[]},
+ {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]}]"#;
+    /// wg-quick with AllowedIPs 0.0.0.0/0: its own table and fwmark rules,
+    /// the main table untouched
+    const WG_QUICK: &str = r#"[
+ {"dst":"default","dev":"wg0","table":"51820","scope":"link","flags":[]},
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+ {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]},
+ {"type":"local","dst":"10.64.1.2","dev":"wg0","table":"local","protocol":"kernel","scope":"host","flags":[]}]"#;
+    /// openvpn's redirect-gateway without def1: the default route replaced
+    const OPENVPN_DEFAULT: &str = r#"[
+ {"dst":"default","gateway":"10.8.0.1","dev":"tun0","flags":[]},
+ {"dst":"10.8.0.0/24","dev":"tun0","protocol":"kernel","scope":"link","prefsrc":"10.8.0.6","flags":[]},
+ {"dst":"185.65.135.1","gateway":"192.168.1.1","dev":"eth0","flags":[]},
+ {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]}]"#;
+    /// a tailscale exit node: a default route in table 52
+    const TS_EXIT: &str = r#"[
+ {"dst":"default","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"100.100.100.100","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]}]"#;
+
+    #[test]
+    fn full_tunnels_from_routes() {
+        let t = |j: &str| tunnels(&route_lines(j.as_bytes()));
+        assert_eq!(t(OPENVPN_DEF1), vec![Tunnel::Halves { dev: "tun0".into() }]);
+        assert_eq!(
+            t(WG_QUICK),
+            vec![Tunnel::Policy {
+                dev: "wg0".into(),
+                table: "51820".into()
+            }]
+        );
+        assert_eq!(
+            t(OPENVPN_DEFAULT),
+            vec![Tunnel::Default { dev: "tun0".into() }]
+        );
+        assert_eq!(
+            t(TS_EXIT),
+            vec![Tunnel::Policy {
+                dev: "tailscale0".into(),
+                table: "52".into()
+            }]
+        );
+        // a wireguard tunnel to one network, tailscale without an exit node,
+        // one half alone: not full tunnels
+        assert!(t(HOMELAB_ROUTES).is_empty());
+        assert!(t(r#"[{"dst":"0.0.0.0/1","dev":"tun0","flags":[]}]"#).is_empty());
+        assert!(t("not json").is_empty());
+        assert!(!is_vpn_dev("bn3") && !is_vpn_dev("eth0") && is_vpn_dev("utun4"));
+        let w = tunnel_words(
+            &Tunnel::Halves {
+                dev: "utun3".into(),
+            },
+            None,
+        );
+        assert!(w.contains("VMs can't reach anything while it's up"), "{w}");
+        let w = tunnel_words(
+            &Tunnel::Policy {
+                dev: "wg0".into(),
+                table: "51820".into(),
+            },
+            Some("eth0"),
+        );
+        assert!(w.contains("leaves outside the vpn, through eth0"), "{w}");
+    }
+
+    #[test]
+    fn halves_block_everything_and_policy_routing_nothing() {
+        use crate::netmodel::{Model, Platform, Proto, Verdict};
+        let addrs = r#"[{"ifname":"eth0","addr_info":[{"local":"192.168.1.20","prefixlen":24}]},
+            {"ifname":"tun0","addr_info":[{"local":"10.8.0.6","prefixlen":24}]}]"#;
+        let cfg = Config::default();
+        let model = |routes: &str| {
+            let b = sources_from(
+                &cfg,
+                None,
+                &parse_addrs(addrs.as_bytes()).unwrap(),
+                &parse_routes(routes.as_bytes(), "eth0").unwrap(),
+            )
+            .unwrap();
+            Model::new(&cfg, Mode::Web, Platform::Linux, b)
+        };
+        let one = Ipv4Addr::new(1, 1, 1, 1);
+        let gh = Ipv4Addr::new(140, 82, 121, 4);
+        let m = model(OPENVPN_DEF1);
+        assert_ne!(m.expect(one, Proto::Tcp, 443).verdict, Verdict::Allowed);
+        assert_ne!(m.expect(gh, Proto::Tcp, 443).verdict, Verdict::Allowed);
+        let m = model(WG_QUICK);
+        assert_eq!(m.expect(gh, Proto::Tcp, 443).verdict, Verdict::Allowed);
+        // and the halves don't count as a resolver problem of their own
+        let b = sources_from(
+            &cfg,
+            None,
+            &parse_addrs(addrs.as_bytes()).unwrap(),
+            &parse_routes(OPENVPN_DEF1.as_bytes(), "eth0").unwrap(),
+        )
+        .unwrap();
+        assert!(blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux).is_empty());
+    }
+
+    #[test]
+    fn resolvers_in_blocked_ranges() {
+        let mut cfg = Config::default();
+        cfg.net.resolvers = vec![
+            Ipv4Addr::new(192, 168, 1, 53),
+            Ipv4Addr::new(9, 9, 9, 9),
+            Ipv4Addr::new(10, 1, 0, 2),
+        ];
+        let b = fixture(None, HOMELAB_ADDRS, HOMELAB_ROUTES, "eth0");
+        let r = blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert_eq!(r[0].0, Ipv4Addr::new(192, 168, 1, 53));
+        assert!(r[0].1.contains("192.168.1.0/24 on eth0"), "{r:?}");
+        assert!(r[1].1.contains("wg0"), "{r:?}");
+    }
+
+    #[test]
+    fn dns_replies() {
+        let mut r = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        assert_eq!(answer_rcode(&r, 0x1234), Some(0));
+        assert_eq!(answer_rcode(&r, 0x1235), None);
+        r[3] = 0x85;
+        assert_eq!(answer_rcode(&r, 0x1234), Some(5));
+        // a query, not a reply
+        r[2] = 0x01;
+        assert_eq!(answer_rcode(&r, 0x1234), None);
+        assert_eq!(answer_rcode(&r[..11], 0x1234), None);
+        // nothing on a loopback port that never answers
+        let e = ask_resolver(Ipv4Addr::new(127, 0, 0, 1), Duration::from_millis(300));
+        assert!(e.is_err(), "{e:?}");
     }
 }
