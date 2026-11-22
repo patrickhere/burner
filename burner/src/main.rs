@@ -188,6 +188,9 @@ fn probe_done(cfg: &Config, config: &std::path::Path, a: &probe::ProbeArgs) -> E
 }
 
 fn explain_main(cfg: &Config, a: &explain::ExplainArgs, json_on: bool) -> anyhow::Result<ExitCode> {
+    if let Some(why) = a.refused() {
+        return Ok(json::fail("explain", exit::EXIT_USAGE, Kind::Usage, why));
+    }
     {
         let e = match explain::build(cfg, a) {
             Ok(e) => e,
@@ -404,10 +407,17 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
             }
             Err(e) => return usage(e),
         },
+        // --rules is refused through sudo there, and without it shows what
+        // would load: as the ssh user, which is root's loaded rules for root
         Cmd::Explain(a) => match a.remote_argv() {
             Ok(argv) => {
                 let w: Vec<&str> = argv.iter().map(String::as_str).collect();
-                remote::client::oneshot(&host, "explain", words(&w), Mode::Auto)
+                let mode = if a.wants_rules() {
+                    Mode::User
+                } else {
+                    Mode::Auto
+                };
+                remote::client::oneshot(&host, "explain", words(&w), mode)
             }
             Err(e) => return usage(e),
         },

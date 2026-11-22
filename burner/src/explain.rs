@@ -36,6 +36,30 @@ impl ExplainArgs {
         }
         Ok(v)
     }
+
+    /// -H runs explain --rules as the ssh user there, since sudo refuses it
+    pub fn wants_rules(&self) -> bool {
+        self.rules
+    }
+
+    /// --rules through sudo, for anyone but root: refused. the rule
+    /// install.sh --allow writes lets a restricted user run explain, and the
+    /// loaded rules (the tap entries, the public address) stay root's
+    pub fn refused(&self) -> Option<String> {
+        self.refused_for(std::env::var("SUDO_UID").ok().as_deref())
+    }
+
+    fn refused_for(&self, sudo_uid: Option<&str>) -> Option<String> {
+        let caller = sudo_uid?;
+        if !self.rules || !cfg!(target_os = "linux") || caller.trim() == "0" {
+            return None;
+        }
+        Some(
+            "burner explain --rules isn't allowed through sudo, the loaded rules are root's: \
+             burner explain --rules without sudo shows what would load (as root: nft list table inet burner)"
+                .into(),
+        )
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -899,5 +923,30 @@ mod tests {
         assert!(a[0].detail.contains("any tcp port but mail"));
         let a = allowed(&cfg, Mode::Web, Platform::Mac, "out");
         assert!(a.iter().any(|x| x.detail.starts_with("no ping")));
+    }
+
+    #[test]
+    fn rules_through_sudo() {
+        let a = |net: Option<&str>, rules: bool| ExplainArgs {
+            net: net.map(str::to_string),
+            rules,
+        };
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(a(None, true).refused_for(Some("1000")).is_some(), linux);
+        assert_eq!(
+            a(Some("open"), true).refused_for(Some("")).is_some(),
+            linux,
+            "a SUDO_UID that isn't a number isn't root"
+        );
+        assert!(
+            a(None, true).refused_for(Some("0")).is_none(),
+            "root's own sudo"
+        );
+        assert!(
+            a(None, true).refused_for(None).is_none(),
+            "not through sudo"
+        );
+        assert!(a(None, false).refused_for(Some("1000")).is_none());
+        assert!(a(Some("web"), false).refused_for(Some("1000")).is_none());
     }
 }
