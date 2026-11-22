@@ -169,7 +169,9 @@ case $scen in
     broken) rec "status not json"; exit 0 ;;
     unknown) rec "teleport now"; status 0 exited 0; exit 0 ;;
     liar) status 0 timeout null; exit 0 ;;
-    huge) rec "status {\"x\":\"$(head -c 70000 /dev/zero | tr '\0' a)\"}"; exit 0 ;;
+    huge) rec "status {\"x\":\"$(head -c 1400000 /dev/zero | tr '\0' a)\"}"; exit 0 ;;
+    # a run's status with its connection log in it: as big as a stored log gets
+    biglog) status 0 exited 0 ",\"network\":{\"pad\":\"$(head -c 1000000 /dev/zero | tr '\0' a)\"}"; exit 0 ;;
     skew) echo "error: unexpected argument '--remote' found" >&2; exit 2 ;;
     osc) printf 'a\033]52;c;cHduZWQ=\007b\033]0;title\007c\n'; status 0 exited 0; exit 0 ;;
     flood) head -c 10485760 /dev/zero | tr '\0' x; status 0 exited 0; exit 0 ;;
@@ -327,7 +329,7 @@ fi
 [ "$r7" = 7 ] && [ "$r255" = 255 ] && [ "$r0" = 0 ] && ok "exit codes from the record: 7, 255, 0" \
   || bad "exit codes from the record" "7->$r7 255->$r255 0->$r0"
 
-# F2 no record, a broken one, one of a kind nobody knows, one over 64K: 125
+# F2 no record, a broken one, one of a kind nobody knows, one over the cap: 125
 codes=
 for s in nostatus broken unknown huge liar; do
     "$B" -H fake run -- "$s" </dev/null >/dev/null 2>"$T/e.$s"
@@ -337,6 +339,11 @@ done
   && grep -q "doesn't add up (outcome timeout with exit 0)" "$T/e.liar" \
   && ok "no end record, a broken one, an unknown kind, an oversized one, one that doesn't add up: 125" \
   || bad "broken records" "$codes $(short "$T/e.broken")"
+
+# F2b a status with a 1M connection log in it is still a status
+"$B" -H fake run --json-fd 3 -- biglog </dev/null >/dev/null 2>"$T/e" 3>"$T/biglog.js"; rc=$?
+[ "$rc" = 0 ] && json_is 'len(d["result"]["network"]["pad"]) == 1000000 and d["host"] == "fake"' < "$T/biglog.js" \
+  && ok "a status with a 1M network log gets through whole (0)" || bad "big status" "rc=$rc $(short "$T/e")"
 
 # F3 a lookalike record without the nonce is only text, and changes nothing
 "$B" -H fake run -- forged </dev/null >/dev/null 2>"$T/e"; rc=$?
@@ -622,6 +629,24 @@ case $d2 in "EXIT 0 "*OK) e2=ok ;; *) e2=no ;; esac
 "$B" -H lo doctor >"$T/doc" 2>&1; rd=$?
 [ "$rd" = 0 ] && grep -q "run, shell, ls, kill and images allowed without a password" "$T/doc" \
   && ok "real: doctor over -H" || bad "real doctor" "rc=$rd $(short "$T/doc")"
+
+# R9 the connection log comes back over -H: the summary on stderr, and a
+# log of 400 blocked rows whole in the json, past what fit in a record before
+"$B" -H lo run --net web --json-fd 3 -- 'for i in $(seq 1 200); do nc -z -w 1 10.254.1.$i 80 & nc -z -w 1 10.254.2.$i 80 & done; wait' \
+    </dev/null >/dev/null 2>"$T/nl.err" 3>"$T/nl.js"; rc=$?
+python3 -I - "$T/nl.js" "$T/nl.err" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+n = d["result"]["network"]
+err = open(sys.argv[2]).read()
+blocked = [e for e in n["events"] if e["verdict"] == "blocked" and e["dst"].startswith("10.254.")]
+print("      over -H: %d blocked rows, a %d byte log" % (len(blocked), len(json.dumps(n))))
+sys.exit(0 if d["host"] == "lo" and len(blocked) >= 300 and len(json.dumps(n)) > 65536
+         and ("burner log " + d["result"]["id"]) in err else 1)
+PY
+r=$?
+[ "$rc" = 0 ] && [ "$r" = 0 ] && ok "real: the network summary on stderr and a big log in the json over -H" \
+  || bad "real network log" "rc=$rc $(short "$T/nl.err")"
 
 vms_gone && ok "no VMs left running" || bad "leftovers" "$(sudo -n burner ls)"
 echo "---- $pass passed, $fail failed"

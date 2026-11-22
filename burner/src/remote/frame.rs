@@ -10,8 +10,9 @@
 
 use serde_json::Value;
 
-/// past this a record is broken, and with it the run
-pub const LINE_MAX: usize = 64 << 10;
+/// past this a record is broken, and with it the run. a run's status has
+/// its connection log in it, which can be up to netlog::FILE_CAP
+pub const LINE_MAX: usize = crate::netlog::FILE_CAP + (256 << 10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Record {
