@@ -104,7 +104,9 @@ Host *
     KbdInteractiveAuthentication no
 EOF
 printf '#!/bin/sh\nexec ssh -F %s "$@"\n' "$T/ssh_config" > "$T/ssh"
-chmod 755 "$T/ssh"
+# an ssh that leaves something holding its output, like a ProxyCommand can
+printf '#!/bin/sh\n[ "$1" = -G ] || sleep 20 &\nexec ssh -F %s "$@"\n' "$T/ssh_config" > "$T/ssh-linger"
+chmod 755 "$T/ssh" "$T/ssh-linger"
 export BURNER_SSH=$T/ssh XDG_CONFIG_HOME=$T/xdg
 unset BURNER_HOST BURNER_BATCH
 
@@ -457,6 +459,12 @@ BURNER_HOST=fake "$B" run -- code9 </dev/null >/dev/null 2>&1; re=$?
 BURNER_HOST=fake "$B" -H local version >"$T/v" 2>&1; rl=$?
 [ "$re" = 9 ] && [ "$rl" = 0 ] && grep -q "^burner " "$T/v" && ok "BURNER_HOST, and -H local beats it" \
   || bad "BURNER_HOST" "env=$re local=$rl $(short "$T/v")"
+
+# ssh's output still held open after it exited: nothing that came back counts
+BURNER_SSH=$T/ssh-linger "$B" -H fake run -- code0 </dev/null >/dev/null 2>"$T/e.linger"; rr=$?
+BURNER_SSH=$T/ssh-linger "$B" -H fake ls </dev/null >/dev/null 2>&1; rl=$?
+[ "$rr" = 125 ] && [ "$rl" = 125 ] && grep -q "didn't close after it exited" "$T/e.linger" \
+  && ok "output held open past ssh's exit: run and ls end 125" || bad "held output" "run=$rr ls=$rl $(short "$T/e.linger")"
 
 # F17 the connection cut during a run: lost, 125, with the VM's id
 "$B" -H fake run --json-fd 3 -- sleep </dev/null >/dev/null 2>"$T/e" 3>"$T/js" &

@@ -455,10 +455,12 @@ pub fn oneshot(host: &Host, command: &'static str, mut args: Vec<String>, mode: 
     });
     let st = child.wait();
     let grace = Instant::now() + READERS_GRACE;
-    let reply = outs.and_then(|h| join_until(h, grace)).unwrap_or_default();
-    if let Some(h) = errs {
-        join_until(h, grace);
+    let reply = outs.map(|h| join_until(h, grace));
+    let errs_done = errs.map(|h| join_until(h, grace).is_some());
+    if matches!(reply, Some(None)) || errs_done == Some(false) {
+        return fail(command, still_open(&host.name));
     }
+    let reply = reply.flatten().unwrap_or_default();
     let until = Instant::now() + Duration::from_secs(30);
     out.drain(until);
     err_out.drain(until);
@@ -752,8 +754,9 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     }));
     // --result tar: stdout is the far end's tar, spooled to be checked here
     // before any of it reaches yours
-    let spool = match a.result_tar().then(Spool::new).transpose() {
-        Ok(sp) => sp,
+    let (spool, sink) = match a.result_tar().then(Spool::new).transpose() {
+        Ok(Some((sp, f))) => (Some(sp), Sink::Spool(f)),
+        Ok(None) => (None, Sink::Live(live.clone())),
         Err(e) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -766,19 +769,18 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     };
     let over = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let outs = child.stdout.take().map(|mut so| {
-        let live = live.clone();
-        let file = spool.as_ref().and_then(|sp| sp.file.try_clone().ok());
         let over = over.clone();
+        let mut sink = sink;
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 65536];
-            let (mut file, mut n_total) = (file, 0u64);
+            let mut n_total = 0u64;
             while let Ok(n) = so.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
-                match &mut file {
+                match &mut sink {
                     // past the cap the rest is read and dropped, so ssh never blocks
-                    Some(f) => {
+                    Sink::Spool(f) => {
                         n_total += n as u64;
                         if n_total > crate::result::CLEAN_SIZE
                             || std::io::Write::write_all(f, &buf[..n]).is_err()
@@ -786,15 +788,18 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
                             over.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    None => live.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300))),
+                    Sink::Live(live) => {
+                        live.put(&buf[..n], Some(Instant::now() + Duration::from_secs(300)))
+                    }
                 }
             }
         })
     });
     let st = wait_ssh(&mut child);
     let grace = Instant::now() + READERS_GRACE;
+    let mut stuck = false;
     for h in [errs, outs].into_iter().flatten() {
-        join_until(h, grace);
+        stuck |= join_until(h, grace).is_none();
     }
     let until = Instant::now() + Duration::from_secs(30);
     live.drain(until);
@@ -803,6 +808,16 @@ pub fn run(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
     let mut end = decide(&c, &s, st.as_ref().and_then(exit_of), "run");
     let id = s.start.clone();
     drop(s);
+    // a reader still going could still bring a second end line or more of
+    // the tar: nothing it read so far counts
+    if stuck {
+        end = End {
+            code: EXIT_SANDBOX,
+            env: None,
+            raw: None,
+            failed: Some((RunOutcome::RemoteError, still_open(&host.name))),
+        };
+    }
     if let (Some(sp), Some(env)) = (&spool, end.env.as_mut()) {
         let over = over.load(std::sync::atomic::Ordering::Relaxed);
         if let Err(why) = sp.deliver(env, over, &host.name) {
@@ -834,6 +849,24 @@ fn result_lost(env: &mut Value, why: &str) {
         Some(e) => e.insert(0, p),
         None => env["errors"] = Value::Array(vec![p]),
     }
+}
+
+/// where a run's stdout from the far end goes: your stdout, or the spool
+/// that gets checked first. never one when the other was asked for
+enum Sink {
+    Live(Arc<Out>),
+    Spool(std::fs::File),
+}
+
+/// ssh exited, but its output didn't close in time: something it started
+/// holds it open
+pub(super) fn still_open(host: &str) -> Failed {
+    Failed::new(
+        Kind::RemoteError,
+        format!(
+            "{host}: ssh's output didn't close after it exited (something it started holds it), so nothing that came back counts"
+        ),
+    )
 }
 
 /// a place for files only you can read: $XDG_RUNTIME_DIR/burner, or
@@ -885,7 +918,15 @@ struct Spool {
 }
 
 impl Spool {
-    fn new() -> std::io::Result<Spool> {
+    /// the spool and a second handle to write it with. without that second
+    /// handle there's no run with --result tar: nothing goes to stdout unchecked
+    fn new() -> std::io::Result<(Spool, std::fs::File)> {
+        let sp = Spool::create()?;
+        let w = sp.file.try_clone()?;
+        Ok((sp, w))
+    }
+
+    fn create() -> std::io::Result<Spool> {
         use std::os::unix::fs::OpenOptionsExt;
         let dir = private_dir()?;
         let path = dir.join(format!("result-{}.tar", sys::random_hex(8)?));

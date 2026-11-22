@@ -198,12 +198,13 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
     });
     let st = child.wait().ok();
     let grace = std::time::Instant::now() + client::READERS_GRACE;
-    let out = outs
-        .and_then(|h| client::join_until(h, grace))
-        .unwrap_or_default();
-    if let Some(h) = errs {
-        client::join_until(h, grace);
+    let out = outs.map(|h| client::join_until(h, grace));
+    let errs_done = errs.map(|h| client::join_until(h, grace).is_some());
+    if matches!(out, Some(None)) || errs_done == Some(false) {
+        r.line(Level::Fail, "ssh", client::still_open(&host.name).msg);
+        return done(r);
     }
+    let out = out.flatten().unwrap_or_default();
     let code = st.as_ref().and_then(client::exit_of);
     let s = seen.lock().unwrap_or_else(|e| e.into_inner());
     let Some((os, uid, sudo, version)) = s.wrap.clone() else {
