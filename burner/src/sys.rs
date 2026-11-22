@@ -894,6 +894,82 @@ pub fn private_dir(path: &std::path::Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+#[cfg(target_os = "macos")]
+mod iokit {
+    use std::ffi::{c_char, c_void};
+
+    pub type CFStringRef = *const c_void;
+    pub const UTF8: u32 = 0x0800_0100;
+    pub const LEVEL_ON: u32 = 255;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        pub fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            s: *const c_char,
+            encoding: u32,
+        ) -> CFStringRef;
+        pub fn CFRelease(cf: *const c_void);
+    }
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        pub fn IOPMAssertionCreateWithName(
+            kind: CFStringRef,
+            level: u32,
+            name: CFStringRef,
+            id: *mut u32,
+        ) -> i32;
+        pub fn IOPMAssertionRelease(id: u32) -> i32;
+    }
+}
+
+/// a sleeping mac freezes its VMs, so a run keeps it from idle sleep while
+/// its VM is up, like caffeinate -i. lid close and a forced sleep still win.
+/// released on drop, and by macOS when the process goes
+#[cfg(target_os = "macos")]
+pub struct Awake(Option<u32>);
+
+#[cfg(target_os = "macos")]
+impl Awake {
+    pub fn hold(name: &str) -> Awake {
+        use iokit::*;
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return Awake(None);
+        };
+        // SAFETY: two CFStrings made from NUL-terminated strings, each
+        // released once; the id is only read when the call says it worked
+        unsafe {
+            let kind = CFStringCreateWithCString(
+                std::ptr::null(),
+                c"PreventUserIdleSystemSleep".as_ptr(),
+                UTF8,
+            );
+            let label = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), UTF8);
+            let mut id = 0u32;
+            let ok = !kind.is_null()
+                && !label.is_null()
+                && IOPMAssertionCreateWithName(kind, LEVEL_ON, label, &mut id) == 0;
+            for s in [kind, label] {
+                if !s.is_null() {
+                    CFRelease(s);
+                }
+            }
+            Awake(ok.then_some(id))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Awake {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            // SAFETY: an id IOPMAssertionCreateWithName gave us, released once
+            unsafe { iokit::IOPMAssertionRelease(id) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

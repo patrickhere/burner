@@ -392,6 +392,9 @@ fn run_vm(
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     record::mark(Mark::Slot);
     *held = Some(());
+    // held until this returns, after teardown
+    #[cfg(target_os = "macos")]
+    let _awake = sys::Awake::hold(&format!("burner {id}"));
 
     let Vmm {
         mut child,
