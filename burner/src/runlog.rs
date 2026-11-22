@@ -176,7 +176,7 @@ fn keep_here(cfg: &Config, args: &RunArgs, fin: &Finished) -> io::Result<bool> {
     private_dir(&logs)?;
     let dir = logs.join(owner.to_string());
     private_dir(&dir)?;
-    store(&dir, &format!("{}.json", r.id), &head, &result, &cfg.log)?;
+    store(&dir, &r.id, &head, &result, &cfg.log, true)?;
     Ok(cfg.log.keep_runs > 0 && cfg.log.keep_days > 0)
 }
 
@@ -204,13 +204,12 @@ fn keep_remote(
         }
         v.as_str().map(String::from)
     };
-    let Some(rid) = str_at(&result, &["id"])
-        .filter(|i| valid_id(i))
-        .or_else(|| id.filter(|i| valid_id(i)).map(String::from))
-    else {
+    // the id the far end said it started goes first: a result that names
+    // another run isn't this one's, and isn't kept with it
+    let started = id.filter(|i| valid_id(i)).map(String::from);
+    let Some(rid) = started.or_else(|| str_at(&result, &["id"]).filter(|i| valid_id(i))) else {
         return Ok(false);
     };
-    // a result that isn't this run's isn't kept with it
     if str_at(&result, &["id"]).as_deref() != Some(rid.as_str()) {
         result = Value::Null;
     }
@@ -224,9 +223,12 @@ fn keep_remote(
         .get("rc")
         .and_then(Value::as_i64)
         .filter(|_| outcome == "exited");
-    let log = result.get("network").and_then(NetLog::lenient);
+    // a log this burner can't read, or another run's, is no log
+    let log = result
+        .get("network")
+        .and_then(NetLog::lenient)
+        .filter(|l| l.id == rid);
     if log.is_none() && result.is_object() {
-        // a log this burner can't read is no log
         result["network"] = Value::Null;
     }
     let elapsed = t0.elapsed().as_secs_f64();
@@ -264,19 +266,29 @@ fn keep_remote(
     let dir = copies_dir().ok_or_else(|| io::Error::other("no home to keep -H runs in"))?;
     make_dirs(&dir)?;
     let cfg = client_config();
+    // a far end that says an id again doesn't replace what it said before
     store(
         &dir,
-        &format!("{rid}@{}.json", slug(host)),
+        &format!("{rid}@{}", slug(host)),
         &head,
         &result,
         &cfg.log,
+        false,
     )?;
     Ok(cfg.log.keep_runs > 0 && cfg.log.keep_days > 0)
 }
 
-/// a record goes in whole or not at all: written aside, then renamed. then
-/// the oldest of that owner's go
-fn store(dir: &Path, name: &str, head: &Head, result: &Value, keep: &Log) -> io::Result<()> {
+/// a record goes in whole or not at all: written aside under a name of its
+/// own, then put in place. `replace` or not: a copy never replaces another,
+/// it gets `STEM.N.json` instead. then the oldest of that owner's go
+fn store(
+    dir: &Path,
+    stem: &str,
+    head: &Head,
+    result: &Value,
+    keep: &Log,
+    replace: bool,
+) -> io::Result<()> {
     if keep.keep_runs > 0 && keep.keep_days > 0 {
         let mut b = serde_json::to_vec(head)?;
         if b.len() >= HEAD_CAP {
@@ -285,20 +297,33 @@ fn store(dir: &Path, name: &str, head: &Head, result: &Value, keep: &Log) -> io:
         b.push(b'\n');
         serde_json::to_writer(&mut b, result)?;
         b.push(b'\n');
-        let path = dir.join(name);
-        let tmp = dir.join(format!("{name}.new"));
-        let _ = fs::remove_file(&tmp);
+        let tmp = dir.join(format!("{stem}.{}.new", crate::sys::random_hex(6)?));
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
-        let wrote = f.write_all(&b).and_then(|()| f.sync_all());
-        if let Err(e) = wrote.and_then(|()| fs::rename(&tmp, &path)) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
+        // no fsync: a record cut short by a crash is skipped when it's read,
+        // and keeping one is never worth holding up the run
+        let put = f.write_all(&b).and_then(|()| {
+            if replace {
+                return fs::rename(&tmp, dir.join(format!("{stem}.json")));
+            }
+            for n in 1..=keep.keep_runs.min(1000) {
+                let name = match n {
+                    1 => format!("{stem}.json"),
+                    n => format!("{stem}.{n}.json"),
+                };
+                match fs::hard_link(&tmp, dir.join(name)) {
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                    r => return r,
+                }
+            }
+            Err(io::Error::other("too many records with that name"))
+        });
+        let _ = fs::remove_file(&tmp);
+        put?;
     }
     prune_dir(dir, keep);
     Ok(())
@@ -317,9 +342,8 @@ fn prune_dir(dir: &Path, keep: &Log) {
         let name = name.to_string_lossy();
         if record_name(&name).is_some() {
             records.push((t, e.path()));
-        } else if name
-            .strip_suffix(".new")
-            .is_some_and(|n| record_name(n).is_some())
+        } else if name.starts_with("burner-")
+            && name.ends_with(".new")
             && t.elapsed().is_ok_and(|d| d > Duration::from_secs(600))
         {
             let _ = fs::remove_file(e.path());
@@ -446,14 +470,25 @@ fn client_config() -> Config {
     Config::load(&crate::config::default_path()).unwrap_or_default()
 }
 
-/// where this user's -H copies go
+/// where this user's -H copies go: on linux the XDG state dir, on a mac
+/// burner's own store, or the XDG state dir when $XDG_STATE_HOME is set
 fn copies_dir() -> Option<PathBuf> {
     // SAFETY: getuid can't fail
     let me = unsafe { libc::getuid() };
     #[cfg(target_os = "macos")]
-    return Some(machine_dir(&client_config()).join(me.to_string()));
+    return Some(match xdg_state() {
+        Some(d) => d.join("burner/logs"),
+        None => machine_dir(&client_config()).join(me.to_string()),
+    });
     #[cfg(target_os = "linux")]
     return state_home(me, true).map(|d| d.join("burner/logs"));
+}
+
+/// $XDG_STATE_HOME, when it's set to an absolute path
+fn xdg_state() -> Option<PathBuf> {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|d| d.is_absolute())
 }
 
 /// a user's XDG state dir: $XDG_STATE_HOME when it's absolute, else
@@ -461,10 +496,7 @@ fn copies_dir() -> Option<PathBuf> {
 /// environment is the caller's only when `env` says it may be
 #[cfg(target_os = "linux")]
 fn state_home(uid: u32, env: bool) -> Option<PathBuf> {
-    if env
-        && let Some(d) = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
-        && d.is_absolute()
-    {
+    if env && let Some(d) = xdg_state() {
         return Some(d);
     }
     home_of(uid).map(|h| h.join(".local/state"))
@@ -527,11 +559,13 @@ impl Kept {
     /// copy's with the lenient ones
     pub fn network(&self) -> Option<NetLog> {
         let n = self.result.get("network").filter(|n| !n.is_null())?;
-        if self.copy {
-            NetLog::lenient(n)
+        let log: NetLog = if self.copy {
+            NetLog::lenient(n)?
         } else {
-            serde_json::from_value(n.clone()).ok()
-        }
+            serde_json::from_value(n.clone()).ok()?
+        };
+        // another run's log is none of this one's
+        (log.id == self.head.id).then_some(log)
     }
 
     /// `run` in burner log --json: the head, and the result without the
@@ -624,7 +658,7 @@ impl Store {
                 sources.push(Source {
                     dir: d,
                     uid: me,
-                    copies_only: false,
+                    copies_only: true,
                     owner: Some(me),
                 });
             }
@@ -757,7 +791,7 @@ fn read(path: &Path, s: &Source) -> Option<Kept> {
     } else {
         // burner's own: read with the types it was written from
         let r: RunResult = serde_json::from_value(result.clone()).ok()?;
-        if r.id != id {
+        if r.id != id || r.network.as_ref().is_some_and(|n| n.id != id) {
             return None;
         }
     }
@@ -1002,14 +1036,7 @@ mod tests {
         };
         for i in 0..5 {
             let r = result(&id(i), None);
-            store(
-                &d,
-                &format!("{}.json", id(i)),
-                &head(&id(i), None),
-                &r,
-                &keep,
-            )
-            .unwrap();
+            store(&d, &id(i), &head(&id(i), None), &r, &keep, true).unwrap();
             age(&d.join(format!("{}.json", id(i))), 1000 - i as u64);
         }
         // a write that didn't finish, from long ago
@@ -1036,14 +1063,7 @@ mod tests {
             keep_days: 30,
         };
         let r = result(&id(7), None);
-        store(
-            &d,
-            &format!("{}.json", id(7)),
-            &head(&id(7), None),
-            &r,
-            &none,
-        )
-        .unwrap();
+        store(&d, &id(7), &head(&id(7), None), &r, &none, true).unwrap();
         assert!(records_in(&d).is_empty());
         fs::remove_dir_all(&d).unwrap();
     }
@@ -1054,14 +1074,7 @@ mod tests {
         let keep = Log::default();
         let mut l = log(&id(1));
         let r = result(&id(1), Some(l.clone()));
-        store(
-            &d,
-            &format!("{}.json", id(1)),
-            &head(&id(1), None),
-            &r,
-            &keep,
-        )
-        .unwrap();
+        store(&d, &id(1), &head(&id(1), None), &r, &keep, true).unwrap();
         age(&d.join(format!("{}.json", id(1))), 100);
         // a copy from a newer far end: a field more in the log and the head
         l["report"] = "x".into();
@@ -1069,7 +1082,10 @@ mod tests {
             "guest_error": "a\u{9b}b", "network": l});
         let mut h = head(&id(1), Some("mini"));
         h.exit = 3;
-        store(&d, &format!("{}@mini.json", id(1)), &h, &copy, &keep).unwrap();
+        store(&d, &format!("{}@mini", id(1)), &h, &copy, &keep, false).unwrap();
+        // the same id from that host again: kept beside it, not over it
+        store(&d, &format!("{}@mini", id(1)), &h, &copy, &keep, false).unwrap();
+        assert!(d.join(format!("{}@mini.2.json", id(1))).exists());
         let mut hv = serde_json::to_value(head(&id(2), Some("pi"))).unwrap();
         hv["newer"] = true.into();
         hv["img"] = "evil\u{9b}31m".into();
@@ -1080,7 +1096,7 @@ mod tests {
         .unwrap();
         let s = Store::at(&[(&d, false)]);
         let all = s.list(|_| true, 10);
-        assert_eq!(all.len(), 3, "{all:?}");
+        assert_eq!(all.len(), 4, "{all:?}");
         assert_eq!(all[0].id, id(2));
         assert_eq!(all[0].img, "evil?31m");
         // by id: this machine's first
@@ -1095,6 +1111,10 @@ mod tests {
         assert_eq!(k.network().unwrap().summary.allowed, 1);
         assert_eq!(k.result["guest_error"], "a?b");
         assert!(s.find(Some("../../etc/passwd")).is_none());
+        // a copy with another run's log in it has no log
+        let mut k = k;
+        k.result["network"]["id"] = id(5).into();
+        assert!(k.network().is_none());
         // the newest without an id
         assert_eq!(s.find(None).unwrap().head.id, id(2));
         fs::remove_dir_all(&d).unwrap();
@@ -1154,6 +1174,14 @@ mod tests {
             line(&head(&id(9), None), &vmm),
         )
         .unwrap();
+        // a log in it that's another run's
+        let mut swapped = result(&id(13), Some(log(&id(14))));
+        swapped["id"] = id(13).into();
+        fs::write(
+            d.join(format!("{}.json", id(13))),
+            line(&head(&id(13), None), &swapped),
+        )
+        .unwrap();
         // a copy whose result is another run's
         let wrong = line(&head(&id(10), Some("x")), &result(&id(11), None));
         fs::write(d.join(format!("{}@x.json", id(10))), wrong).unwrap();
@@ -1166,14 +1194,7 @@ mod tests {
         assert!(s.find(None).is_none());
         // and the same written by store is fine
         let r = result(&id(12), None);
-        store(
-            &d,
-            &format!("{}.json", id(12)),
-            &head(&id(12), None),
-            &r,
-            &keep,
-        )
-        .unwrap();
+        store(&d, &id(12), &head(&id(12), None), &r, &keep, true).unwrap();
         assert_eq!(s.list(|_| true, 20).len(), 1);
         fs::remove_dir_all(&d).unwrap();
     }
