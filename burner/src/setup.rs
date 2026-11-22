@@ -231,6 +231,7 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let _setup = sys::Lock::exclusive_until(&cfg.paths.state.join("setup.lock"), Instant::now())
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
+    recover_all(root)?;
     let stage = Stage::new(root)?;
     let files: Vec<String> = std::iter::once(KERNEL.to_string())
         .chain(imgs.iter().map(|i| asset(i)))
@@ -437,6 +438,7 @@ fn remove(cfg: &Config) -> Result<ExitCode> {
         // no VM may be using the kernel or an image, and none starts meanwhile
         let ledger = idle(cfg, "remove their kernel and image")?;
         sweep(root);
+        recover_all(root)?;
         let kernel = root.join("kernel").join("vmlinux");
         let imgs = IMAGES.iter().map(|i| root.join("images").join(i));
         for p in std::iter::once(kernel).chain(imgs) {
@@ -568,6 +570,16 @@ fn kept_old(dest: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     dest.with_file_name(format!(".{name}.old"))
+}
+
+/// what a setup killed mid-swap left, for every image setup installs, right
+/// after the setup lock and before anything is fetched, so a setup that then
+/// fails (offline, say) has still put the old image back
+fn recover_all(root: &Path) -> Result<()> {
+    for img in IMAGES {
+        recover(&root.join("images").join(img))?;
+    }
+    Ok(())
 }
 
 /// an image dir a setup killed between swap_dir's two renames left aside:

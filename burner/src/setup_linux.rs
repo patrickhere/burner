@@ -18,8 +18,8 @@ use clap::Args;
 
 use super::{
     IMAGES, MAX_SUMS, SUMS, SWAPPING, Stage, asset, defaults, download_listed, fetch_sums, go_on,
-    gunzip, idle, own_release, package_list, real_dir, recover, replaceable, say, sum_for,
-    swap_dir, sweep, wanted,
+    gunzip, idle, own_release, package_list, real_dir, recover, recover_all, replaceable, say,
+    sum_for, swap_dir, sweep, wanted,
 };
 use crate::config::{self, Config};
 use crate::json::{self, Kind};
@@ -76,7 +76,15 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
             root.display()
         );
     }
-    // as root, a dir anyone else can write would hand them the images
+    // as root, a dir anyone else can write would hand them the images. a
+    // symlink on the way is refused outright: the dir it sits in could be
+    // someone else's, and trusted_file only checks where it leads
+    if fs::canonicalize(root).with_context(|| format!("checking {}", root.display()))? != *root {
+        bail!(
+            "{} goes through a symlink, set paths.root to the real dir",
+            root.display()
+        );
+    }
     config::trusted_file(root)?;
     let base = own_release();
     let kept = kept_sums(root)?;
@@ -88,6 +96,7 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let _setup = sys::Lock::exclusive_until(&cfg.paths.state.join("setup.lock"), Instant::now())
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
+    recover_all(root)?;
     let stage = Stage::new(root)?;
     let sums = match &kept {
         Some((path, text)) => {
