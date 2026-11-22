@@ -76,6 +76,9 @@ class Burner < Formula
         burner setup
       burner setup debian fetches the debian image too.
       then burner doctor checks the rest. VMs run as you, no sudo.
+      after every brew upgrade burner, run burner setup again (and burner
+      setup debian if you have it): the images go with the burner they came with.
+      to remove it all: burner setup --remove, then brew uninstall burner.
     EOS
   end
 
