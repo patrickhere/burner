@@ -1360,8 +1360,8 @@ pub fn tunnel_words(t: &Tunnel, uplink: Option<&str>) -> String {
             "the default route is on {dev}, a vpn: VM traffic goes out through it, into whatever network it leads to"
         ),
         Tunnel::Policy { dev, table } => format!(
-            "{dev} has a default route in table {table} (a full-tunnel vpn by policy routing): VM packets use burner's \
-             own table, so VM traffic leaves outside the vpn, through {} from this host's own address",
+            "{dev} has a default route in table {table}, a full-tunnel vpn when a policy rule picks that table: \
+             VM packets use burner's own table, so VM traffic leaves outside the vpn, through {} from this host's own address",
             uplink.unwrap_or("the uplink")
         ),
     }
