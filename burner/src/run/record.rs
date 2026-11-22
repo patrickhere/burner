@@ -4,13 +4,13 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use super::{EXIT_INTERRUPTED, EXIT_USAGE};
 use crate::json::{Kind, Problem};
 
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunOutcome {
     Exited,
@@ -24,7 +24,8 @@ pub enum RunOutcome {
     Reboot,
     /// the shell was left with ~.
     Detached,
-    // reserved for -H, not written yet
+    // burner -H: no address answered or ssh failed, burner didn't start
+    // there, the connection went during the run
     Unreachable,
     RemoteError,
     Lost,
@@ -342,6 +343,57 @@ impl Rec {
     }
 }
 
+/// a burner -H run that ended without the far end saying how: no address
+/// answered, burner didn't start there, the connection went. `id` when the
+/// far end had said which VM it started
+pub fn client_end(
+    start: Instant,
+    code: u8,
+    outcome: RunOutcome,
+    id: Option<&str>,
+    why: Problem,
+) -> Finished {
+    with(|r| {
+        if let Some(id) = id {
+            r.id = Some(id.into());
+        }
+        r.outcome = Some((outcome, None));
+        r.finish(start, Instant::now(), code, Some(why))
+    })
+}
+
+/// the --status-fd line for a burner -H run, from the json the far end
+/// ended with. its own words for the outcome, mapped the way a local line
+/// maps them; one this burner doesn't know is a sandbox error
+pub fn status_line_of(env: &Value, code: u8, secs: f64) -> String {
+    let r = env.get("result").filter(|r| r.is_object());
+    let outcome = match r.and_then(|r| r.get("outcome")).cloned() {
+        Some(o) => serde_json::from_value::<RunOutcome>(o)
+            .map(RunOutcome::legacy)
+            .unwrap_or("sandbox_error"),
+        None if code == EXIT_USAGE => "usage",
+        None if code == EXIT_INTERRUPTED => "interrupted",
+        None => "sandbox_error",
+    };
+    let rc = r
+        .and_then(|r| r.get("rc"))
+        .and_then(Value::as_i64)
+        .filter(|rc| (0..=255).contains(rc) && outcome == "exited");
+    let id = r
+        .and_then(|r| r.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| crate::ledger::valid_id(id));
+    let secs = r
+        .and_then(|r| r.get("secs"))
+        .and_then(Value::as_f64)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(secs);
+    json!({"outcome": outcome, "rc": rc, "exit": code, "id": id,
+           "secs": (secs * 10.0).round() / 10.0})
+    .to_string()
+        + "\n"
+}
+
 impl Finished {
     /// the --status-fd line, byte for byte what burner wrote before the json:
     /// sorted keys, secs to a tenth, usage when the run never got going
@@ -432,6 +484,32 @@ mod tests {
             r#"{"exit":125,"id":null,"outcome":"sandbox_error","rc":null,"secs":0.0}"#.to_string()
                 + "\n"
         );
+    }
+
+    #[test]
+    fn status_lines_from_the_far_end() {
+        let env: Value = serde_json::from_str(
+            r#"{"exit":3,"result":{"id":"burner-3f9a1c2b7d10","outcome":"exited","rc":3,"secs":10.449}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_line_of(&env, 3, 0.0),
+            r#"{"exit":3,"id":"burner-3f9a1c2b7d10","outcome":"exited","rc":3,"secs":10.4}"#
+                .to_string()
+                + "\n"
+        );
+        // an outcome from a newer burner, an id that isn't one, no result
+        let odd: Value = serde_json::from_str(
+            r#"{"result":{"id":"x/../y","outcome":"teleported","rc":3,"secs":"soon"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            status_line_of(&odd, 125, 2.04),
+            r#"{"exit":125,"id":null,"outcome":"sandbox_error","rc":null,"secs":2.0}"#.to_string()
+                + "\n"
+        );
+        let none: Value = serde_json::from_str(r#"{"result":null}"#).unwrap();
+        assert!(status_line_of(&none, 2, 0.0).contains(r#""outcome":"usage""#));
     }
 
     #[test]

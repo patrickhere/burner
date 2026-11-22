@@ -38,6 +38,8 @@ pub mod output;
 #[doc(hidden)]
 pub mod probe;
 #[doc(hidden)]
+pub mod remote;
+#[doc(hidden)]
 pub mod result;
 #[doc(hidden)]
 pub mod run;

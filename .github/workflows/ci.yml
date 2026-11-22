@@ -53,6 +53,35 @@ jobs:
             "$f" --version
           done
 
+  # burner -H over ssh to a private sshd on localhost, with a stand-in burner
+  # on the far end: every rule the client has, no kvm needed. the only ci
+  # run of burner's tests on a mac, and of the quoting tests through zsh,
+  # fish, dash and ksh
+  remote:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: toolchain and shells
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get install -y -qq zsh fish dash ksh
+          else
+            brew update --quiet
+            brew install libkrun fish
+          fi
+      - run: cargo test --locked -p burnervm
+      - run: cargo build --locked -p burnervm
+      - run: BURNER=target/debug/burner bash tests/remote.sh --fake-only
+
   shell:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -60,6 +89,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck install.sh get.sh guest/init tools/build-image tools/formula-shas
+      - run: shellcheck install.sh get.sh guest/init tools/build-image tools/formula-shas burner/src/remote/wrap.sh
       # the suites run as a user with sudo and redirect on purpose
       - run: shellcheck -S warning -e SC2024 tests/*.sh

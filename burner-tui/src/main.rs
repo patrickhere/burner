@@ -24,6 +24,8 @@ use burner::{Burner, Mode};
 use keys::Keys;
 
 const REFRESH: Duration = Duration::from_secs(2);
+/// every refresh of a remote host's list is a new ssh connection
+const REFRESH_REMOTE: Duration = Duration::from_secs(5);
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -232,26 +234,34 @@ enum Msg {
 }
 
 fn main() -> ExitCode {
-    if let Some(a) = std::env::args().nth(1) {
-        match a.as_str() {
-            "-V" | "--version" => println!("burner-tui {}", env!("CARGO_PKG_VERSION")),
-            "-h" | "--help" => println!(
-                "burner-tui: pick an image and settings, start a burner shell or run, watch and kill running VMs\n\
-                 runs $BURNER (default: burner on PATH), through sudo when not root. ? inside shows the keys"
-            ),
-            _ => {
-                eprintln!("burner-tui: takes no arguments, try --help");
-                return ExitCode::from(2);
-            }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut host = None;
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] => {}
+        ["-V" | "--version"] => {
+            println!("burner-tui {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
         }
-        return ExitCode::SUCCESS;
+        ["-h" | "--help"] => {
+            println!(
+                "burner-tui [-H HOST]: pick an image and settings, start a burner shell or run, watch and kill running VMs\n\
+                 runs $BURNER (default: burner on PATH), through sudo when not root. -H (or $BURNER_HOST) drives\n\
+                 that host over ssh with burner -H, as you. ? inside shows the keys"
+            );
+            return ExitCode::SUCCESS;
+        }
+        ["-H" | "--host", h] => host = Some(h.to_string()),
+        _ => {
+            eprintln!("burner-tui: takes only -H HOST, try --help");
+            return ExitCode::from(2);
+        }
     }
     // SAFETY: isatty only looks at the fd
     if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
         eprintln!("burner-tui: needs a terminal");
         return ExitCode::from(2);
     }
-    match run() {
+    match run(host) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("burner-tui: {e}");
@@ -260,13 +270,22 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> io::Result<()> {
-    let b = Burner::from_env();
-    let (images, images_err) = match burner::output(&b.quiet(&["images"])) {
+/// the image list for the host in use, and what went wrong getting it
+fn images(b: &Burner) -> (Vec<String>, Option<String>) {
+    match burner::output(&b.quiet(&["images"])) {
         Ok(out) => (burner::parse_images(&out), None),
         Err(e) => (Vec::new(), Some(e)),
-    };
-    let mut app = App::new(b, images);
+    }
+}
+
+fn run(host: Option<String>) -> io::Result<()> {
+    let b = Burner::from_env(host);
+    let hosts = burner::output(&b.hosts_argv())
+        .map(|o| burner::parse_hosts(&o))
+        .unwrap_or_default();
+    let (imgs, images_err) = images(&b);
+    let mut app = App::new(b, imgs);
+    app.hosts = hosts;
     if let Some(e) = images_err {
         app.status = format!("burner images: {e}");
     }
@@ -307,9 +326,11 @@ fn run() -> io::Result<()> {
             }
         }
         // only poll while the list is on screen, every call is a sudo log line
-        if app.screen == Screen::Running
-            && !asking
-            && last_ls.is_none_or(|t| t.elapsed() >= REFRESH)
+        let every = match app.burner.host {
+            Some(_) => REFRESH_REMOTE,
+            None => REFRESH,
+        };
+        if app.screen == Screen::Running && !asking && last_ls.is_none_or(|t| t.elapsed() >= every)
         {
             asking = true;
             last_ls = Some(Instant::now());
@@ -330,6 +351,20 @@ fn run() -> io::Result<()> {
                 Action::Nothing => {}
                 Action::Quit => break 'main,
                 Action::Refresh => last_ls = None,
+                Action::Host(h) => {
+                    app.burner.host = Some(h).filter(|h| h != "local");
+                    let (imgs, err) = images(&app.burner);
+                    app.images = imgs;
+                    app.image = 0;
+                    app.ls = None;
+                    app.ls_err = None;
+                    app.selected = 0;
+                    app.status = match err {
+                        Some(e) => format!("burner images: {e}"),
+                        None => format!("host: {}", app.burner.host.as_deref().unwrap_or("local")),
+                    };
+                    last_ls = None;
+                }
                 Action::Kill(id) => {
                     let (tx, argv) = (tx.clone(), app.burner.quiet(&["kill", &id]));
                     thread::spawn(move || {
@@ -371,7 +406,10 @@ fn hand_over(
     // the child starts with the default again
     handle(libc::SIGINT, ignore);
     handle(libc::SIGQUIT, ignore);
-    let res = Command::new(&argv[0]).args(&argv[1..]).status();
+    let res = Command::new(&argv[0])
+        .args(&argv[1..])
+        .env_remove("BURNER_HOST")
+        .status();
     let msg = match &res {
         Ok(st) => burner::describe_exit(st.code()),
         Err(e) => format!("can't run {}: {e}", argv[0]),

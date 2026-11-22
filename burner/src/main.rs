@@ -10,18 +10,23 @@ use burnervm::json::{self, Kind};
 use burnervm::net;
 #[cfg(target_os = "macos")]
 use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, explain, probe, result, run};
+use burnervm::{doctor, exit, explain, probe, remote, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// config file
-    #[arg(long, global = true, default_value_os_t = config::default_path())]
-    config: PathBuf,
+    /// config file [default: /etc/burner/config.toml, on macOS in
+    /// ~/Library/Application Support/burner]
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     /// write one JSON document (docs/json.md) instead of text
     #[arg(long, global = true)]
     json: bool,
+    /// run it on this host over ssh: a name from ~/.config/burner/hosts.toml
+    /// or an ssh host. local means here. default: $BURNER_HOST
+    #[arg(short = 'H', long = "host", global = true, value_name = "HOST")]
+    host: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -56,6 +61,12 @@ enum Cmd {
     Images,
     /// this burner's version, backend and the json and guest protocol it speaks
     Version,
+    /// the hosts -H knows, from ~/.config/burner/hosts.toml
+    Hosts {
+        /// try every address now
+        #[arg(long)]
+        check: bool,
+    },
     /// fetch the guest kernel and alpine image from a release and install them
     #[cfg(target_os = "macos")]
     Setup(setup::SetupArgs),
@@ -93,7 +104,7 @@ fn main() -> ExitCode {
     };
     json::set_on(cli.json);
     if let Cmd::ParseResult { emit } = &cli.cmd {
-        return result::child_main(emit == "1");
+        return result::child_main(emit);
     }
     #[cfg(target_os = "linux")]
     if let Cmd::ReadNetlog = &cli.cmd {
@@ -106,6 +117,9 @@ fn main() -> ExitCode {
         _ => {}
     }
     let name = cli.cmd.name();
+    if let Some(code) = remote(&cli) {
+        return code;
+    }
     match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -201,6 +215,7 @@ impl Cmd {
             Cmd::Kill { .. } => "kill",
             Cmd::Images => "images",
             Cmd::Version => "version",
+            Cmd::Hosts { .. } => "hosts",
             #[cfg(target_os = "macos")]
             Cmd::Setup(_) => "setup",
             Cmd::Reap => "reap",
@@ -251,7 +266,7 @@ fn parse_failed(e: clap::Error) -> ExitCode {
 fn command_word(args: &[String]) -> Option<&'static str> {
     let mut words = args.iter().scan(false, |skip, a| {
         let this = !*skip && !a.starts_with('-');
-        *skip = a == "--config";
+        *skip = matches!(a.as_str(), "--config" | "-H" | "--host");
         Some((this, a.as_str()))
     });
     let first = words.find(|(w, _)| *w)?.1;
@@ -269,10 +284,83 @@ fn command_word(args: &[String]) -> Option<&'static str> {
     };
     [
         "config", "doctor", "run", "shell", "explain", "net up", "net down", "net show", "ls",
-        "log", "kill", "images", "setup", "version",
+        "log", "kill", "images", "setup", "version", "hosts",
     ]
     .into_iter()
     .find(|c| *c == full)
+}
+
+/// -H or BURNER_HOST: the command goes to that host over ssh, and nothing
+/// here is loaded. None when it runs here
+fn remote(cli: &Cli) -> Option<ExitCode> {
+    use remote::hosts;
+    use remote::ssh::Mode;
+    let name = cli.cmd.name();
+    // the far end of -H always runs here. the wrapper drops BURNER_HOST, and
+    // a run or shell started for a client never looks
+    match &cli.cmd {
+        Cmd::Run(a) if a.is_remote() => return None,
+        Cmd::Shell(a) if a.is_remote() => return None,
+        Cmd::ParseResult { .. } | Cmd::Hosts { .. } => return None,
+        _ => {}
+    }
+    let env = std::env::var("BURNER_HOST").ok();
+    let value = hosts::pick(cli.host.as_deref(), env.as_deref())?;
+    let usage = |msg: String| Some(json::fail(name, exit::EXIT_USAGE, Kind::Usage, msg));
+    // before hosts.toml is read: as root it would be someone else's file
+    if let Some(why) = remote::client::refuse_here() {
+        return usage(why);
+    }
+    let host = match hosts::load(&hosts::path()).and_then(|h| hosts::lookup(&value, &h)) {
+        Ok(h) => h,
+        Err(e) => {
+            return Some(json::fail(
+                name,
+                exit::EXIT_USAGE,
+                Kind::Config,
+                format!("{e:#}"),
+            ));
+        }
+    };
+    let config = cli
+        .config
+        .as_ref()
+        // one word, so a path that looks like a flag stays the value
+        .map(|c| vec![format!("--config={}", c.to_string_lossy())])
+        .unwrap_or_default();
+    let words = |w: &[&str]| -> Vec<String> {
+        w.iter()
+            .map(|s| s.to_string())
+            .chain(config.clone())
+            .collect()
+    };
+    let h = &host.name;
+    Some(match &cli.cmd {
+        Cmd::Ls => remote::client::oneshot(&host, "ls", words(&["ls"]), Mode::Auto),
+        // checked here: an id like -Hother would be a flag on the far end
+        Cmd::Kill { id } if !burnervm::ledger::valid_id(id) => {
+            return usage("usage: burner kill burner-xxxxxxxxxxxx".into());
+        }
+        Cmd::Kill { id } => {
+            remote::client::oneshot(&host, "kill", words(&["kill", id]), Mode::Auto)
+        }
+        // the sudo rule names `burner images` exactly, so no --config for it
+        Cmd::Images => {
+            remote::client::oneshot(&host, "images", vec!["images".to_string()], Mode::Auto)
+        }
+        // config needs no root there, and isn't in the sudo rule
+        Cmd::Config => remote::client::oneshot(&host, "config", words(&["config"]), Mode::User),
+        Cmd::Version => remote::client::oneshot(&host, "version", words(&["version"]), Mode::User),
+        Cmd::Run(a) => remote::client::run(&host, a, &config),
+        Cmd::Shell(a) => remote::pty::shell(&host, &run::shell_run_args(a), &config),
+        Cmd::Doctor(a) if !a.probe => remote::doctor::doctor(&host, &config),
+        _ => {
+            let what = name.split(' ').next().unwrap_or(name);
+            return usage(format!(
+                "burner {what} runs on the machine itself, not over -H (ssh {h} sudo burner {name}, or -H local here)"
+            ));
+        }
+    })
 }
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -286,6 +374,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
         }
         return Ok(json::reply("version", 0, Some(v)));
+    }
+    if let Cmd::Hosts { check } = cli.cmd {
+        return Ok(remote::doctor::hosts(check));
     }
     let t0 = Instant::now();
     // a shell is a run with the caller's terminal from here on
@@ -301,7 +392,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     // run and shell end with 125 when they have no result, a config that
     // doesn't load included, and run still writes its status line
-    let cfg = match Config::load(&cli.config) {
+    let config_path = cli.config.clone().unwrap_or_else(config::default_path);
+    let cfg = match Config::load(&config_path) {
         Ok(cfg) => cfg,
         Err(e) => {
             if let Some(a) = &run_args {
@@ -326,11 +418,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(json::reply("config", 0, Some(&cfg)))
         }
-        Cmd::Doctor(a) if a.probe => Ok(probe_done(&cfg, &cli.config, &a)),
+        Cmd::Doctor(a) if a.probe => Ok(probe_done(&cfg, &config_path, &a)),
         #[cfg(target_os = "linux")]
         Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
-        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
+        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg, &config_path))),
         Cmd::Run(_) => Ok(run::main(&cfg, &run_args.expect("set for run"))),
         Cmd::Shell(_) => Ok(run::shell_main(&cfg, &run_args.expect("set for shell"))),
         // not there on this OS rather than failed, like a wrong flag
@@ -388,7 +480,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reap => run::reap(&cfg),
-        Cmd::Version => unreachable!("handled before the config loads"),
+        Cmd::Version | Cmd::Hosts { .. } => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
@@ -413,6 +505,8 @@ mod tests {
         let w = |a: &[&str]| command_word(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(w(&["--json", "ls"]), Some("ls"));
         assert_eq!(w(&["--config", "ls", "kill", "--json"]), Some("kill"));
+        assert_eq!(w(&["-H", "ls", "images", "--json"]), Some("images"));
+        assert_eq!(w(&["--host", "kill", "ls"]), Some("ls"));
         assert_eq!(w(&["net", "--json", "up"]), Some("net up"));
         assert_eq!(w(&["net", "sideways"]), None);
         assert_eq!(w(&["reap", "--json"]), None);

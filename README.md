@@ -196,6 +196,62 @@ if ufw is on, `burner doctor` prints the one route rule it needs. settings live 
 
 anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, use `dist/sudoers.example`: it allows `run`, `shell`, `ls`, `kill` and `images`. through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `[limits]` in the config apply to everyone.
 
+## remote hosts
+
+`burner -H HOST` runs any of `run`, `shell`, `ls`, `kill`, `images`, `config`, `doctor` and `version` on another machine over ssh, with your own keys, agent and `~/.ssh/config`. nothing listens anywhere and nothing new runs as root: the laptop only starts `ssh`, as you, and burner on the far end runs as it would there by hand.
+
+```
+burner -H mini shell
+burner -H vps run --net web -- 'curl -sI https://example.com'
+git archive HEAD | burner -H gaming run --in tar -- 'npm ci && npm test'
+```
+
+hosts go in `~/.config/burner/hosts.toml` (`$XDG_CONFIG_HOME/burner/hosts.toml`, on a mac too):
+
+```toml
+[hosts.mini]
+addrs = ["10.1.0.81", "mini.tail1234.ts.net"]   # tried in this order
+
+[hosts.gaming]
+addrs = ["10.1.10.139", "gaming.tail1234.ts.net"]
+user = "patrick"              # else your ssh config, else your login name
+port = 22                     # else your ssh config
+connect_timeout = "2s"        # per address, 1s to 30s, default 3s
+burner = "/usr/local/bin/burner"   # where it is there, if not the usual place
+```
+
+- an address is an ip, a dns name or a `Host` from your ssh config, so `ProxyJump` and the rest apply. a host's addresses are all tried at once, and the first one in the list that answers wins: once any has, the ones before it get 300ms more. at home the LAN address wins, away the tailnet one does, and nothing is remembered between runs. one behind a ProxyJump can't be tried that way, it's used when everything before it failed
+- a `-H` name that isn't in hosts.toml is used as an ssh destination (`user@` too), so `burner -H vps ls` works with only `Host vps` in your ssh config. `BURNER_HOST=mini` does the same as `-H mini` for every command in that shell, and `-H local` means this machine whatever it says
+- there's no place for a password or a key in the file, auth is ssh's. burner won't use the file if anyone but you (or root) could have written it or a directory above it
+- every connection goes out with agent, X11 and port forwarding off, ssh's own `~` escape off, and host keys checked strictly: a host ssh doesn't know yet, or one whose key changed, is refused and never added to known_hosts. a changed key on the first address stops there, it doesn't quietly move on to the next one. `ssh HOST` once to check and add a new host's key
+- on linux the far end runs burner through `sudo -n`, so the user you ssh in as needs the rule in `dist/sudoers.example`. a password prompt never comes up, `burner -H HOST doctor` says what the rule allows. ssh'd in as root it runs without sudo, and on a mac it runs as you. a mac host only needs Remote Login on, and works with nobody logged in at its screen
+- `burner -H HOST doctor` checks the way there (each address, ssh, burner's version on both ends, the sudo rule) and then shows that host's own doctor. `burner hosts` lists the file, `--check` tries every address
+- `burner -H` refuses to run as root or through sudo: root has other keys and another known_hosts. `net`, `reap` and `setup` don't go over -H, they're for the machine itself
+
+a result over `-H` is only as trustworthy as the host it ran on. that host runs the VM and the burner that reports on it, so a compromised one can make up the output, the exit code, the json and the result tar, and burner here has no way to check them against what really happened. what burner does guarantee is that a hostile host can't reach past its own results into your machine:
+
+- the far end's output is escaped on your terminal like a local run's, and a shell's goes through the same terminal filter: no title, clipboard or query escapes reach your terminal, and it's reset at the end from what was really written to it
+- `~.` in a shell is read here and ends the session without asking the far end, and ctrl-c in a run stops ssh here. either way burner there sees ssh go and stops the VM
+- a `--result tar` is parsed again here by the same limited parser a guest's tar gets, so only regular files and directories with clean names reach your `tar -x`
+- the exit code comes from a line marked with a nonce that only burner there knows, so the VM can't forge it (the host can). the line has to be schema 1 json whose exit code goes with its outcome, or the run is 125 `remote_error`. a host that doesn't answer, a burner there that doesn't start, and a connection that goes in the middle all end in 125, outcome `unreachable`, `remote_error` or `lost` in `--json-fd`. ssh's own 255 never comes out as burner's: a command that really exits 255 does
+- your flags and host keys: what goes over is rebuilt from parsed arguments so nothing becomes a flag there, forwarding is always off, and a host key is never accepted or written
+- a different burner version on the far end is fine as long as it takes the arguments, `doctor` warns. one that doesn't is refused with a message saying which one to update
+
+things to know:
+
+- the command line shows up in the far end's process list and in its sudo log, like it would if you typed it there. secrets go in through `--in`, never on the command line
+- a laptop that sleeps in the middle of a shell gets `lost` after about a minute (burner sets `ServerAliveInterval` when your ssh config doesn't). the far end only notices when its TCP does, which can take hours, and until then the VM runs to its time limit. `ClientAliveInterval 30` in the host's `sshd_config` makes that a minute too
+- every `burner -H` call is a new ssh connection. burner-tui refreshes a remote list every 5s; to make that close to free, share connections in `~/.ssh/config`:
+
+  ```
+  Host mini vps gaming
+      ControlMaster auto
+      ControlPath ~/.ssh/cm-%C
+      ControlPersist 60s
+  ```
+
+- `BURNER_SSH` runs another ssh program, and `BURNER_BATCH=1` adds `BatchMode=yes` so ssh never asks for anything (burner-tui sets it for its background calls)
+
 ## from scripts and agents
 
 - exit codes, the same for every command:
@@ -206,7 +262,7 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
   | 1 | the command didn't do its job: doctor found a FAIL or doctor --probe something not as expected, explain found the filter missing or stale, log has no such run, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell |
   | 2 | usage: bad flags or arguments, needs root (or must not be root), no terminal for shell, not on this OS. nothing was started |
   | 124 | run and shell: the time limit stopped it |
-  | 125 | run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered, the network log's reader stopped. doctor --probe: its VM couldn't run |
+  | 125 | run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered, the network log's reader stopped. doctor --probe: its VM couldn't run. any command over `-H`: the host didn't answer, burner there didn't start, or the connection went |
   | 130 | a signal (ctrl-c, SIGTERM, SIGHUP) stopped burner, or burner kill stopped the VM |
   | other | run and shell: the command's own exit code |
 
@@ -237,6 +293,8 @@ exit "$code"
 
 `burner-tui` is a small terminal UI on top of the same commands. pick an image, network, cpus, memory and time limit, see the exact `sudo burner ...` line it'll run, and enter starts the shell or run in your terminal and comes back when it ends. tab shows the running VMs, refreshed every 2s, and `k` kills one after asking.
 
+`burner-tui -H mini` (or `BURNER_HOST`) drives a remote host the same way, with `burner -H` and never through sudo. `h` goes to the next host: local, then the ones in hosts.toml.
+
 it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so the sudoers rule above covers it. release tarballs have it next to burner, `cargo build --release` builds it too, and `install.sh` puts it in `/usr/local/bin`.
 
 ## why not docker, gvisor or a hosted sandbox
@@ -257,6 +315,8 @@ it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so
 ## tests
 
 `tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on, by address and by a name pointing at them, ipv6, and the connection log: that it has every blocked target, can't be forged, survives hostile dns and floods, and stops the VM when its reader dies). both need a box with burner installed and an alpine image, and run as root through sudo.
+
+`tests/remote.sh` tests `burner -H` over ssh to a private sshd on localhost, all of it in a temp dir. `--fake-only` puts a stand-in burner on the far end (hostile records, escapes, tars, a shell that hangs) and runs anywhere, a mac included; without it the real burner runs there too. run it as yourself, not root.
 
 both VM suites run on github's kvm runners on every push to main, and on a dedicated box with a LAN and vpns.
 

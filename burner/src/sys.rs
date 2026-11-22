@@ -329,6 +329,80 @@ pub fn poll_read(fds: &[i32], timeout: Duration) -> Vec<i32> {
     p.iter().filter(|x| x.revents != 0).map(|x| x.fd).collect()
 }
 
+/// a new pseudo terminal pair of the given size: (master, slave), both
+/// close-on-exec
+pub fn openpty(
+    (rows, cols): (u16, u16),
+) -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let (mut m, mut s) = (-1, -1);
+    let mut ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: openpty fills two fds; no name buffer, default termios
+    let r = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut ws,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both were just opened and are ours
+    let (m, s) = unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(m),
+            std::os::fd::OwnedFd::from_raw_fd(s),
+        )
+    };
+    for fd in [&m, &s] {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fcntl only flags the fd
+        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok((m, s))
+}
+
+/// a terminal's size, which sends its foreground job SIGWINCH
+pub fn set_term_size(fd: i32, (rows, cols): (u16, u16)) -> io::Result<()> {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads a winsize
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// whether any of `fds` hung up: a pipe or socket whose other end is gone,
+/// a terminal that was hung up. macOS only says so when asked about writing
+pub fn hung_up(fds: &[i32]) -> bool {
+    let mut p: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&fd| libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        })
+        .collect();
+    // SAFETY: p is a valid array of p.len() pollfds
+    let n = unsafe { libc::poll(p.as_mut_ptr(), p.len() as libc::nfds_t, 0) };
+    n > 0
+        && p.iter()
+            .any(|x| x.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+}
+
 /// fire-and-forget to the system log. never blocks, so it's safe under a lock
 #[cfg(target_os = "linux")]
 pub fn syslog(msg: &str) {
@@ -805,6 +879,19 @@ pub fn private_dir(path: &std::path::Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hang_ups() {
+        let mut fds = [0; 2];
+        // SAFETY: pipe(2) fills two fds
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(!hung_up(&[fds[1]]));
+        // SAFETY: closing the read end we just made
+        unsafe { libc::close(fds[0]) };
+        assert!(hung_up(&[fds[1]]));
+        // SAFETY: and the write end
+        unsafe { libc::close(fds[1]) };
+    }
 
     #[test]
     fn remove_tree_stays_inside() {

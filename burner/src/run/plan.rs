@@ -59,6 +59,10 @@ pub struct RunArgs {
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
+    /// burner -H on the far end of ssh: how it ended goes to stderr as a
+    /// marked line, and a closed stdout or stderr stops the run
+    #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
+    pub(super) remote: Option<String>,
     /// one argument runs as a shell string; several are quoted as they are
     #[arg(trailing_var_arg = true, required = true)]
     cmd: Vec<String>,
@@ -96,6 +100,142 @@ pub struct ShellArgs {
     /// the connection log when the shell ends: a summary, the full table, or nothing
     #[arg(long, value_enum, default_value_t = LogMode::Summary)]
     log: LogMode,
+    /// burner -H on the far end of ssh, see run. the ~ escape is the client's
+    #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
+    remote: Option<String>,
+}
+
+/// the remote protocol this burner speaks
+pub const REMOTE_PROTO: u32 = 1;
+
+/// `1:` and 32 lowercase hex digits. a client asking for a protocol this
+/// burner doesn't know is refused before anything starts
+fn remote_nonce(s: &str) -> Result<String, String> {
+    let (proto, nonce) = s.split_once(':').unwrap_or(("", s));
+    if proto != REMOTE_PROTO.to_string() {
+        return Err(format!(
+            "this burner ({}) speaks remote protocol {REMOTE_PROTO}, the caller asked for {}",
+            env!("CARGO_PKG_VERSION"),
+            if proto.is_empty() { "none" } else { proto }
+        ));
+    }
+    if nonce.len() != 32
+        || !nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err("the nonce is 32 lowercase hex digits".into());
+    }
+    Ok(nonce.into())
+}
+
+impl RunArgs {
+    /// started by burner -H on the far end of ssh
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    pub fn is_shell(&self) -> bool {
+        self.shell
+    }
+
+    /// stdin is the run's (--in stdin or tar)
+    pub fn reads_stdin(&self) -> bool {
+        self.input != Input::None
+    }
+
+    pub fn result_tar(&self) -> bool {
+        self.result.is_some()
+    }
+
+    pub fn status_fd(&self) -> Option<i32> {
+        self.status_fd
+    }
+
+    /// what burner -H checks here before it connects: everything that needs
+    /// no config. the image, the limits and limits.net are the far end's call
+    pub fn check_local(&self) -> std::result::Result<(), String> {
+        if let Some(t) = &self.ttl {
+            parse_ttl(t, u32::MAX).map_err(|e| e.to_string())?;
+        }
+        if net::Mode::parse(&self.net).is_none() {
+            return Err(format!("--net {:?}: use none, web or open", self.net));
+        }
+        if !valid_name(&self.img) {
+            return Err(format!("unknown image {:?} (burner images)", self.img));
+        }
+        if let Some(t) = &self.tag
+            && !valid_name(t)
+        {
+            return Err("--tag must be lowercase letters, digits and dashes, max 32".into());
+        }
+        let cmd = command_string(&self.cmd);
+        if cmd.trim().is_empty() {
+            return Err("no command given (burner run [opts] -- COMMAND)".into());
+        }
+        if cmd.len() > CMD_CAP || cmd.contains('\0') {
+            return Err("command too long or contains NUL".into());
+        }
+        if self.input != Input::None && sys::is_tty(0) {
+            return Err("--in stdin and --in tar need piped input".into());
+        }
+        if self.result.is_some() && sys::is_tty(1) {
+            return Err("--result tar writes a tar to stdout, redirect it to a file".into());
+        }
+        Ok(())
+    }
+
+    /// burner's argv on the far end, rebuilt from what was parsed: only flags
+    /// burner knows, each value one argument, the command after --. never
+    /// -H, --status-fd or --json-fd, those are the client's
+    pub fn remote_argv(&self, nonce: &str, json: bool) -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            if self.shell { "shell" } else { "run" }.into(),
+            "--remote".into(),
+            format!("{REMOTE_PROTO}:{nonce}"),
+        ];
+        let mut opt = |k: &str, val: Option<String>| {
+            if let Some(val) = val {
+                v.push(format!("--{k}"));
+                v.push(val);
+            }
+        };
+        opt("cpus", self.cpus.map(|n| n.to_string()));
+        opt("mem", self.mem.map(|n| n.to_string()));
+        opt("disk", self.disk.map(|n| n.to_string()));
+        opt("ttl", self.ttl.clone());
+        opt("tag", self.tag.clone());
+        opt("net", (!self.net_default).then(|| self.net.clone()));
+        if self.shell {
+            v.push(self.img.clone());
+            return v;
+        }
+        opt("img", Some(self.img.clone()));
+        opt(
+            "in",
+            match self.input {
+                Input::None => None,
+                Input::Stdin => Some("stdin".into()),
+                Input::Tar => Some("tar".into()),
+            },
+        );
+        opt("result", self.result.map(|_| "tar".into()));
+        if self.no_wait {
+            v.push("--no-wait".into());
+        }
+        if json {
+            v.push("--json".into());
+        }
+        v.push("--".into());
+        v.extend(self.cmd.iter().cloned());
+        v
+    }
+}
+
+impl ShellArgs {
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
 }
 
 /// a shell is a run with the caller's terminal and no command
@@ -114,6 +254,7 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         json_fd: a.json_fd,
         log: a.log,
         no_wait: false,
+        remote: a.remote.clone(),
         net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
@@ -440,6 +581,95 @@ mod tests {
         assert!(parse_ttl("1h", 1800).is_err());
         assert!(parse_ttl("5s", 1800).is_err());
         assert!(parse_ttl("x", 1800).is_err());
+    }
+
+    fn parse(args: &[&str]) -> RunArgs {
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: RunArgs,
+        }
+        <T as clap::Parser>::try_parse_from(std::iter::once("run").chain(args.iter().copied()))
+            .unwrap()
+            .a
+    }
+
+    #[test]
+    fn remote_argv_round_trips() {
+        let n = "0123456789abcdef0123456789abcdef";
+        let a = parse(&[
+            "--img",
+            "alpine --net open",
+            "--mem",
+            "1024",
+            "--ttl",
+            "90s",
+            "--net",
+            "web",
+            "--status-fd",
+            "3",
+            "--json-fd",
+            "4",
+            "--no-wait",
+            "--",
+            "echo",
+            "--net open",
+            "a b",
+        ]);
+        let argv = a.remote_argv(n, false);
+        assert_eq!(
+            argv,
+            [
+                "run",
+                "--remote",
+                &format!("1:{n}"),
+                "--mem",
+                "1024",
+                "--ttl",
+                "90s",
+                "--net",
+                "web",
+                "--img",
+                "alpine --net open",
+                "--no-wait",
+                "--",
+                "echo",
+                "--net open",
+                "a b"
+            ]
+        );
+        // the far end parses it back to the same run, the hostile --img still
+        // one value, and never the client's fds
+        let back = parse(&argv[1..].iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(back.img, "alpine --net open");
+        assert_eq!((back.status_fd, back.json_fd), (None, None));
+        assert_eq!(back.cmd, ["echo", "--net open", "a b"]);
+        assert_eq!(back.remote.as_deref(), Some(n));
+        assert!(a.check_local().is_err(), "a bad image name is caught here");
+        let j = parse(&["--in", "tar", "--result", "tar", "--", "x"]).remote_argv(n, true);
+        assert_eq!(
+            j[3..],
+            [
+                "--net", "none", "--img", "alpine", "--in", "tar", "--result", "tar", "--json",
+                "--", "x"
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_flag() {
+        let n = "0123456789abcdef0123456789abcdef";
+        assert_eq!(remote_nonce(&format!("1:{n}")).as_deref(), Ok(n));
+        let two = remote_nonce(&format!("2:{n}")).unwrap_err();
+        assert!(two.contains("speaks remote protocol 1, the caller asked for 2"));
+        for bad in [
+            n.to_string(),
+            format!("1:{}", &n[1..]),
+            format!("1:{}", n.to_uppercase()),
+            format!("1:{n}0"),
+        ] {
+            assert!(remote_nonce(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

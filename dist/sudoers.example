@@ -4,6 +4,7 @@
 # through sudo, burner only takes configs from /etc/burner and burner kill only
 # stops VMs that caller started and burner log only shows their own runs. net,
 # reap, doctor and config stay root's.
+# burner -H from another machine, ssh'd in as alice, needs this same rule.
 alice ALL=(root) NOPASSWD: /usr/local/bin/burner run *, /usr/local/bin/burner shell, \
     /usr/local/bin/burner shell *, /usr/local/bin/burner ls, /usr/local/bin/burner ls *, \
     /usr/local/bin/burner kill *, /usr/local/bin/burner images, /usr/local/bin/burner images --json, \

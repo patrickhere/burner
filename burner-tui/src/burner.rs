@@ -9,21 +9,33 @@ use serde::Deserialize;
 pub struct Burner {
     pub bin: String,
     pub root: bool,
+    /// burner -H: the host the VMs run on, None for this machine
+    pub host: Option<String>,
 }
 
 impl Burner {
-    pub fn from_env() -> Burner {
+    /// `host` from -H, else BURNER_HOST. local means this machine
+    pub fn from_env(host: Option<String>) -> Burner {
         let bin = std::env::var("BURNER")
             .ok()
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| "burner".into());
         // SAFETY: geteuid has no preconditions and can't fail
         let root = unsafe { libc::geteuid() } == 0;
-        Burner { bin, root }
+        let host = host
+            .or_else(|| std::env::var("BURNER_HOST").ok())
+            .filter(|h| !h.is_empty() && h != "local");
+        Burner { bin, root, host }
     }
 
     fn with(&self, sudo: &[&str], args: &[String]) -> Vec<String> {
         let mut argv: Vec<String> = Vec::new();
+        // a remote host is reached over ssh as you: burner refuses sudo then
+        if let Some(h) = &self.host {
+            argv.extend([self.bin.clone(), "-H".into(), h.clone()]);
+            argv.extend(args.iter().cloned());
+            return argv;
+        }
         if !self.root {
             argv.extend(sudo.iter().map(|s| s.to_string()));
         }
@@ -32,22 +44,55 @@ impl Burner {
         argv
     }
 
-    /// for commands run behind the TUI, where sudo has no terminal to ask a password on
+    /// for commands run behind the TUI, where sudo has no terminal to ask a
+    /// password on, and ssh mustn't ask anything either (BURNER_BATCH)
     pub fn quiet(&self, args: &[&str]) -> Vec<String> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        self.with(&["sudo", "-n"], &args)
+        let argv = self.with(&["sudo", "-n"], &args);
+        if self.host.is_some() {
+            return ["env".to_string(), "BURNER_BATCH=1".into()]
+                .into_iter()
+                .chain(argv)
+                .collect();
+        }
+        argv
     }
 
     /// for shell and run, which get the terminal, so sudo can ask
     pub fn interactive(&self, args: &[String]) -> Vec<String> {
         self.with(&["sudo"], args)
     }
+
+    /// `burner hosts --json`, run as you: it only reads your hosts.toml
+    pub fn hosts_argv(&self) -> Vec<String> {
+        vec![self.bin.clone(), "hosts".into(), "--json".into()]
+    }
+}
+
+/// the names in `burner hosts --json`, or none from a burner without it
+pub fn parse_hosts(s: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap_or_default();
+    v.pointer("/result/hosts")
+        .and_then(|h| h.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.get("name")?.as_str())
+        .filter(|n| {
+            !n.is_empty()
+                && n.len() <= 32
+                && n.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        .map(String::from)
+        .collect()
 }
 
 /// runs argv with no stdin and returns stdout, or the first line of stderr
 pub fn output(argv: &[String]) -> Result<String, String> {
+    // the host is always on the command line, BURNER_HOST mustn't pick another
     let out = Command::new(&argv[0])
         .args(&argv[1..])
+        .env_remove("BURNER_HOST")
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("can't run {}: {e}", argv[0]))?;
@@ -312,6 +357,36 @@ pub fn users(passwd: &str) -> HashMap<u32, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn remote_hosts_never_go_through_sudo() {
+        let b = Burner {
+            bin: "burner".into(),
+            root: false,
+            host: Some("mini".into()),
+        };
+        assert_eq!(
+            b.quiet(&["ls", "--json"]),
+            [
+                "env",
+                "BURNER_BATCH=1",
+                "burner",
+                "-H",
+                "mini",
+                "ls",
+                "--json"
+            ]
+        );
+        assert_eq!(
+            b.interactive(&["shell".into()]),
+            ["burner", "-H", "mini", "shell"]
+        );
+        let local = Burner { host: None, ..b };
+        assert_eq!(local.quiet(&["ls"]), ["sudo", "-n", "burner", "ls"]);
+        let j = r#"{"schema":1,"result":{"hosts":[{"name":"mini"},{"name":"vps"},{"name":"Bad Name"}]}}"#;
+        assert_eq!(parse_hosts(j), ["mini", "vps"]);
+        assert!(parse_hosts("error: unrecognized subcommand").is_empty());
+    }
+
     fn launch() -> Launch {
         Launch {
             image: "alpine".into(),
@@ -409,6 +484,7 @@ mod tests {
         let b = Burner {
             bin: "burner".into(),
             root: false,
+            host: None,
         };
         assert_eq!(
             join(&b.interactive(&launch().args())),
@@ -446,6 +522,7 @@ mod tests {
         let b = Burner {
             bin: "/opt/burner/bin/burner".into(),
             root: false,
+            host: None,
         };
         let argv = b.interactive(&l.args());
         assert_eq!(argv.last().unwrap(), "echo 'hi there'; exit 3");
@@ -460,6 +537,7 @@ mod tests {
         let b = Burner {
             bin: "burner".into(),
             root: true,
+            host: None,
         };
         assert_eq!(b.quiet(&["ls", "--json"]), s(&["burner", "ls", "--json"]));
         assert_eq!(b.interactive(&s(&["shell"])), s(&["burner", "shell"]));

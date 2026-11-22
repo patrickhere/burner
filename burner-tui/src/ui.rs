@@ -46,12 +46,14 @@ fn tabs(f: &mut Frame, app: &App, area: Rect) {
         let s = Span::raw(format!(" {name} "));
         if on { s.reversed().bold() } else { s }
     };
+    let host = app.burner.host.as_deref().unwrap_or("local");
     let line = Line::from(vec![
         Span::raw(" burner ").bold(),
         Span::raw(" "),
         tab("launcher".into(), app.screen == Screen::Launcher),
         Span::raw(" "),
         tab(format!("running{count}"), app.screen == Screen::Running),
+        Span::raw(format!("   host: {host}")).dim(),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -160,7 +162,9 @@ fn running(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let rows = ls.vms.iter().map(|v| {
+        // this machine's /etc/passwd says nothing about a remote host's users
         let owner = match v.owner {
+            Some(uid) if app.burner.host.is_some() => uid.to_string(),
             Some(uid) => app.users.get(&uid).cloned().unwrap_or(uid.to_string()),
             None => "-".into(),
         };
@@ -236,6 +240,7 @@ const HELP: &[(&str, &str)] = &[
     ("q, ctrl-c", "quit (in the command field q types a q)"),
     ("?", "this help, any key closes it"),
     ("esc", "clear the message line"),
+    ("h", "next host: local, then the ones in hosts.toml"),
     ("", ""),
     ("launcher", ""),
     ("up/down", "pick a field"),
@@ -246,7 +251,10 @@ const HELP: &[(&str, &str)] = &[
     ("running VMs", ""),
     ("up/down", "pick a VM"),
     ("k", "kill it, asks first"),
-    ("r", "refresh now (it does every 2s anyway)"),
+    (
+        "r",
+        "refresh now (it does every 2s anyway, 5s on a remote host)",
+    ),
 ];
 
 fn help(f: &mut Frame) {
@@ -293,6 +301,7 @@ pub mod tests {
             Burner {
                 bin: "burner".into(),
                 root: false,
+                host: None,
             },
             vec!["alpine".into(), "node".into()],
         );
@@ -372,6 +381,7 @@ pub mod tests {
             Burner {
                 bin: "burner".into(),
                 root: true,
+                host: None,
             },
             vec![],
         );

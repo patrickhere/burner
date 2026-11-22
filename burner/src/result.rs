@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::sys;
 
 pub const RESULT_SIZE: u64 = 256 << 20;
+/// the most a clean tar can be: what the parser writes, headers included
+pub const CLEAN_SIZE: u64 = RESULT_SIZE + (4 << 20);
 pub const LOG_CAP: u64 = 16 << 20;
 const MEMBERS: u32 = 20_000;
 const PARSE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -81,10 +83,30 @@ const MEM_LIMIT: &[(sys::Resource, u64)] = &[(libc::RLIMIT_AS, 512 << 20)];
 #[cfg(target_os = "macos")]
 const MEM_LIMIT: &[(sys::Resource, u64)] = &[];
 
+/// what a parse reads: the raw disk a guest left, or a clean tar from the
+/// far end of burner -H, which gets the same hostile treatment
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Layout {
+    /// result/rc, result/log.txt, out/... and the rest of guest init's names
+    Guest,
+    /// what the parser makes of one: out/..., log.txt and rc, nothing else
+    Clean,
+}
+
 /// parent side: parse the already-open result disk in a limited child, write the
 /// log and (optionally) a clean tar
 pub fn parse(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> Meta {
-    match parse_inner(raw, log, tar_out, state) {
+    unreadable(parse_inner(raw, log, tar_out, state, Layout::Guest))
+}
+
+/// burner -H: a result tar from the far end, parsed again here before it
+/// reaches your tar -x, as you, under the same limits. `dir` is private to you
+pub fn recheck(tar: File, log: &Path, tar_out: &Path, dir: &Path) -> Meta {
+    unreadable(parse_inner(tar, log, Some(tar_out), dir, Layout::Clean))
+}
+
+fn unreadable(r: io::Result<Meta>) -> Meta {
+    match r {
         Ok(m) => m,
         Err(e) => Meta {
             problem: Some(format!("result unreadable ({e})")),
@@ -94,11 +116,28 @@ pub fn parse(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> Met
     }
 }
 
-fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> io::Result<Meta> {
+fn parse_inner(
+    raw: File,
+    log: &Path,
+    tar_out: Option<&Path>,
+    state: &Path,
+    layout: Layout,
+) -> io::Result<Meta> {
+    // as root the parser gets an account of its own. burner -H's client is
+    // never root, and runs it as you
     #[cfg(target_os = "linux")]
-    let (uid, gid) = sys::user_ids(PARSE_USER)
-        .ok_or_else(|| io::Error::other(format!("no {PARSE_USER} user, rerun install.sh")))?;
-    if raw.metadata()?.len() > RESULT_SIZE {
+    let ids =
+        match sys::is_root() {
+            true => Some(sys::user_ids(PARSE_USER).ok_or_else(|| {
+                io::Error::other(format!("no {PARSE_USER} user, rerun install.sh"))
+            })?),
+            false => None,
+        };
+    let cap = match layout {
+        Layout::Guest => RESULT_SIZE,
+        Layout::Clean => CLEAN_SIZE,
+    };
+    if raw.metadata()?.len() > cap {
         return Err(io::Error::other("result disk larger than expected"));
     }
     // one parser at a time keeps the host-side memory budget to one rlimit
@@ -125,7 +164,11 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     // the file, and the old path would then point at nothing
     let mut cmd = Command::new(sys::self_exe());
     cmd.arg(PARSE_ARG)
-        .arg(if tar_out.is_some() { "1" } else { "0" })
+        .arg(match (tar_out.is_some(), layout) {
+            (false, _) => "0",
+            (true, Layout::Guest) => "1",
+            (true, Layout::Clean) => "2",
+        })
         .stdin(Stdio::from(raw))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -134,7 +177,9 @@ fn parse_inner(raw: File, log: &Path, tar_out: Option<&Path>, state: &Path) -> i
     // on macOS burner runs as you and has no other user to switch to: the
     // parser is still its own process under the same rlimits
     #[cfg(target_os = "linux")]
-    cmd.uid(uid).gid(gid);
+    if let Some((uid, gid)) = ids {
+        cmd.uid(uid).gid(gid);
+    }
     // the sandbox only holds the parser to the fds it has, so it gets no others
     #[cfg(target_os = "macos")]
     let fds = sys::open_fds()?;
@@ -210,8 +255,15 @@ pub fn accept_meta(out: &str) -> io::Result<Meta> {
 }
 
 /// child side: fd 0 the raw tar, fd 3 the log, fd 4 the clean tar. refuses to
-/// run as root or with anything else wired to those fds
-pub fn child_main(emit: bool) -> ExitCode {
+/// run as root or with anything else wired to those fds. `mode` is 0 (no
+/// tar out), 1 (a guest's disk) or 2 (a clean tar from burner -H's far end)
+pub fn child_main(mode: &str) -> ExitCode {
+    let (emit, layout) = match mode {
+        "0" => (false, Layout::Guest),
+        "1" => (true, Layout::Guest),
+        "2" => (true, Layout::Clean),
+        _ => return ExitCode::from(2),
+    };
     // SAFETY: geteuid has no preconditions
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("burner: {PARSE_ARG} is internal and never runs as root");
@@ -267,8 +319,8 @@ pub fn child_main(emit: bool) -> ExitCode {
         })
     });
     let mut src = src;
-    if let Err(e) =
-        prescan(&mut src, src_len).and_then(|()| walk(src, logf, out.as_mut(), &mut meta))
+    if let Err(e) = prescan(&mut src, src_len)
+        .and_then(|()| walk_layout(src, logf, out.as_mut(), &mut meta, layout))
     {
         meta.problem = Some(e.to_string());
         meta.fatal = true;
@@ -293,7 +345,8 @@ fn fatal(msg: &str) -> io::Error {
 /// number of headers, and every size in range. the crate would otherwise load
 /// extension records and sparse maps before any of burner's limits apply
 pub fn prescan(src: &mut (impl Read + Seek), len: u64) -> io::Result<()> {
-    let len = len.min(RESULT_SIZE);
+    // a guest's disk is never over RESULT_SIZE, a clean tar never over this
+    let len = len.min(CLEAN_SIZE);
     let (mut off, mut headers) = (0u64, 0u32);
     let mut h = [0u8; 512];
     while off + 512 <= len {
@@ -359,9 +412,29 @@ fn octal(f: &[u8]) -> Option<u64> {
 
 pub fn walk<W: Write>(
     src: impl Read,
+    logf: impl Write,
+    out: Option<&mut tar::Builder<W>>,
+    meta: &mut Meta,
+) -> io::Result<()> {
+    walk_layout(src, logf, out, meta, Layout::Guest)
+}
+
+/// a clean tar's names as the guest's: rc and log.txt are what result/rc
+/// and result/log.txt became, out/... stays. anything else isn't one
+fn from_clean(name: &str, dir: bool) -> Option<String> {
+    match name {
+        "rc" | "log.txt" if !dir => Some(format!("result/{name}")),
+        n if n == "out" || n.starts_with("out/") => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+pub fn walk_layout<W: Write>(
+    src: impl Read,
     mut logf: impl Write,
     mut out: Option<&mut tar::Builder<W>>,
     meta: &mut Meta,
+    layout: Layout,
 ) -> io::Result<()> {
     let mut ar = tar::Archive::new(BufReader::with_capacity(1 << 16, src));
     let (mut count, mut total, mut logged) = (0u32, 0u64, 0u64);
@@ -379,10 +452,14 @@ pub fn walk<W: Write>(
         if !(kind.is_file() || kind.is_dir()) {
             continue;
         }
-        let Some(name) = clean_name(&e.path()?) else {
+        let Some(mut name) = clean_name(&e.path()?) else {
             meta.problem = Some("result had unsafe entries, dropped".into());
             continue;
         };
+        if layout == Layout::Clean {
+            name = from_clean(&name, kind.is_dir())
+                .ok_or_else(|| fatal("result has an entry burner doesn't write"))?;
+        }
         // twice the same path, or a file where another entry needs a directory,
         // can't be unpacked as one tree: not a result burner hands back
         if !seen.insert(name.clone()) {
@@ -656,6 +733,86 @@ mod tests {
         h.set_size(1);
         b.append_data(&mut h, "out/x", &b"z"[..]).unwrap();
         assert!(walk_bytes(&b.into_inner().unwrap()).is_ok());
+    }
+
+    fn walk_clean(bytes: &[u8]) -> io::Result<(Meta, Vec<u8>)> {
+        let mut meta = Meta::default();
+        let mut src = io::Cursor::new(bytes);
+        prescan(&mut src, bytes.len() as u64)?;
+        let mut b = tar::Builder::new(Vec::new());
+        walk_layout(src, io::sink(), Some(&mut b), &mut meta, Layout::Clean)?;
+        Ok((meta, b.into_inner()?))
+    }
+
+    fn names_in(tar: &[u8]) -> Vec<String> {
+        tar::Archive::new(tar)
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn clean_layout() {
+        // what the parser writes from a guest's disk parses again to the same
+        let mut b = tar::Builder::new(Vec::new());
+        let mut meta = Meta::default();
+        let guest = tar_of(&[
+            ("out/a/b", b"x"),
+            ("result/log.txt", b"log"),
+            ("result/rc", b"3\n"),
+        ]);
+        walk(io::Cursor::new(&guest), io::sink(), Some(&mut b), &mut meta).unwrap();
+        let clean = b.into_inner().unwrap();
+        assert_eq!(names_in(&clean), ["out/a/b", "log.txt", "rc"]);
+        let (m, again) = walk_clean(&clean).unwrap();
+        assert_eq!(m.rc, Some(3));
+        assert_eq!(names_in(&again), names_in(&clean));
+        // the guest's names aren't clean ones, nor is anything else
+        for bad in [
+            &[("result/rc", &b"0\n"[..])][..],
+            &[("etc/passwd", b"x")],
+            &[("rc", b"0\n"), ("result/error", b"boom")],
+        ] {
+            assert!(walk_clean(&tar_of(bad)).is_err(), "{:?}", bad[0].0);
+        }
+        // every hostile shape the guest layout refuses, in the clean one
+        assert!(walk_clean(&tar_of(&[("out/a", b"x"), ("out/a/b", b"y")])).is_err());
+        assert!(walk_clean(&tar_of(&[("out/a", b"x"), ("out/a", b"y")])).is_err());
+        assert!(walk_clean(&tar_of(&[("rc", b"1\n"), ("rc", b"0\n")])).is_err());
+        let mut dots = walk_clean(&tar_of(&[("rc", b"0\n")])).unwrap();
+        assert_eq!(dots.0.rc, Some(0));
+        // a name the tar crate wouldn't write, put in the header by hand
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_ustar();
+        h.as_old_mut().name[..11].copy_from_slice(b"out/../../x");
+        h.set_size(1);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append(&h, &b"y"[..]).unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(2);
+        b.append_data(&mut h, "rc", &b"0\n"[..]).unwrap();
+        dots = walk_clean(&b.into_inner().unwrap()).unwrap();
+        assert_eq!(names_in(&dots.1), ["rc"], "unsafe names dropped");
+        let full = tar_of(&[("log.txt", &[b'a'; 4000])]);
+        assert!(walk_clean(&full[..512 + 1000]).is_err());
+        let mut link = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        link.append_link(&mut h, "out/l", "/etc/passwd").unwrap();
+        let (_, t) = walk_clean(&link.into_inner().unwrap()).unwrap();
+        assert!(names_in(&t).is_empty(), "links never come out");
+        let (_, t) = walk_clean(&with_type(tar::EntryType::Char, 0)).unwrap();
+        assert!(names_in(&t).is_empty(), "nor devices");
+        assert!(walk_clean(&with_type(tar::EntryType::GNUSparse, 0)).is_err());
+        let mut pax = tar::Builder::new(Vec::new());
+        pax.append_pax_extensions([("size", &b"5"[..])]).unwrap();
+        let mut h = tar::Header::new_ustar();
+        h.set_size(1);
+        pax.append_data(&mut h, "out/x", &b"z"[..]).unwrap();
+        assert!(walk_clean(&pax.into_inner().unwrap()).is_err());
     }
 
     #[test]

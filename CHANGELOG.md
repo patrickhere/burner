@@ -1,5 +1,13 @@
 # changelog
 
+## unreleased
+
+- remote hosts: `burner -H HOST run`, `shell`, `ls`, `kill`, `images`, `config`, `doctor` and `version` over ssh, as you, with your own keys and ssh config. hosts go in `~/.config/burner/hosts.toml`, each with several addresses tried at once (a LAN one and a tailnet one), or `-H` takes any ssh host. `BURNER_HOST` for a whole shell, `-H local` for here
+- what a remote host sends back is checked here: output escaped, a shell's terminal filtered and reset here, `~.` handled here, a result tar parsed again here, and the exit code from a line only burner there can write. remote failures are 125 with outcome `unreachable`, `remote_error` or `lost`, never ssh's 255
+- `burner -H HOST doctor` checks the way there and shows that host's own doctor. `burner hosts [--check]` lists hosts.toml
+- burner-tui takes `-H HOST` and switches hosts with `h`
+- `tests/remote.sh`: burner -H over ssh to localhost, with a stand-in for the far end or the real burner
+
 ## 0.2.1
 
 - `burner setup` on a mac takes the kernel and image homebrew fetched again. it refused them because homebrew's Cellar is writable by the admin group, whose members can become root anyway. a directory only you, root or the admin group can write counts as safe now, world write and other groups still don't

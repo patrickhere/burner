@@ -58,7 +58,7 @@ fn home() -> PathBuf {
 /// the per-user temp dir launchd hands out (what $TMPDIR is set to), only
 /// you can enter it. it doesn't depend on the environment burner got
 #[cfg(target_os = "macos")]
-fn user_temp() -> PathBuf {
+pub fn user_temp() -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0u8; 1024];
     // SAFETY: confstr writes at most buf.len() bytes, NUL included
@@ -388,8 +388,8 @@ fn mode_lets_others_write(mode: u32, gid: u32) -> bool {
 }
 
 /// a file and every directory above it owned by you or root and writable by
-/// nobody else but the admin group, by its mode or by an ACL
-#[cfg(target_os = "macos")]
+/// nobody else: on macOS the admin group aside, by its mode or by an ACL, on
+/// linux by its mode
 pub fn trusted_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid can't fail
@@ -399,10 +399,7 @@ pub fn trusted_file(path: &Path) -> Result<()> {
     let real = fs::canonicalize(path).with_context(|| format!("checking {}", path.display()))?;
     for p in real.ancestors() {
         let m = fs::metadata(p).with_context(|| format!("checking {}", p.display()))?;
-        let others_write = mode_lets_others_write(m.mode(), m.gid())
-            || acl::lets_others_write(p, me)
-                .with_context(|| format!("reading the ACL of {}", p.display()))?;
-        if (m.uid() != me && m.uid() != 0) || others_write {
+        if (m.uid() != me && m.uid() != 0) || others_write(p, &m, me)? {
             bail!(
                 "{} is owned or writable by someone other than you or root, so burner won't use it",
                 p.display()
@@ -410,6 +407,65 @@ pub fn trusted_file(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn others_write(p: &Path, m: &fs::Metadata, me: u32) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(mode_lets_others_write(m.mode(), m.gid())
+        || acl::lets_others_write(p, me)
+            .with_context(|| format!("reading the ACL of {}", p.display()))?)
+}
+
+/// world writable, or group writable by a group with anyone in it but you.
+/// debian and ubuntu give each user a group of their own and often umask
+/// 002, so ~/.config can be group writable by just you. ssh makes the same
+/// exception for ~/.ssh/config
+#[cfg(target_os = "linux")]
+fn others_write(_: &Path, m: &fs::Metadata, me: u32) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    if m.mode() & 0o002 != 0 {
+        return Ok(true);
+    }
+    if m.mode() & 0o020 == 0 {
+        return Ok(false);
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let group = fs::read_to_string("/etc/group").unwrap_or_default();
+    Ok(!group_of_one(m.gid(), me, &passwd, &group))
+}
+
+/// whether `me` is the only user in group `gid`, as the primary group of
+/// accounts and as a listed member. a group with nobody in it doesn't count:
+/// those belong to setgid programs
+#[cfg(target_os = "linux")]
+fn group_of_one(gid: u32, me: u32, passwd: &str, group: &str) -> bool {
+    let users: Vec<(&str, u32, u32)> = passwd
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            Some((
+                *f.first()?,
+                f.get(2)?.parse().ok()?,
+                f.get(3)?.parse().ok()?,
+            ))
+        })
+        .collect();
+    let Some(my_name) = users.iter().find(|u| u.1 == me).map(|u| u.0) else {
+        return false;
+    };
+    let primary: Vec<u32> = users.iter().filter(|u| u.2 == gid).map(|u| u.1).collect();
+    let listed: Vec<&str> = group
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(':').collect();
+            (f.get(2)?.parse::<u32>().ok()? == gid).then(|| f.get(3).copied().unwrap_or(""))
+        })
+        .flat_map(|m| m.split(',').filter(|s| !s.is_empty()))
+        .collect();
+    (!primary.is_empty() || !listed.is_empty())
+        && primary.iter().all(|&u| u == me)
+        && listed.iter().all(|&n| n == my_name)
 }
 
 /// macOS ACLs: an entry can let others write where the mode bits say nobody can
@@ -521,6 +577,57 @@ mod acl {
             assert!(!with_acl("group:admin allow write"));
             assert!(with_acl("group:everyone allow write"));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    #[test]
+    fn trusted_by_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        // /tmp is world writable, so the test tree lives in the checkout
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!(
+                "burner-trust-{}",
+                crate::sys::random_hex(6).unwrap()
+            ));
+        let f = d.join("f");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(&f, b"x").unwrap();
+        let set = |p: &std::path::Path, m| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let mut seen = Vec::new();
+        for (dir, file) in [
+            (0o700, 0o600),
+            (0o755, 0o644),
+            (0o757, 0o644),
+            (0o755, 0o666),
+        ] {
+            set(&d, dir);
+            set(&f, file);
+            seen.push(super::trusted_file(&f).is_ok());
+        }
+        set(&d, 0o700);
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(seen, [true, true, false, false]);
+        assert!(super::trusted_file(&d.join("gone")).is_err());
+    }
+
+    #[test]
+    fn groups_of_one() {
+        let passwd = "root:x:0:0::/root:/bin/sh\npat:x:1000:1000::/home/pat:/bin/bash\n\
+                      sam:x:1001:1001::/home/sam:/bin/bash\nweb:x:33:1000::/:/bin/false\n";
+        let group = "pat:x:1000:\nsam:x:1001:\nstaff:x:50:pat,sam\nmine:x:51:pat\nempty:x:52:\n";
+        let one = |gid, me| super::group_of_one(gid, me, passwd, group);
+        assert!(one(1001, 1001));
+        assert!(!one(50, 1001));
+        assert!(!one(52, 1001), "a group with nobody in it");
+        assert!(one(51, 1000));
+        // another account has pat's group as its primary one
+        assert!(!one(1000, 1000));
+        assert!(!one(1001, 4242));
     }
 }
 

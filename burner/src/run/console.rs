@@ -220,6 +220,8 @@ pub(super) struct ShellIo {
     pub(super) tty_rec: Option<File>,
     /// the size written there before the VM started
     pub(super) size: (u16, u16),
+    /// ~. leaves. off for burner -H, where the client handles it
+    pub(super) escape: bool,
 }
 
 /// how a shell session went
@@ -259,6 +261,7 @@ pub(super) fn relay(
         legacy,
         tty_rec,
         size: sent,
+        escape: escapes,
     } = io;
     let screen = Out::new_screen();
     let failed = |screen: Out| {
@@ -397,7 +400,9 @@ pub(super) fn relay(
                 Ok(n) => {
                     let mut keys = Vec::new();
                     escape.bracketed = screen.screen().is_some_and(|s| s.paste());
-                    if escape.feed(&buf[..n], &mut keys) {
+                    if !escapes {
+                        keys.extend_from_slice(&buf[..n]);
+                    } else if escape.feed(&buf[..n], &mut keys) {
                         break Outcome::Detached;
                     }
                     if console_open && ended_at.is_none() {
@@ -891,11 +896,12 @@ impl Markers {
 /// paste (ESC[200~ .. ESC[201~, only while the guest has bracketed paste on at
 /// the terminal) is pasted text, not keys, and goes through untouched
 #[derive(Default)]
-struct Escape {
+/// `~.` after enter leaves, `~~` is one ~, a bracketed paste is text
+pub(crate) struct Escape {
     mid_line: bool,
     tilde: bool,
     /// the guest has bracketed paste on, as far as the terminal knows
-    bracketed: bool,
+    pub(crate) bracketed: bool,
     paste: bool,
     /// the last few bytes, to spot the paste brackets across reads
     recent: Vec<u8>,
@@ -908,7 +914,7 @@ const PASTE_IDLE: Duration = Duration::from_secs(1);
 
 impl Escape {
     /// true when the caller asked to leave
-    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
+    pub(crate) fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> bool {
         self.feed_at(input, out, Instant::now())
     }
 

@@ -25,17 +25,18 @@ pub mod record;
 #[cfg(target_os = "linux")]
 pub use admin::reaper_age;
 pub use admin::{kill, log, ls, reap};
+pub(crate) use console::Escape;
 #[cfg(target_os = "linux")]
 pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
-pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, main};
+pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, finished, json_target, main, refuse};
 
 /// the line the network log's reader writes first
 pub fn netlog_ready() -> &'static str {
     netwire::READY
 }
-pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main, shell_run_args};
+pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main, shell_run_args, valid_name};
 
 pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};
 
@@ -85,7 +86,31 @@ fn signals() -> usize {
     SIGNALS.load(Ordering::Relaxed)
 }
 
-pub(crate) fn is_interrupted() -> bool {
+/// burner -H on the far end: when sshd loses the client it closes the
+/// session's pipes but sends the command no signal (a shell has a pty, whose
+/// hangup does). so a stdout or stderr that hung up counts as a SIGHUP, and
+/// the run stops as it would on ctrl-c
+pub(crate) fn watch_peer() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        std::thread::spawn(|| {
+            loop {
+                if sys::hung_up(&[1, 2]) {
+                    SIGNALS.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    });
+}
+
+/// SIGINT, SIGTERM and SIGHUP count from here on instead of ending burner
+pub fn catch_signals() {
+    interrupted()
+}
+
+pub fn is_interrupted() -> bool {
     signals() > 0
 }
 

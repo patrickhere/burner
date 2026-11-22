@@ -13,8 +13,8 @@ every command takes `--json`, before or after the command (`burner --json ls` an
 |---|---|---|
 | `schema` | int | 1. it only goes up when a field changes type or goes away |
 | `burner` | string | the version that wrote it |
-| `command` | string or null | `run`, `shell`, `ls`, `log`, `kill`, `images`, `doctor`, `explain`, `config`, `net show`, `net up`, `net down`, `setup`, `version`. null only when the command line didn't parse far enough to tell |
-| `host` | string or null | the remote host it ran on, null when local (always null in 0.3.0 so far) |
+| `command` | string or null | `run`, `shell`, `ls`, `log`, `kill`, `images`, `doctor`, `explain`, `config`, `net show`, `net up`, `net down`, `setup`, `version`, `hosts`. null only when the command line didn't parse far enough to tell |
+| `host` | string or null | the `-H` host it ran on, as you named it, null when local |
 | `exit` | int | what burner exits with, see the exit codes in the README |
 | `ok` | bool | burner did what was asked. for run and shell: the command ran and exited (whatever its exit code), or the shell was left with `~.` |
 | `result` | object or null | the command's own result, below. null when burner failed before it had one |
@@ -63,7 +63,7 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 | field | what |
 |---|---|
 | `id` | the VM's id |
-| `outcome` | `exited`, `timeout`, `killed` (burner kill), `interrupted` (a signal), `busy` (no free slot), `sandbox_error`, `input_error` (the `--in tar` didn't unpack, the command never ran), `poweroff` and `reboot` (the command did that before it exited), `detached` (a shell left with `~.`). reserved for remote hosts: `unreachable`, `remote_error`, `lost` |
+| `outcome` | `exited`, `timeout`, `killed` (burner kill), `interrupted` (a signal), `busy` (no free slot), `sandbox_error`, `input_error` (the `--in tar` didn't unpack, the command never ran), `poweroff` and `reboot` (the command did that before it exited), `detached` (a shell left with `~.`). over `-H`: `unreachable` (no address answered, or ssh failed before running anything), `remote_error` (ssh worked but burner there didn't start: not installed, no sudo rule, a version that didn't take the arguments, a broken answer), `lost` (the connection went after the run started; the VM's id is in `id` when burner there had said it) |
 | `rc` | the command's exit code, only when `outcome` is `exited`, else null. a shell whose VM was powered off is `exited` with rc null |
 | `shell_end` | shell only: `exit`, `poweroff`, `reboot`, `no_start`, `lost`, or `legacy` for an image whose guest init doesn't say. null for run |
 | `guest_error` | what guest init wrote to result/error, guest text |
@@ -174,16 +174,28 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 
 // version: needs no config
 {"version":"0.3.0","schema":1,"guest_proto":1,"backend":"firecracker","os":"linux","arch":"x86_64"}
+
+// hosts: what ~/.config/burner/hosts.toml has. checks is null without --check
+{"path":"/home/pat/.config/burner/hosts.toml","hosts":[{"name":"mini","addrs":["10.1.0.81","mini.tail1234.ts.net"],
+  "user":null,"port":null,"connect_timeout_secs":3.0,"burner":null,
+  "checks":[{"addr":"10.1.0.81","up":true,"proxied":false,"connect_ms":3,"why":null}, ...]}]}
+
+// doctor over -H: the way there, then the far end's own doctor result in remote
+{"host":"mini","worst":"ok","checks":[{"name":"address","level":"ok","detail":"..."}, ...],"remote":{"root":true,...}}
 ```
+
+## over -H
+
+`burner -H HOST CMD --json` asks the far end for its document and prints it again from what was parsed here, with `host` filled in, keys in sorted order and DEL and C1 control characters (which json doesn't escape) made `?`. run and shell get theirs back over ssh in a marked line instead, and `--json-fd` and `--status-fd` are written here. that document is the far end's word: the host ran the VM, and a compromised one can say anything in it. burner here checks only that it's schema 1 and that `exit` goes with `result.outcome`, and makes it 125 `remote_error` when it doesn't. when the far end never answered, the document is the client's own: exit 125, `result` null (or just the id and outcome `lost` when the run had started), and the first error says why with kind `unreachable`, `remote_error` or `lost`.
 
 `ls --json` before 0.3 printed the ls object alone, with `mem`, `disk`, `age`, `ttl`, `ttl_left`, `total_mem` and `used_mem`. burner-tui reads both.
 
 ## kinds
 
-errors: `usage`, `not_root`, `root`, `no_tty`, `unknown_image`, `config`, `unsupported` (not on this OS), `busy`, `no_reaper`, `no_public_ip`, `disk_full`, `sandbox`, `guest`, `input`, `timeout`, `interrupted`, `killed`, `poweroff`, `reboot`, `result_lost` (the result tar didn't get to you), `not_found`, `not_owner`, `still_stopping`, `doctor_failed`, `net`, `io` (anything else). reserved for remote hosts: `unreachable`, `remote_error`, `lost`.
+errors: `usage`, `not_root`, `root`, `no_tty`, `unknown_image`, `config`, `unsupported` (not on this OS), `busy`, `no_reaper`, `no_public_ip`, `disk_full`, `sandbox`, `guest`, `input`, `timeout`, `interrupted`, `killed`, `poweroff`, `reboot`, `result_lost` (the result tar didn't get to you, or over `-H` didn't check out when it was parsed again here), `not_found`, `not_owner`, `still_stopping`, `doctor_failed`, `net`, `io` (anything else), and over `-H` `unreachable`, `remote_error`, `lost`, the same as the outcomes.
 
 warnings: `queued` (waited for a slot), `output` (output cut or dropped), `vmm` (the VMM's own log, or a VM that stopped before the job), `oom`, `image` (an image's guest init or defaults), `result` (something in the result was dropped), `shell` (how a shell ended when that wasn't a failure), `unverified` (setup: what wasn't checked).
 
 ## --status-fd
 
-the older one-line form, kept byte for byte: `{"exit":124,"id":"burner-3f9a1c2b7d10","outcome":"timeout","rc":null,"secs":10.4}`, keys sorted, secs to a tenth. its outcomes are the ones above minus `detached` (it's run only), plus `usage`, and the remote ones show as `sandbox_error`. new scripts should use `--json-fd`.
+the older one-line form, kept byte for byte: `{"exit":124,"id":"burner-3f9a1c2b7d10","outcome":"timeout","rc":null,"secs":10.4}`, keys sorted, secs to a tenth. its outcomes are the ones above minus `detached` (it's run only), plus `usage`, and the `-H` ones show as `sandbox_error`. new scripts should use `--json-fd`.
