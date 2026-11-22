@@ -76,6 +76,7 @@ pub fn run(cfg: &Config) -> Report {
         );
     }
 
+    container(&mut r);
     kvm(&mut r);
     cgroups(&mut r);
     tools(&mut r);
@@ -117,23 +118,110 @@ fn kvm(r: &mut Report) {
             "kvm",
             format!("/dev/kvm exists but can't be opened ({e}), run as root"),
         ),
-        Err(_) => r.line(
-            Level::Fail,
-            "kvm",
-            "no /dev/kvm. enable virtualization in the bios, or nested virt if this is a VM",
-        ),
+        Err(_) => {
+            let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+            r.line(
+                Level::Fail,
+                "kvm",
+                no_kvm(&cpuinfo, cfg!(target_arch = "x86_64")),
+            )
+        }
     }
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
-    if cpuinfo
-        .lines()
-        .any(|l| l.starts_with("flags") && l.split_whitespace().any(|f| f == "hypervisor"))
-    {
+    if cpu_flag(&cpuinfo, "hypervisor") {
         r.line(
             Level::Warn,
             "nested",
             "this machine is itself a VM: VMs run nested, slower and at the host's mercy",
         );
     }
+}
+
+/// whether /proc/cpuinfo's first flags line has this flag
+fn cpu_flag(cpuinfo: &str, flag: &str) -> bool {
+    cpuinfo
+        .lines()
+        .find(|l| l.starts_with("flags"))
+        .is_some_and(|l| l.split_whitespace().any(|f| f == flag))
+}
+
+/// why there's no /dev/kvm, from the cpu: a VM whose cpu type hides
+/// virtualization (proxmox's default does), a module that isn't loaded, or
+/// a bios that has it off. x86 only, an arm cpu doesn't list it
+fn no_kvm(cpuinfo: &str, x86: bool) -> String {
+    let model = cpuinfo
+        .lines()
+        .find(|l| l.starts_with("model name"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, m)| m.trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let virt = ["vmx", "svm"].into_iter().find(|f| cpu_flag(cpuinfo, f));
+    match (x86, virt, cpu_flag(cpuinfo, "hypervisor")) {
+        (false, _, _) => {
+            "no /dev/kvm. enable virtualization in the firmware, or nested virt if this is a VM"
+                .into()
+        }
+        (true, Some(f), _) => format!(
+            "no /dev/kvm, though the cpu has {f}: the kvm module isn't loaded (modprobe {})",
+            if f == "vmx" { "kvm_intel" } else { "kvm_amd" }
+        ),
+        (true, None, true) => format!(
+            "no /dev/kvm: this VM's cpu type ({model}) hides virtualization. on proxmox: cpu type host \
+             (qm set ID --cpu host), and nested on in the proxmox host"
+        ),
+        (true, None, false) => format!(
+            "no /dev/kvm, and the cpu ({model}) shows no vmx or svm: turn virtualization on in the bios (VT-x or AMD-V)"
+        ),
+    }
+}
+
+/// inside a container: lxc, docker, podman, systemd-nspawn. burner needs a
+/// machine or a VM of its own: its nft table, routing table, taps and uid
+/// range would land on the container's host
+fn container(r: &mut Report) {
+    let environ = fs::read("/proc/1/environ").unwrap_or_default();
+    let what = in_container(
+        fs::read_to_string("/run/systemd/container").ok().as_deref(),
+        &environ,
+        Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists(),
+    )
+    .or_else(|| {
+        run_ok("systemd-detect-virt", &["-c"])
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty() && o != "none")
+    });
+    if let Some(what) = what {
+        r.line(
+            Level::Fail,
+            "container",
+            format!(
+                "burner is inside a container ({}). it needs a machine or a VM of its own: in a \
+                 container its firewall, routes and VM users would be the host's",
+                printable(&what)
+            ),
+        );
+    }
+}
+
+/// the container kind, from /run/systemd/container, pid 1's environment or
+/// docker's and podman's marker files
+fn in_container(systemd: Option<&str>, environ: &[u8], marker: bool) -> Option<String> {
+    if let Some(s) = systemd.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    let env = environ
+        .split(|&b| b == 0)
+        .find_map(|v| v.strip_prefix(b"container="))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+        .filter(|v| !v.is_empty());
+    env.or_else(|| marker.then(|| "docker or podman".to_string()))
+}
+
+fn printable(s: &str) -> String {
+    s.chars()
+        .take(40)
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .collect()
 }
 
 fn cgroups(r: &mut Report) {
@@ -624,5 +712,51 @@ mod tests {
         let subuid = "alice:100000:65536\nbob:362144:65536\nend:399000:1000\nafter:401024:65536\n";
         assert_eq!(sub_ranges_in(subuid, &ids), vec!["bob"]);
         assert!(sub_ranges_in("", &ids).is_empty());
+    }
+
+    const PROXMOX_DEFAULT: &str = "processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: QEMU Virtual CPU version 2.5+\n\
+        flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep hypervisor lahf_lm\n\nprocessor\t: 1\n";
+    const HOST_TYPE: &str = "model name\t: Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz\n\
+        flags\t\t: fpu vme de vmx ssse3 hypervisor\n";
+    const BARE_AMD: &str =
+        "model name\t: AMD Ryzen 7 5800X 8-Core Processor\nflags\t\t: fpu svm sse4a\n";
+    const BIOS_OFF: &str = "model name\t: Intel(R) Xeon(R) CPU E5-2680 v4\nflags\t\t: fpu sse4_2\n";
+
+    #[test]
+    fn why_no_kvm() {
+        let m = no_kvm(PROXMOX_DEFAULT, true);
+        assert!(
+            m.contains("this VM's cpu type (QEMU Virtual CPU version 2.5+) hides virtualization"),
+            "{m}"
+        );
+        assert!(m.contains("qm set ID --cpu host"), "{m}");
+        assert!(
+            no_kvm(HOST_TYPE, true)
+                .contains("cpu has vmx: the kvm module isn't loaded (modprobe kvm_intel)")
+        );
+        assert!(no_kvm(BARE_AMD, true).contains("modprobe kvm_amd"));
+        let m = no_kvm(BIOS_OFF, true);
+        assert!(
+            m.contains("(Intel(R) Xeon(R) CPU E5-2680 v4) shows no vmx or svm"),
+            "{m}"
+        );
+        assert!(no_kvm("", false).contains("firmware"));
+        assert!(no_kvm("", true).contains("(unknown)"));
+        assert!(cpu_flag(HOST_TYPE, "hypervisor") && !cpu_flag(BIOS_OFF, "hypervisor"));
+    }
+
+    #[test]
+    fn containers() {
+        assert_eq!(in_container(Some("lxc\n"), b"", false), Some("lxc".into()));
+        assert_eq!(
+            in_container(None, b"PATH=/bin\0container=podman\0TERM=xterm\0", false),
+            Some("podman".into())
+        );
+        assert_eq!(
+            in_container(None, b"", true),
+            Some("docker or podman".into())
+        );
+        assert_eq!(in_container(Some(""), b"HOME=/\0container=\0", false), None);
+        assert_eq!(in_container(None, b"PATH=/bin\0", false), None);
     }
 }
