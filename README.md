@@ -202,7 +202,7 @@ if ufw is on, `burner doctor` prints the one route rule it needs. settings live 
 
 ## letting other users run VMs
 
-anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, use `dist/sudoers.example`: it allows `run`, `shell`, `ls`, `kill`, `images`, `log` and `explain`. through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `[limits]` in the config apply to everyone.
+anyone who can run `sudo burner` with any arguments can also take the VM network down or reap. to let someone run VMs and nothing else, `sudo ./install.sh --allow alice` writes the rule in `dist/sudoers.example` to `/etc/sudoers.d/burner` and checks it with visudo (get.sh asks who, or takes `--allow alice` too). it allows `run`, `shell`, `ls`, `kill`, `images` and `log`, and `doctor` and `explain` without `--probe` and `--rules`. `--allow` again adds another user, and every upgrade keeps the rule in step with that release for the users in it. a rule you wrote by hand stays as it is until you use `--allow`, which keeps it as `/etc/sudoers.d/burner.old`. through sudo, `--config` only takes files in `/etc/burner`, `burner kill` only stops VMs that caller started, and `[limits]` in the config apply to everyone.
 
 ## remote hosts
 
