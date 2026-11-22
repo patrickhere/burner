@@ -403,44 +403,58 @@ pub struct KillArgs {
     mine: bool,
 }
 
-const KILL_USAGE: &str = "usage: burner kill burner-xxxxxxxxxxxx";
+/// with --tag or --mine: every VM it asked to stop
+#[derive(Serialize)]
+pub struct KillManyResult {
+    pub vms: Vec<KillResult>,
+}
+
+const KILL_USAGE: &str = "usage: burner kill burner-xxxxxxxxxxxx, --tag TAG or --mine";
+const TAG_USAGE: &str = "--tag must be lowercase letters, digits and dashes, max 32";
+
+/// which VMs a kill is for
+enum Pick<'a> {
+    Id(&'a str),
+    /// the caller's, with this tag or all of them
+    Mine(Option<&'a str>),
+}
 
 impl KillArgs {
-    /// a flag that parses but isn't built yet
-    fn unbuilt(&self) -> Option<&'static str> {
-        if self.tag.is_some() {
-            Some("burner kill --tag: not yet")
-        } else if self.mine {
-            Some("burner kill --mine: not yet")
-        } else {
-            None
+    fn pick(&self) -> std::result::Result<Pick<'_>, &'static str> {
+        match (&self.id, &self.tag, self.mine) {
+            (Some(id), None, false) if valid_id(id) => Ok(Pick::Id(id)),
+            (None, Some(t), false) if super::plan::valid_name(t) => Ok(Pick::Mine(Some(t))),
+            (None, Some(_), false) => Err(TAG_USAGE),
+            (None, None, true) => Ok(Pick::Mine(None)),
+            _ => Err(KILL_USAGE),
         }
     }
 
     /// burner's argv on the far end of -H. checked here: an id like
-    /// -Hother would be a flag there
+    /// -Hother would be a flag there. --tag and --mine need a 0.3.1 there
     pub fn remote_argv(&self) -> std::result::Result<Vec<String>, String> {
-        if let Some(why) = self.unbuilt() {
-            return Err(why.into());
+        let mut v = vec!["kill".to_string()];
+        match self.pick()? {
+            Pick::Id(id) => v.push(id.into()),
+            Pick::Mine(Some(t)) => v.extend(["--tag".into(), t.into()]),
+            Pick::Mine(None) => v.push("--mine".into()),
         }
-        match &self.id {
-            Some(id) if valid_id(id) => Ok(vec!["kill".into(), id.clone()]),
-            _ => Err(KILL_USAGE.into()),
-        }
+        Ok(v)
     }
 }
 
 pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
-    if let Some(why) = a.unbuilt() {
-        return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, why));
-    }
-    let id = match &a.id {
-        Some(id) if valid_id(id) => id.as_str(),
-        _ => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, KILL_USAGE)),
+    let pick = match a.pick() {
+        Ok(p) => p,
+        Err(why) => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, why)),
     };
     if let Some(code) = needs_root("kill", "stops") {
         return Ok(code);
     }
+    let id = match pick {
+        Pick::Id(id) => id,
+        Pick::Mine(tag) => return kill_mine(cfg, tag),
+    };
     // through sudo you can only kill what you started. real root can kill anything
     let caller = sudo_caller();
     // nothing is printed while the ledger is locked: a stalled stderr would hold it
@@ -465,33 +479,109 @@ pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
             format!("{id}: {why}"),
         ));
     }
-    cgroup::kill(id);
-    log_line(&format!("kill {id}"));
+    let ids = [id.to_string()];
+    let gone = stop_and_wait(cfg, &ids);
     let done = |state| {
         Some(KillResult {
             id: id.into(),
             state,
         })
     };
-    // only say it's gone once its wrapper (or the reaper) has cleaned it up
-    let end = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < end {
-        // no reaper timer on macOS: a VM whose wrapper is gone is cleaned up here
-        #[cfg(target_os = "macos")]
-        let _ = reap(cfg);
-        if matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None)) {
-            if !json::on() {
-                println!("killed {id}");
-            }
-            return Ok(json::reply("kill", 0, done("gone")));
+    if gone[0] {
+        if !json::on() {
+            println!("killed {id}");
         }
-        std::thread::sleep(Duration::from_millis(200));
+        return Ok(json::reply("kill", 0, done("gone")));
     }
     json::error(
         Kind::StillStopping,
         format!("kill requested for {id}, still stopping (burner ls shows it)"),
     );
     Ok(json::reply("kill", EXIT_FAILED, done("stopping")))
+}
+
+/// kill --tag and --mine: the caller's VMs (the sudo caller's, else the
+/// uid burner runs as, which is what a VM's owner was set from). none is
+/// fine, there's nothing left to stop
+fn kill_mine(cfg: &Config, tag: Option<&str>) -> Result<ExitCode> {
+    let me: Option<u32> = caller_uid().parse().ok();
+    let ids: Vec<String> = {
+        let led = Ledger::open(&cfg.paths.state)?;
+        let mut ids = Vec::new();
+        for v in led.all() {
+            if v.owner.is_some()
+                && v.owner == me
+                && tag.is_none_or(|t| v.tag == t)
+                && led.update(&v.id, |v| v.cancel = true)?.is_some()
+            {
+                ids.push(v.id);
+            }
+        }
+        ids
+    };
+    let gone = stop_and_wait(cfg, &ids);
+    let vms: Vec<KillResult> = ids
+        .iter()
+        .zip(&gone)
+        .map(|(id, &g)| KillResult {
+            id: id.clone(),
+            state: if g { "gone" } else { "stopping" },
+        })
+        .collect();
+    if !json::on() {
+        for v in vms.iter().filter(|v| v.state == "gone") {
+            println!("killed {}", v.id);
+        }
+        if vms.is_empty() {
+            match tag {
+                Some(t) => println!("no VMs of yours tagged {t}"),
+                None => println!("no VMs of yours running"),
+            }
+        }
+    }
+    let left: Vec<&str> = vms
+        .iter()
+        .filter(|v| v.state == "stopping")
+        .map(|v| v.id.as_str())
+        .collect();
+    if left.is_empty() {
+        return Ok(json::reply("kill", 0, Some(KillManyResult { vms })));
+    }
+    json::error(
+        Kind::StillStopping,
+        format!(
+            "kill requested for {}, still stopping (burner ls shows it)",
+            left.join(", ")
+        ),
+    );
+    Ok(json::reply(
+        "kill",
+        EXIT_FAILED,
+        Some(KillManyResult { vms }),
+    ))
+}
+
+/// stop VMs whose cancel is set, and wait up to 20s for each to be gone.
+/// only gone once its wrapper (or the reaper) has cleaned it up
+fn stop_and_wait(cfg: &Config, ids: &[String]) -> Vec<bool> {
+    for id in ids {
+        cgroup::kill(id);
+        log_line(&format!("kill {id}"));
+    }
+    let mut gone = vec![false; ids.len()];
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end && !gone.iter().all(|&g| g) {
+        // no reaper timer on macOS: a VM whose wrapper is gone is cleaned up here
+        #[cfg(target_os = "macos")]
+        let _ = reap(cfg);
+        for (id, g) in ids.iter().zip(gone.iter_mut()) {
+            *g = *g || matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None));
+        }
+        if !gone.iter().all(|&g| g) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    gone
 }
 
 /// a wrapper that's still alive a minute past its VM's deadline without having
@@ -755,6 +845,34 @@ mod tests {
         let row = t.lines().nth(1).unwrap();
         assert!(row.starts_with("burner-") && row.contains(" tests "));
         assert_eq!(row.split_whitespace().nth(1), Some("tests"));
+    }
+
+    #[test]
+    fn kill_picks() {
+        #[derive(clap::Parser)]
+        struct K {
+            #[command(flatten)]
+            a: KillArgs,
+        }
+        let argv = |args: &[&str]| {
+            <K as clap::Parser>::try_parse_from(std::iter::once("kill").chain(args.iter().copied()))
+                .map_err(|e| e.to_string())
+                .and_then(|k| k.a.remote_argv())
+        };
+        assert_eq!(
+            argv(&["burner-3f9a1c2b7d10"]).unwrap(),
+            ["kill", "burner-3f9a1c2b7d10"]
+        );
+        assert_eq!(
+            argv(&["--tag", "tests"]).unwrap(),
+            ["kill", "--tag", "tests"]
+        );
+        assert_eq!(argv(&["--mine"]).unwrap(), ["kill", "--mine"]);
+        assert_eq!(argv(&["--tag", "Tests_1"]).unwrap_err(), TAG_USAGE);
+        assert_eq!(argv(&["--tag=-Hx"]).unwrap_err(), TAG_USAGE);
+        assert_eq!(argv(&["../../etc"]).unwrap_err(), KILL_USAGE);
+        assert!(argv(&["--mine", "--tag", "x"]).is_err(), "one of them");
+        assert!(argv(&[]).is_err());
     }
 
     #[test]

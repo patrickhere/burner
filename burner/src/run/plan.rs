@@ -211,20 +211,14 @@ impl RunArgs {
         command_string(&self.cmd)
     }
 
-    /// a flag that parses but isn't built yet
-    pub(super) fn unbuilt(&self) -> Option<&'static str> {
-        if self.wait.is_some() {
-            Some("--wait")
-        } else {
-            None
-        }
-    }
-
     /// what burner -H checks here before it connects: everything that needs
     /// no config. the image, the limits and limits.net are the far end's call
     pub fn check_local(&self) -> std::result::Result<(), String> {
         if let Some(t) = &self.ttl {
             parse_ttl(t, u32::MAX).map_err(|e| e.to_string())?;
+        }
+        if let Some(w) = &self.wait {
+            parse_wait(w).map_err(|e| e.to_string())?;
         }
         if net::Mode::parse(self.net()).is_none() {
             return Err(format!("--net {:?}: use none, web or open", self.net()));
@@ -284,6 +278,8 @@ impl RunArgs {
                 LogMode::Full => Some("full".into()),
             },
         );
+        // only when given: a 0.3.0 far end doesn't take it
+        opt("wait", self.wait.clone());
         if self.shell {
             v.push(self.img.clone());
             return v;
@@ -509,17 +505,32 @@ fn disk_size(s: &str) -> Result<u32, String> {
     u32::try_from(mib / 1024).map_err(|_| format!("{s:?} is too big"))
 }
 
-pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
+/// 90s, 10m, 1h or plain seconds
+fn secs_of(s: &str) -> Option<u32> {
     let (num, mult) = match s.as_bytes().last() {
         Some(b's') => (&s[..s.len() - 1], 1),
         Some(b'm') => (&s[..s.len() - 1], 60),
         Some(b'h') => (&s[..s.len() - 1], 3600),
         _ => (s, 1),
     };
-    let n: u32 = num
-        .parse()
-        .map_err(|_| usage(format!("bad --ttl {s:?} (use 90s, 10m, 1h)")))?;
-    let secs = n.saturating_mul(mult);
+    let n: u32 = num.parse().ok()?;
+    Some(n.saturating_mul(mult))
+}
+
+/// how long a run queues for a slot without --wait
+pub(super) const QUEUE_WAIT: u32 = 600;
+
+/// --wait: 1s to a day
+pub fn parse_wait(s: &str) -> Result<u32> {
+    let secs = secs_of(s).ok_or_else(|| usage(format!("bad --wait {s:?} (use 30s, 5m, 1h)")))?;
+    if !(1..=86400).contains(&secs) {
+        return Err(usage("--wait must be between 1s and 24h"));
+    }
+    Ok(secs)
+}
+
+pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
+    let secs = secs_of(s).ok_or_else(|| usage(format!("bad --ttl {s:?} (use 90s, 10m, 1h)")))?;
     if !(10..=max).contains(&secs) {
         return Err(usage(format!(
             "--ttl must be between 10s and {}m",
@@ -561,6 +572,8 @@ pub(super) struct Plan {
     pub(super) net: net::Mode,
     pub(super) shell: bool,
     pub(super) no_wait: bool,
+    /// how long to queue for a slot
+    pub(super) wait_secs: u32,
 }
 
 /// where get.sh keeps this release's tools/build-image
@@ -701,6 +714,10 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
             "--tag must be lowercase letters, digits and dashes, max 32",
         ));
     }
+    let wait_secs = match &a.wait {
+        Some(w) => parse_wait(w)?,
+        None => QUEUE_WAIT,
+    };
     let cmd = command_string(&a.cmd);
     if cmd.trim().is_empty() {
         return Err(usage("no command given (burner run [opts] -- COMMAND)"));
@@ -727,6 +744,7 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         net,
         shell: a.shell,
         no_wait: a.no_wait,
+        wait_secs,
     })
 }
 
@@ -828,6 +846,39 @@ mod tests {
         assert!(
             sh(&["--img", "debian", "alpine"]).is_err(),
             "one or the other"
+        );
+    }
+
+    #[test]
+    fn waits() {
+        assert_eq!(parse_wait("30s").unwrap(), 30);
+        assert_eq!(parse_wait("5m").unwrap(), 300);
+        assert_eq!(parse_wait("24h").unwrap(), 86400);
+        for bad in ["0s", "25h", "x", "", "5d"] {
+            assert!(parse_wait(bad).is_err(), "{bad:?}");
+        }
+        let n = "0123456789abcdef0123456789abcdef";
+        let a = parse(&["--wait", "30s", "--", "x"]);
+        assert!(a.check_local().is_ok());
+        let argv = a.remote_argv(n, false);
+        let at = argv.iter().position(|w| w == "--wait").unwrap();
+        assert_eq!(argv[at + 1], "30s");
+        assert!(at < argv.iter().position(|w| w == "--").unwrap());
+        assert!(
+            !parse(&["--", "x"])
+                .remote_argv(n, false)
+                .contains(&"--wait".into())
+        );
+        assert!(parse(&["--wait", "2d", "--", "x"]).check_local().is_err());
+        #[derive(clap::Parser)]
+        struct S {
+            #[command(flatten)]
+            a: ShellArgs,
+        }
+        let s = <S as clap::Parser>::try_parse_from(["shell", "--wait", "1m", "debian"]).unwrap();
+        assert_eq!(
+            shell_run_args(&s.a).remote_argv(n, false)[3..],
+            ["--wait", "1m", "debian"]
         );
     }
 

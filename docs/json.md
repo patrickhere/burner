@@ -143,6 +143,9 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 // kill: gone, or stopping with exit 1 and kind still_stopping
 {"id":"burner-3f9a1c2b7d10","state":"gone"}
 
+// kill --tag T and kill --mine: each VM of yours it stopped, the same way. none is exit 0 with an empty list
+{"vms":[{"id":"burner-3f9a1c2b7d10","state":"gone"},{"id":"burner-0c2e4f6a8b1d","state":"gone"}]}
+
 // images
 {"images":[{"name":"alpine","rootfs_bytes":96468992,"init_matches":true,
             "defaults":{"vcpus":1,"mem_mib":512,"disk_gib":2,"ttl_secs":600}}]}

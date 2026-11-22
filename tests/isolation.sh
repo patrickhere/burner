@@ -201,6 +201,22 @@ head=$(sudo env -u SUDO_UID burner ls | head -n 1)
   && ok "ls and kill need root (2); through sudo ls lists only yours and kill won't stop another user's VM" \
   || bad "ls and kill owners" "noroot=$r1,$r2 other=$ov kill=$rk head=$head mine=$(head -c 200 <<<"$mine")"
 
+# 12c kill --tag and --mine stop the caller's VMs and nobody else's, and
+# --wait gives up queueing when it says
+( sudo burner run --img "$IMG" --tag grp -- 'sleep 300' </dev/null >/dev/null 2>"$T/g1.err"; echo $? > "$T/g1.rc" ) &
+( sudo env SUDO_UID=4242 burner run --img "$IMG" --tag grp -- 'sleep 300' </dev/null >/dev/null 2>&1; echo $? > "$T/g2.rc" ) &
+for _ in $(seq 40); do [ "$(sudo env -u SUDO_UID burner ls | grep -c ' grp ')" = 2 ] && break; sleep 0.25; done
+ws=$(date +%s); sudo burner run --img "$IMG" --wait 3s -- true </dev/null >/dev/null 2>"$T/w.err"; rw=$?; we=$(date +%s)
+kt=$(sudo burner kill --tag grp --json); rt=$?
+left=$(sudo env -u SUDO_UID burner ls | grep -c ' grp ')
+km=$(sudo burner kill --mine); rm_=$?
+sudo env SUDO_UID=4242 burner kill --mine >/dev/null; wait
+[ "$rw" = 125 ] && grep -q 'no free slot after 3s' "$T/w.err" && [ $((we - ws)) -le 15 ] \
+  && [ "$rt" = 0 ] && printf '%s' "$kt" | jq -e '(.result.vms | length) == 1 and .result.vms[0].state == "gone"' >/dev/null && [ "$left" = 1 ] \
+  && [ "$rm_" = 0 ] && [ "$km" = "no VMs of yours running" ] && [ "$(cat "$T/g1.rc")" = 130 ] && [ "$(cat "$T/g2.rc")" = 130 ] \
+  && ok "kill --tag and --mine stop only the caller's VMs, --wait 3s gives up (125)" \
+  || bad "kill --tag/--mine, --wait" "wait=$rw $((we - ws))s tag=$rt left=$left mine=$rm_ '$km' rcs=$(cat "$T/g1.rc" "$T/g2.rc" | tr '\n' ' ') $(head -c 200 <<<"$kt")"
+
 # 13 argument fuzzing: all must be refused with rc 2 before any VM starts
 fz=0
 for a in "--img ../alpine" "--img alpine/../x" "--img ALPINE" "--tag A_B" "--tag $(printf 'x%.0s' {1..40})" \
@@ -212,6 +228,8 @@ for a in "--img ../alpine" "--img alpine/../x" "--img ALPINE" "--tag A_B" "--tag
 done
 sudo burner run -- </dev/null >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      empty command not refused"; }
 sudo burner kill ../../etc >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad kill id not refused"; }
+sudo burner kill --tag A_B >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad kill tag not refused"; }
+sudo burner run --wait 2d -- true </dev/null >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad --wait not refused"; }
 [ "$fz" = 0 ] && ok "argument fuzzing: all refused" || bad "argument fuzzing" "see above"
 
 # 14 stdin cap is not tested here (512M); oversized command:

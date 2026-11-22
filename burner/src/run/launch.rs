@@ -35,7 +35,6 @@ use crate::sys;
 
 const STDIN_CAP: u64 = 512 << 20;
 const STDIN_TOTAL: Duration = Duration::from_secs(600);
-const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(target_os = "linux")]
 pub const VMM: &str = "firecracker";
@@ -156,10 +155,7 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
         _ if a.json_mark.is_some() && a.remote.is_none() && json_target(a).is_none() => {
             "--json-mark marks the json, give --json-fd too (2 through sudo)".into()
         }
-        _ => {
-            let cmd = if a.shell { "shell" } else { "run" };
-            format!("burner {cmd} {}: not yet", a.unbuilt()?)
-        }
+        _ => return None,
     };
     // with nowhere to put the json, stderr is all that's left
     if !quiet() || !json_ok {
@@ -1497,9 +1493,19 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32
                 waited = true;
             }
         }
-        if start.elapsed() > QUEUE_WAIT {
+        if start.elapsed() > Duration::from_secs(u64::from(p.wait_secs)) {
             record::set_outcome(RunOutcome::Busy, None, None);
-            return Err(exit(EXIT_SANDBOX, Kind::Busy, "no free slot after 10 min"));
+            let w = p.wait_secs;
+            let after = if w.is_multiple_of(60) {
+                format!("{} min", w / 60)
+            } else {
+                format!("{w}s")
+            };
+            return Err(exit(
+                EXIT_SANDBOX,
+                Kind::Busy,
+                format!("no free slot after {after}"),
+            ));
         }
         std::thread::sleep(Duration::from_secs(2));
     }
