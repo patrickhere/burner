@@ -184,7 +184,7 @@ mac_uninstall() {
     fi
     if [ -n "$purge" ]; then
         rm -rf "$support"
-        ok "config and run log" "removed"
+        ok "$support" "removed, config, run log and any other images too"
     elif [ -e "$support" ]; then
         printf '\n  %sleft: %s, --purge removes it%s\n' "$D" "$support" "$R"
     fi
