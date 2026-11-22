@@ -434,8 +434,12 @@ main() {
     rule=$(sed -n 's/^sudo rule: \(.*\) can run burner VMs.*/\1/p' "$LOG" | tail -n 1)
     [ -z "$rule" ] || ok "sudo rule" "$rule, /etc/sudoers.d/burner"
 
+    # a new release brings its images along: more than the guest init can
+    # change between them (bash in alpine, debian's disk in 0.3.1)
+    upgraded=""
+    [ "v$old" = "$version" ] || upgraded=1
     if ! as_root /usr/local/bin/burner images 2>/dev/null | grep -qx alpine \
-        || grep -q 'rebuild alpine' "$LOG"; then
+        || grep -q 'rebuild alpine' "$LOG" || { [ -n "$upgraded" ] && in_release alpine; }; then
         image alpine
     else
         ok "alpine image" "already there"
@@ -444,10 +448,10 @@ main() {
     # when you ask: it's ~100M, and built here it needs mmdebstrap
     have_debian=""
     as_root /usr/local/bin/burner images 2>/dev/null | grep -qx debian && have_debian=1
-    if [ -n "$have_debian" ] && grep -q 'rebuild debian' "$LOG"; then
+    if [ -n "$have_debian" ] && { grep -q 'rebuild debian' "$LOG" || [ -n "$upgraded" ]; }; then
         if in_release debian; then
             image debian
-        else
+        elif grep -q 'rebuild debian' "$LOG"; then
             warn "the debian image needs a rebuild for the new guest init: $SHARE/current/tools/build-image debian"
         fi
     elif [ -z "$have_debian" ]; then
