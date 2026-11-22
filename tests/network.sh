@@ -300,10 +300,9 @@ wait "$dp"
 grep -qx 'rc=125' "$T/death.txt" && grep -q 'network log reader stopped, VM stopped' "$T/death.txt" && [ -z "$(sudo burner ls | grep -v '^no VMs')" ]
 check $? "log: a dead reader stops its VM (125)" "$(tr '\n' ' ' < "$T/death.txt")"
 
-# a reader that's there but stopped (SIGSTOP), and one attempt from the VM
-# after that, the first it makes: the counters say a message went out, the
-# reader passes nothing on, so the watchdog stops the VM the same way. its
-# starting point is read before the VM boots, so even the first attempt counts
+# a reader that's there but stopped (SIGSTOP): the watchdog sees it stopped
+# in /proc at its next read and stops the VM, before or at the VM's first
+# attempt
 ( sudo burner run --img "$IMG" --net web --ttl 2m --tag stall -- "$PRE"'sleep 8; timeout 1 tcp 10.254.8.1 80; sleep 100' </dev/null > "$T/stall.txt" 2>&1; echo "rc=$?" >> "$T/stall.txt" ) &
 sp=$!
 for _ in $(seq 120); do sudo burner ls | awk '$2 == "stall" && /running/ {f = 1} END {exit !f}' && break; sleep 0.25; done
@@ -313,7 +312,28 @@ wait "$sp"
 s1=$(date +%s)
 grep -qx 'rc=125' "$T/stall.txt" && grep -q 'network log reader stalled, VM stopped' "$T/stall.txt" && [ $((s1 - s0)) -le 45 ] \
   && [ -z "$(sudo burner ls | grep -v '^no VMs')" ] && [ -z "$(pgrep -u burner-parse -f -- __read-netlog)" ]
-check $? "log: a stalled reader (SIGSTOP) stops its VM at its first attempt (125, $((s1 - s0))s)" "$(tr '\n' ' ' < "$T/stall.txt") left=$(pgrep -u burner-parse -f -- __read-netlog | tr '\n' ' ')"
+check $? "log: a stopped reader (SIGSTOP) stops its VM (125, $((s1 - s0))s)" "$(tr '\n' ' ' < "$T/stall.txt") left=$(pgrep -u burner-parse -f -- __read-netlog | tr '\n' ' ')"
+
+# a reader that's stuck but not stopped: its cgroup frozen, which /proc
+# shows as sleeping, not stopped. the VM's attempts go out, the counters
+# count them and nothing is passed on, so the watchdog stops the VM by the
+# counters alone
+fz=/sys/fs/cgroup/burner-test-freeze
+( sudo burner run --img "$IMG" --net web --ttl 2m --tag frz -- "$PRE"'sleep 8; for i in 1 2 3; do timeout 1 tcp 10.254.8.$i 80; done; sleep 100' </dev/null > "$T/frz.txt" 2>&1; echo "rc=$?" >> "$T/frz.txt" ) &
+fp=$!
+for _ in $(seq 120); do sudo burner ls | awk '$2 == "frz" && /running/ {f = 1} END {exit !f}' && break; sleep 0.25; done
+rp=$(pgrep -u burner-parse -f -- __read-netlog | head -n 1)
+st=none
+if [ -n "$rp" ] && sudo mkdir -p "$fz" && echo "$rp" | sudo tee "$fz/cgroup.procs" >/dev/null && echo 1 | sudo tee "$fz/cgroup.freeze" >/dev/null; then
+    sleep 1; st=$(sudo awk '{print $3}' "/proc/$rp/stat" 2>/dev/null)
+fi
+f0=$(date +%s)
+wait "$fp"
+f1=$(date +%s)
+[ -d "$fz" ] && { echo 0 | sudo tee "$fz/cgroup.freeze" >/dev/null; sudo rmdir "$fz"; }
+grep -qx 'rc=125' "$T/frz.txt" && grep -q 'network log reader stalled, VM stopped' "$T/frz.txt" && [ "$st" != none ] && [ "$st" != T ] \
+  && [ $((f1 - f0)) -le 45 ] && [ -z "$(sudo burner ls | grep -v '^no VMs')" ] && [ -z "$(pgrep -u burner-parse -f -- __read-netlog)" ]
+check $? "log: a stuck reader (frozen, state $st) stops its VM by the counters (125, $((f1 - f0))s)" "$(tr '\n' ' ' < "$T/frz.txt") state=$st left=$(pgrep -u burner-parse -f -- __read-netlog | tr '\n' ' ')"
 
 # the same while the VM is still starting: the reader killed as soon as it
 # shows up, before or after it said it's ready. the run never goes on
