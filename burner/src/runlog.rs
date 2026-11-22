@@ -35,6 +35,8 @@ const HEAD_CAP: usize = 16 << 10;
 pub const RECORD_CAP: usize = 2 * crate::netlog::FILE_CAP;
 /// a -H host as it's kept in a file name
 const SLUG_CAP: usize = 64;
+/// a copy beside one with the same name gets this many random bytes, in hex
+const DUP_BYTES: usize = 4;
 
 /// how a run or shell ended, as it's handed to keep
 pub enum Ended<'a> {
@@ -280,7 +282,7 @@ fn keep_remote(
 
 /// a record goes in whole or not at all: written aside under a name of its
 /// own, then put in place. `replace` or not: a copy never replaces another,
-/// it gets `STEM.N.json` instead. then the oldest of that owner's go
+/// it gets `STEM.XXXXXXXX.json` instead. then the oldest of that owner's go
 fn store(
     dir: &Path,
     stem: &str,
@@ -310,17 +312,16 @@ fn store(
             if replace {
                 return fs::rename(&tmp, dir.join(format!("{stem}.json")));
             }
-            for n in 1..=keep.keep_runs.min(1000) {
-                let name = match n {
-                    1 => format!("{stem}.json"),
-                    n => format!("{stem}.{n}.json"),
-                };
-                match fs::hard_link(&tmp, dir.join(name)) {
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            let mut name = format!("{stem}.json");
+            for _ in 0..4 {
+                match fs::hard_link(&tmp, dir.join(&name)) {
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        name = format!("{stem}.{}.json", crate::sys::random_hex(DUP_BYTES)?);
+                    }
                     r => return r,
                 }
             }
-            Err(io::Error::other("too many records with that name"))
+            Err(io::Error::other("no free name for the record"))
         });
         let _ = fs::remove_file(&tmp);
         put?;
@@ -372,8 +373,11 @@ fn record_name(name: &str) -> Option<(&str, Option<&str>)> {
     if !valid_id(id) {
         return None;
     }
+    // the slug, and a copy beside another's .XXXXXXXX
     if let Some(h) = host
-        && (h.is_empty() || h.len() > SLUG_CAP || h.bytes().any(|b| !slug_byte(b)))
+        && (h.is_empty()
+            || h.len() > SLUG_CAP + 1 + 2 * DUP_BYTES
+            || h.bytes().any(|b| !slug_byte(b)))
     {
         return None;
     }
@@ -1085,7 +1089,27 @@ mod tests {
         store(&d, &format!("{}@mini", id(1)), &h, &copy, &keep, false).unwrap();
         // the same id from that host again: kept beside it, not over it
         store(&d, &format!("{}@mini", id(1)), &h, &copy, &keep, false).unwrap();
-        assert!(d.join(format!("{}@mini.2.json", id(1))).exists());
+        // and from a host with the longest name, past what retention keeps
+        let long = slug(&"x".repeat(300));
+        assert_eq!(long.len(), SLUG_CAP);
+        let few = Log {
+            keep_runs: 2,
+            keep_days: 30,
+        };
+        let mut hl = head(&id(3), Some(&"x".repeat(300)));
+        hl.host = Some("x".repeat(255));
+        let r3 = serde_json::json!({"id": id(3), "outcome": "exited", "rc": 0});
+        let d3 = tmp("dups");
+        for _ in 0..4 {
+            store(&d3, &format!("{}@{long}", id(3)), &hl, &r3, &few, false).unwrap();
+        }
+        let s3 = Store::at(&[(&d3, true)]);
+        assert_eq!(
+            s3.list(|_| true, 10).len(),
+            2,
+            "every copy is a record, pruned to 2"
+        );
+        fs::remove_dir_all(&d3).unwrap();
         let mut hv = serde_json::to_value(head(&id(2), Some("pi"))).unwrap();
         hv["newer"] = true.into();
         hv["img"] = "evil\u{9b}31m".into();
@@ -1097,6 +1121,7 @@ mod tests {
         let s = Store::at(&[(&d, false)]);
         let all = s.list(|_| true, 10);
         assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 4, "no temp files left");
         assert_eq!(all[0].id, id(2));
         assert_eq!(all[0].img, "evil?31m");
         // by id: this machine's first
