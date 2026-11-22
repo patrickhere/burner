@@ -993,106 +993,132 @@ pub fn cut_to(log: &mut NetLog, cap: usize) {
     }
 }
 
-// ---- kept logs ----
+// ---- the old store ----
 
-/// how many runs' logs are kept
-pub const KEEP: usize = 32;
-
-fn logs_dir(state: &std::path::Path) -> std::path::PathBuf {
-    state.join("logs")
-}
-
-/// keep a run's log in the state dir (cleared on reboot on linux), mode
-/// 0600, and drop the oldest past KEEP
-pub fn store(state: &std::path::Path, log: &NetLog) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    if !crate::ledger::valid_id(&log.id) {
-        return Err(std::io::Error::other("not a run id"));
-    }
-    let dir = logs_dir(state);
-    crate::sys::private_dir(&dir)?;
-    let path = dir.join(format!("{}.json", log.id));
-    let tmp = dir.join(format!("{}.json.new", log.id));
-    let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&tmp)?;
-    f.write_all(&serde_json::to_vec(log)?)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, &path)?;
-    prune(state, KEEP);
+/// 0.3.0 kept each run's log on its own in the state dir. the run log
+/// (runlog.rs) has it in the run's record now, so this keeps nothing
+pub fn store(_state: &std::path::Path, _log: &NetLog) -> std::io::Result<()> {
     Ok(())
 }
 
-/// the kept logs, newest first
-fn kept(state: &std::path::Path) -> Vec<(std::time::SystemTime, std::path::PathBuf)> {
-    let mut v: Vec<_> = std::fs::read_dir(logs_dir(state))
+/// what 0.3.0 left in the state dir goes: nothing reads it any more
+pub fn clear_old(state: &std::path::Path) {
+    let dir = state.join("logs");
+    let names = std::fs::read_dir(&dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().into_string().ok()?;
-            let id = name.strip_suffix(".json")?;
-            crate::ledger::valid_id(id).then_some(())?;
-            Some((e.metadata().ok()?.modified().ok()?, e.path()))
-        })
-        .collect();
-    v.sort_by_key(|x| std::cmp::Reverse(x.0));
-    v
-}
-
-/// drop all but the newest `keep`, and leftovers of a write that didn't finish.
-/// the reaper runs it too
-pub fn prune(state: &std::path::Path, keep: usize) {
-    for (_, p) in kept(state).into_iter().skip(keep) {
-        let _ = std::fs::remove_file(p);
-    }
-    for e in std::fs::read_dir(logs_dir(state))
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-    {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|d| d > Duration::from_secs(600));
-        if e.file_name().to_string_lossy().ends_with(".json.new") && old {
-            let _ = std::fs::remove_file(e.path());
+        .filter_map(|e| e.file_name().into_string().ok());
+    for name in names {
+        let id = name
+            .strip_suffix(".json")
+            .or_else(|| name.strip_suffix(".json.new"));
+        if id.is_some_and(crate::ledger::valid_id) {
+            let _ = std::fs::remove_file(dir.join(&name));
         }
     }
+    let _ = std::fs::remove_dir(&dir);
 }
 
-/// a kept log: by id, or the newest one `owner` ran (any owner's when None).
-/// it's burner's own file, still read with the same strict types and caps
-pub fn load(state: &std::path::Path, id: Option<&str>, owner: Option<u32>) -> Option<NetLog> {
-    let read = |p: &std::path::Path| -> Option<NetLog> {
-        use std::io::Read;
-        let mut b = Vec::new();
-        std::fs::File::open(p)
-            .ok()?
-            .take(FILE_CAP as u64 * 2)
-            .read_to_end(&mut b)
-            .ok()?;
-        serde_json::from_slice(&b).ok()
-    };
-    match id {
-        Some(id) => {
-            if !crate::ledger::valid_id(id) {
-                return None;
+// ---- a log from somewhere else ----
+
+/// the keys a value of this type has when serialized
+fn keys_of<T: Serialize>(sample: &T) -> Vec<String> {
+    match serde_json::to_value(sample) {
+        Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn only_keys(v: &serde_json::Value, keys: &[String]) -> Option<serde_json::Value> {
+    let m = v.as_object()?;
+    Some(serde_json::Value::Object(
+        m.iter()
+            .filter(|(k, _)| keys.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    ))
+}
+
+impl NetLog {
+    /// a log another burner wrote (the far end of -H, maybe a newer one): the
+    /// fields this burner knows, read with the same types. a row it can't
+    /// read (a kind it doesn't know yet) is left out, and then the log
+    /// isn't complete. None when what's there isn't a log at all
+    pub fn lenient(v: &serde_json::Value) -> Option<NetLog> {
+        let event = Event {
+            t: 0.0,
+            last: 0.0,
+            count: 0,
+            dir: String::new(),
+            kind: Kind::Conn,
+            proto: Proto::Tcp,
+            dst: Ipv4Addr::UNSPECIFIED,
+            port: None,
+            verdict: Verdict::Allowed,
+            reason: None,
+            detail: None,
+            outcome: None,
+            names: Vec::new(),
+            bytes_up: None,
+            bytes_down: None,
+            name: None,
+            qtype: None,
+            rcode: None,
+            answers: Vec::new(),
+            malformed: false,
+        };
+        let sample = NetLog {
+            id: String::new(),
+            net: String::new(),
+            platform: String::new(),
+            owner: None,
+            started_unix: 0,
+            secs: 0.0,
+            complete: false,
+            lost: 0,
+            not_itemized: 0,
+            invalid: 0,
+            summary: Summary::default(),
+            events: Vec::new(),
+        };
+        let (top, sum, ev) = (
+            keys_of(&sample),
+            keys_of(&Summary::default()),
+            keys_of(&event),
+        );
+        let mut o = only_keys(v, &top)?;
+        if let Some(s) = o.get("summary").and_then(|s| only_keys(s, &sum)) {
+            o["summary"] = s;
+        }
+        let rows = o
+            .get("events")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        o["events"] = serde_json::Value::Array(Vec::new());
+        let mut log: NetLog = serde_json::from_value(o).ok()?;
+        let mut left_out = false;
+        for r in &rows {
+            let Some(mut r) = only_keys(r, &ev) else {
+                left_out = true;
+                continue;
+            };
+            // a reason this burner doesn't know yet: the row without it
+            let e = serde_json::from_value::<Event>(r.clone()).ok().or_else(|| {
+                r["reason"] = serde_json::Value::Null;
+                serde_json::from_value::<Event>(r).ok()
+            });
+            match e {
+                Some(e) => log.events.push(e),
+                None => left_out = true,
             }
-            read(&logs_dir(state).join(format!("{id}.json")))
-                .filter(|l| owner.is_none() || l.owner == owner)
         }
-        None => kept(state)
-            .iter()
-            .filter_map(|(_, p)| read(p))
-            .find(|l| owner.is_none() || l.owner == owner),
+        if left_out {
+            log.complete = false;
+        }
+        cut_to(&mut log, FILE_CAP);
+        Some(log)
     }
 }
 
@@ -1755,43 +1781,35 @@ mod tests {
     }
 
     #[test]
-    fn kept_logs() {
-        let dir = std::env::temp_dir().join(format!("burner-netlog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut log = sample();
-        for i in 0..(KEEP + 3) {
-            log.id = format!("burner-{i:012x}");
-            log.owner = Some(if i == 1 { 1001 } else { 1000 });
-            store(&dir, &log).unwrap();
-            // mtimes a filesystem can tell apart
-            let t = std::time::SystemTime::now() - Duration::from_secs(1000 - i as u64);
-            let f = std::fs::File::options()
-                .write(true)
-                .open(dir.join("logs").join(format!("{}.json", log.id)))
-                .unwrap();
-            f.set_modified(t).unwrap();
-        }
-        prune(&dir, KEEP);
-        assert_eq!(kept(&dir).len(), KEEP);
-        let newest = format!("burner-{:012x}", KEEP + 2);
-        assert_eq!(load(&dir, None, None).unwrap().id, newest);
-        assert_eq!(load(&dir, None, Some(1000)).unwrap().id, newest);
+    fn lenient_reads_a_newer_log() {
+        let log = sample();
+        let mut v = serde_json::to_value(&log).unwrap();
+        // what's this burner's own passes as it is
+        assert_eq!(NetLog::lenient(&v).unwrap(), log);
+        assert!(serde_json::from_value::<NetLog>(v.clone()).is_ok());
+        // a newer far end: a field more at every level, a reason and a kind
+        // this burner doesn't know
+        v["report"] = "x".into();
+        v["summary"]["http"] = 3.into();
+        v["events"][0]["tls"] = true.into();
+        let mut odd = v["events"][1].clone();
+        odd["reason"] = "geo".into();
+        let mut http = v["events"][1].clone();
+        http["kind"] = "http".into();
+        v["events"].as_array_mut().unwrap().push(odd);
+        v["events"].as_array_mut().unwrap().push(http);
         assert!(
-            load(&dir, Some("burner-000000000000"), None).is_none(),
-            "pruned"
+            serde_json::from_value::<NetLog>(v.clone()).is_err(),
+            "strict refuses it"
         );
-        assert!(load(&dir, Some("../../etc/passwd"), None).is_none());
-        assert!(
-            load(&dir, Some(&newest), Some(1001)).is_none(),
-            "someone else's"
-        );
-        let mode = std::fs::metadata(dir.join("logs").join(format!("{newest}.json")))
-            .unwrap()
-            .permissions();
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(mode.mode() & 0o777, 0o600);
-        std::fs::remove_dir_all(&dir).unwrap();
+        let l = NetLog::lenient(&v).unwrap();
+        assert_eq!(l.events.len(), log.events.len() + 1);
+        assert_eq!(l.events.last().unwrap().reason, None);
+        assert_eq!(l.summary, log.summary);
+        assert!(!l.complete, "the http row was left out");
+        // not a log at all
+        assert!(NetLog::lenient(&serde_json::json!({"pad": "aaaa"})).is_none());
+        assert!(NetLog::lenient(&serde_json::json!("x")).is_none());
     }
 
     #[test]
