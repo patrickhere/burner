@@ -96,7 +96,10 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let _setup = sys::Lock::exclusive_until(&cfg.paths.state.join("setup.lock"), Instant::now())
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
-    recover_all(root)?;
+    {
+        let _no_vms = idle(cfg, "swap their image")?;
+        recover_all(root)?;
+    }
     let stage = Stage::new(root)?;
     let sums = match &kept {
         Some((path, text)) => {

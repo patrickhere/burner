@@ -231,7 +231,10 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let _setup = sys::Lock::exclusive_until(&cfg.paths.state.join("setup.lock"), Instant::now())
         .map_err(|_| anyhow::anyhow!("another burner setup is running"))?;
     sweep(root);
-    recover_all(root)?;
+    {
+        let _no_vms = idle(cfg, "swap their kernel and image")?;
+        recover_all(root)?;
+    }
     let stage = Stage::new(root)?;
     let files: Vec<String> = std::iter::once(KERNEL.to_string())
         .chain(imgs.iter().map(|i| asset(i)))
@@ -574,8 +577,10 @@ fn kept_old(dest: &Path) -> PathBuf {
 
 /// what a setup killed mid-swap left, for every image setup installs, right
 /// after the setup lock and before anything is fetched, so a setup that then
-/// fails (offline, say) has still put the old image back
+/// fails (offline, say) has still put the old image back. with the ledger
+/// locked, so no VM starts meanwhile
 fn recover_all(root: &Path) -> Result<()> {
+    real_dir(&root.join("images"))?;
     for img in IMAGES {
         recover(&root.join("images").join(img))?;
     }
@@ -594,6 +599,8 @@ fn recover(dest: &Path) -> Result<()> {
     }
     match dest.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // only a dir nobody else could have put there goes back
+            crate::config::trusted_file(&old)?;
             fs::rename(&old, dest).with_context(|| format!("putting back {}", dest.display()))
         }
         _ if sys::remove_tree_at(&old) => Ok(()),
@@ -601,8 +608,8 @@ fn recover(dest: &Path) -> Result<()> {
     }
 }
 
-/// whether there's an image dir at dest to replace. anything but a dir there,
-/// a symlink included, is an error
+/// whether there's an image dir at dest to replace. anything but a dir
+/// there, a symlink included, or one someone else can write, is an error
 fn replaceable(dest: &Path) -> Result<bool> {
     match dest.symlink_metadata() {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -611,7 +618,7 @@ fn replaceable(dest: &Path) -> Result<bool> {
             "{} isn't a directory, so setup won't replace it",
             dest.display()
         ),
-        Ok(_) => Ok(true),
+        Ok(_) => crate::config::trusted_file(dest).map(|()| true),
     }
 }
 
