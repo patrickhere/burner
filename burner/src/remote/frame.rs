@@ -44,6 +44,11 @@ pub struct Frames {
     rec: Option<Vec<u8>>,
     started: bool,
     ended: bool,
+    /// a shell's stream: a marker only counts at the start of a line, so a
+    /// typed `b` isn't held back waiting for what comes after it
+    lines: bool,
+    /// the next byte out starts a line
+    at_line: bool,
     /// why the stream can't be trusted any more. bytes after it go through
     /// as text
     pub broken: Option<String>,
@@ -57,16 +62,54 @@ impl Frames {
             rec: None,
             started: false,
             ended: false,
+            lines: false,
+            at_line: true,
             broken: None,
         }
+    }
+
+    /// for a shell: records only at the start of a line, where the far end's
+    /// burner puts them there. bytes are held only while they can still be
+    /// a marker, never on a timer, and let out the moment they can't
+    pub fn lines(nonce: &str) -> Frames {
+        Frames {
+            lines: true,
+            ..Frames::new(nonce)
+        }
+    }
+
+    fn emit(&mut self, out: &mut Vec<u8>, b: &[u8]) {
+        if let Some(&last) = b.last() {
+            self.at_line = last == b'\n';
+        }
+        out.extend_from_slice(b);
+    }
+
+    /// where in `b` a marker could start next
+    fn next_start(&self, b: &[u8]) -> usize {
+        let m = self.marker[0];
+        if !self.lines {
+            return b.iter().position(|&c| c == m).unwrap_or(b.len());
+        }
+        (0..b.len())
+            .find(|&i| {
+                b[i] == m
+                    && if i == 0 {
+                        self.at_line
+                    } else {
+                        b[i - 1] == b'\n'
+                    }
+            })
+            .unwrap_or(b.len())
     }
 
     /// what isn't a record goes to `out`, records to `recs`
     pub fn feed(&mut self, mut b: &[u8], out: &mut Vec<u8>, recs: &mut Vec<Record>) {
         while !b.is_empty() {
             if self.broken.is_some() {
-                out.append(&mut self.held);
-                out.extend_from_slice(b);
+                let held = std::mem::take(&mut self.held);
+                self.emit(out, &held);
+                self.emit(out, b);
                 return;
             }
             if let Some(rec) = &mut self.rec {
@@ -74,6 +117,7 @@ impl Frames {
                     Some(i) => {
                         rec.extend_from_slice(&b[..i]);
                         b = &b[i + 1..];
+                        self.at_line = true;
                         let mut line = self.rec.take().unwrap_or_default();
                         if line.last() == Some(&b'\r') {
                             line.pop();
@@ -99,12 +143,9 @@ impl Frames {
                 continue;
             }
             if self.held.is_empty() {
-                // nothing can start before the next b
-                let next = b
-                    .iter()
-                    .position(|&c| c == self.marker[0])
-                    .unwrap_or(b.len());
-                out.extend_from_slice(&b[..next]);
+                // nothing can start before the next b (at a line start)
+                let next = self.next_start(b);
+                self.emit(out, &b[..next]);
                 b = &b[next..];
                 if b.is_empty() {
                     return;
@@ -118,11 +159,16 @@ impl Frames {
                 continue;
             }
             if !self.marker.starts_with(&self.held) {
-                // let out what can't start a marker any more
-                let keep = (1..self.held.len())
-                    .find(|&i| self.marker.starts_with(&self.held[i..]))
-                    .unwrap_or(self.held.len());
-                out.extend(self.held.drain(..keep));
+                // let out what can't start a marker any more: everything up
+                // to the next place one still could
+                let h = &self.held;
+                let keep = (1..h.len())
+                    .find(|&i| {
+                        self.marker.starts_with(&h[i..]) && (!self.lines || h[i - 1] == b'\n')
+                    })
+                    .unwrap_or(h.len());
+                let gone: Vec<u8> = self.held.drain(..keep).collect();
+                self.emit(out, &gone);
             }
         }
     }
@@ -133,18 +179,6 @@ impl Frames {
         out.append(&mut self.held);
         if self.rec.take().is_some() && self.broken.is_none() {
             self.broken = Some("the far end stopped in the middle of a record".into());
-        }
-    }
-
-    /// bytes held back as a possible marker. a shell flushes them after a
-    /// moment of quiet, since no marker comes in pieces that far apart
-    pub fn held(&self) -> bool {
-        !self.held.is_empty()
-    }
-
-    pub fn flush_held(&mut self, out: &mut Vec<u8>) {
-        if self.rec.is_none() {
-            out.append(&mut self.held);
         }
     }
 
@@ -307,6 +341,56 @@ mod tests {
         // one byte at a time
         let ones: Vec<usize> = (0..s.len()).collect();
         assert_eq!(pieces(s.as_bytes(), &ones), whole);
+    }
+
+    fn lines_all(input: &[u8], cuts: &[usize]) -> (Vec<u8>, Vec<Record>, Option<String>) {
+        let mut f = Frames::lines(N);
+        let (mut out, mut recs) = (Vec::new(), Vec::new());
+        let mut at = 0;
+        for &c in cuts {
+            let c = c.clamp(at, input.len());
+            f.feed(&input[at..c], &mut out, &mut recs);
+            at = c;
+        }
+        f.feed(&input[at..], &mut out, &mut recs);
+        f.finish(&mut out);
+        (out, recs, f.broken)
+    }
+
+    #[test]
+    fn shell_streams_only_hold_at_a_line_start() {
+        let mut f = Frames::lines(N);
+        let (mut out, mut recs) = (Vec::new(), Vec::new());
+        // a typed b echoed after the prompt shows at once
+        f.feed(b"burner:~# b", &mut out, &mut recs);
+        assert_eq!(out, b"burner:~# b");
+        // one at a line start waits for what decides it, however long
+        f.feed(b"\r\nbu", &mut out, &mut recs);
+        assert_eq!(out, b"burner:~# b\r\n");
+        f.feed(b"s\n", &mut out, &mut recs);
+        assert_eq!(out, b"burner:~# b\r\nbus\n");
+        // a marker in the middle of a line is text in a shell
+        let mid = format!("x{}", rec("status {}"));
+        assert_eq!(lines_all(mid.as_bytes(), &[]).0, mid.as_bytes());
+        // a record after a newline, cut anywhere, comes out whole
+        let s = format!(
+            "bye\r\nbu\r\n{}{}",
+            rec("start {\"id\":\"burner-4f1c09ab22e1\"}"),
+            "\r\nburner: x\n\r\n".to_string() + &rec("status {\"exit\":3}")
+        );
+        let whole = lines_all(s.as_bytes(), &[]);
+        assert_eq!(whole.1.len(), 2, "{whole:?}");
+        assert_eq!(whole.0, b"bye\r\nbu\r\n\r\nburner: x\n\r\n");
+        for i in 0..=s.len() {
+            for j in (i..=s.len()).step_by(5) {
+                assert_eq!(lines_all(s.as_bytes(), &[i, j]), whole, "cut at {i}, {j}");
+            }
+        }
+        // the stream starts a line
+        assert_eq!(
+            lines_all(rec("nosudo").as_bytes(), &[3]).1,
+            [Record::NoSudo]
+        );
     }
 
     #[test]

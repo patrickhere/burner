@@ -27,10 +27,6 @@ use crate::sys;
 
 /// keys for a far end that isn't taking them; past this they're dropped
 const TO_PTY_CAP: usize = 1 << 20;
-/// bytes held as a possible record marker go out after this much quiet. a
-/// marker split over a slow link comes together well within it; text that
-/// only looks like the start of one waits that long to show
-const HELD_QUIET: Duration = Duration::from_secs(1);
 
 enum Ended {
     /// ssh went: the far end ended the session, or the connection did
@@ -301,14 +297,13 @@ fn relay(
     let _ = sys::set_nonblocking(m);
     let mut filter = TermFilter::new(!term_utf8());
     let mut escape = Escape::default();
-    let mut frames = Frames::new(nonce);
+    let mut frames = Frames::lines(nonce);
     let winch = Arc::new(AtomicBool::new(false));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, winch.clone());
     let mut size = sys::term_size(1);
     let mut to_pty: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16384];
     let mut stdin_open = true;
-    let mut last_out = Instant::now();
     // a ctrl-c typed before burner there answered went to ssh, still
     // connecting on a cooked pty: when ssh then goes, that was you
     let mut early_ctrl_c = false;
@@ -372,16 +367,11 @@ fn relay(
                 Ok(n) => {
                     let data = buf[..n].to_vec();
                     show(&mut frames, &mut filter, &data, seen);
-                    last_out = Instant::now();
                 }
                 Err(e) if would_block(&e) => {}
                 // EIO: every slave fd is closed, ssh is gone
                 Err(_) => break Ended::Closed,
             }
-        } else if frames.held() && last_out.elapsed() >= HELD_QUIET {
-            let mut text = Vec::new();
-            frames.flush_held(&mut text);
-            screen.put(&filter.feed(&text), None);
         }
         if ready.is_empty() && matches!(child.try_wait(), Ok(Some(_))) {
             // ssh exited, but its pty may still hold the last bytes

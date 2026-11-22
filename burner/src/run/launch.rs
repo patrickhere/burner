@@ -82,7 +82,14 @@ pub fn json_target(a: &RunArgs) -> Option<i32> {
 /// closes every other fd, and stdout is the command's
 fn to_client(a: &RunArgs, kind: &str, body: &str) {
     if let Some(n) = &a.remote {
-        json::write_fd(2, &format!("burner-{n} {kind} {}\n", body.trim_end()));
+        // a shell's client only looks for these at the start of a line, and
+        // the session can end anywhere
+        let nl = if a.shell && kind == "status" {
+            "\r\n"
+        } else {
+            ""
+        };
+        json::write_fd(2, &format!("{nl}burner-{n} {kind} {}\n", body.trim_end()));
     }
 }
 
