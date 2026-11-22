@@ -196,15 +196,21 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
                 } else {
                     String::new()
                 };
+                let v = env!("CARGO_PKG_VERSION");
                 let pinned = fetch
                     .iter()
                     .map(|f| match sum_for(&pins, f) {
+                        Some(h) if placeholder(&h) => Err(anyhow::anyhow!(
+                            "the homebrew formula's sha256 for {f} is still the all-zero \
+                             placeholder, so it pins nothing. brew update && brew upgrade \
+                             burner gets the real one, or burner setup --version v{v} fetches \
+                             it checked only against the release's SHA256SUMS"
+                        )),
                         Some(h) => Ok((f.clone(), h)),
                         None => Err(anyhow::anyhow!(
                             "the homebrew formula pins no sha256 for {f}. burner setup \
-                             --version v{} fetches it checked only against the release's \
-                             SHA256SUMS",
-                            env!("CARGO_PKG_VERSION")
+                             --version v{v} fetches it checked only against the release's \
+                             SHA256SUMS"
                         )),
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -577,6 +583,11 @@ fn sum_for(list: &str, name: &str) -> Option<String> {
     })
 }
 
+/// the formula's pin before a release fills it in
+fn placeholder(h: &str) -> bool {
+    h.bytes().all(|b| b == b'0')
+}
+
 fn is_sha256(h: &str) -> bool {
     h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -692,6 +703,9 @@ mod tests {
         assert_eq!(sum_for(&pins, &asset("debian")).as_deref(), Some(h));
         assert_eq!(sum_for(&pins, &asset("alpine")), None);
         assert_eq!(sum_for("", &asset("debian")), None);
+        assert!(!placeholder(h));
+        let zeros = format!("{}  debian-aarch64.ext4.gz\n", "0".repeat(64));
+        assert!(sum_for(&zeros, &asset("debian")).is_some_and(|h| placeholder(&h)));
     }
 
     #[test]

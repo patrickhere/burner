@@ -87,6 +87,12 @@ class Burner < Formula
     assert_match "https:// or file://", shell_output("#{bin}/burner setup --from ftp://example.com 2>&1", 1)
     assert_path_exists pkgshare/"vmlinux-aarch64"
     assert_path_exists pkgshare/"alpine-aarch64.ext4.gz"
-    assert_match(/\A\h{64}  debian-aarch64\.ext4\.gz\n\z/, (pkgshare/"pins").read)
+    pin = (pkgshare/"pins").read
+    assert_match(/\A\h{64}  debian-aarch64\.ext4\.gz\n\z/, pin)
+    # all zeros is the placeholder until a release fills the pin in: burner
+    # takes it as no pin and says so, before it fetches anything
+    if pin.start_with?("0" * 64)
+      assert_match "all-zero placeholder", shell_output("#{bin}/burner setup debian 2>&1", 1)
+    end
   end
 end
