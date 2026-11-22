@@ -190,16 +190,9 @@ pub fn run(cfg: &Config, config_path: &Path) -> Report {
 
 /// the way out: NAT and the router, a full-tunnel vpn, and resolvers VMs
 /// can use. the same lines linux doctor has
-fn network(r: &mut Report, cfg: &Config) {
+/// the default route's interface, and NAT behind it
+fn uplink(r: &mut Report, cfg: &Config, up: &crate::explain::Uplink) {
     use crate::net;
-    let Some(up) = crate::explain::mac_uplink() else {
-        r.line(
-            Level::Warn,
-            "uplink",
-            "no default route right now, so VMs with a network can't reach anything",
-        );
-        return;
-    };
     let list: Vec<String> = up.addrs.iter().map(|a| a.to_string()).collect();
     let gw = up
         .gateway
@@ -240,6 +233,18 @@ fn network(r: &mut Report, cfg: &Config) {
              that's often its admin page, its ssh or your port forwards. set net.block_public_ip = true \
              to have burner look it up and block it, or put it in net.block yourself",
         );
+    }
+}
+
+fn network(r: &mut Report, cfg: &Config) {
+    use crate::net;
+    match crate::explain::mac_uplink() {
+        Some(up) => uplink(r, cfg, &up),
+        None => r.line(
+            Level::Warn,
+            "uplink",
+            "no default route right now, so VMs with a network can't reach anything",
+        ),
     }
     for t in crate::explain::tunnel_notes(&crate::macnet::route::tunnels_here(), None) {
         r.line(Level::Warn, "vpn", t);
