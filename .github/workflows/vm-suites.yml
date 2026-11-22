@@ -60,6 +60,20 @@ jobs:
           sudo ./install.sh
       - id: image
         run: tools/build-image "$IMG"
+      # apt checks the snapshot against images/debian/keys.asc and nothing
+      # else, so with that file empty the build has to stop at apt-get update
+      - name: debian without its keys doesn't build
+        if: matrix.img == 'debian'
+        run: |
+          cp -R images/debian images/debian-nokeys
+          : > images/debian-nokeys/keys.asc
+          if BURNER_ROOT="$RUNNER_TEMP/nokeys" tools/build-image debian-nokeys > "$RUNNER_TEMP/nokeys.log" 2>&1; then
+            echo "a debian build with an empty keys.asc went through" >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/nokeys.log"
+          grep -q 'apt-get update' "$RUNNER_TEMP/nokeys.log"
+          rm -rf images/debian-nokeys
       - run: sudo env BURNER_TEST_IMG="$IMG" bash tests/isolation.sh
       # worth running even when isolation failed, as long as there's an image
       - if: always() && steps.image.outcome == 'success'

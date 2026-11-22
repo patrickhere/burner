@@ -68,9 +68,12 @@ fi
 if [ "$mode" = debian ]; then
     snap=https://snapshot.debian.org/archive
     epoch=$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" +%s)
-    # apt checks the snapshot's signatures against these keys only, not the host's
+    # apt checks the snapshot's signatures against these keys only, not the
+    # host's: --keyring replaces trusted.gpg.d, and signed-by on each source
+    # keeps a legacy /etc/apt/trusted.gpg out of it too
     mkdir "$work/keys"
     cp "$img/keys.asc" "$work/keys/burner-$name.asc"
+    keys="signed-by=$work/keys/burner-$name.asc"
     opts=(
         # a pinned snapshot's Release files are past their Valid-Until. the
         # signature is still checked, and an older one fails the lock below
@@ -94,9 +97,9 @@ if [ "$mode" = debian ]; then
         env SOURCE_DATE_EPOCH="$epoch" mmdebstrap --quiet --mode=root --variant=apt \
         --architectures="$darch" --keyring="$work/keys" "${opts[@]}" \
         "$suite" "$r" \
-        "deb $snap/debian/$stamp $suite main" \
-        "deb $snap/debian/$stamp $suite-updates main" \
-        "deb $snap/debian-security/$stamp $suite-security main"
+        "deb [$keys] $snap/debian/$stamp $suite main" \
+        "deb [$keys] $snap/debian/$stamp $suite-updates main" \
+        "deb [$keys] $snap/debian-security/$stamp $suite-security main"
 
     # the packages and versions have to be the ones in the lock, so a build
     # from the same base gets the same packages anywhere
