@@ -18,8 +18,8 @@ use clap::Args;
 
 use super::{
     IMAGES, MAX_SUMS, SUMS, SWAPPING, Stage, asset, defaults, download_listed, fetch_sums, go_on,
-    gunzip, idle, own_release, package_list, real_dir, replaceable, say, sum_for, swap_dir, sweep,
-    wanted,
+    gunzip, idle, own_release, package_list, real_dir, recover, replaceable, say, sum_for,
+    swap_dir, sweep, wanted,
 };
 use crate::config::{self, Config};
 use crate::json::{self, Kind};
@@ -147,17 +147,14 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     real_dir(&root.join("images"))?;
     // before anything is swapped, so a refusal changes nothing
     for d in &idirs {
+        recover(d)?;
         replaceable(d)?;
     }
     SWAPPING.store(true, Ordering::SeqCst);
     // each image dir whole, in one step: what tools/build-image wrote next
     // to an image this one replaces (packages, base) goes with the old dir
     for (img, idir) in imgs.iter().zip(&idirs) {
-        swap_dir(
-            &stage.0.join(img),
-            idir,
-            &stage.0.join(format!("old-{img}")),
-        )?;
+        swap_dir(&stage.0.join(img), idir)?;
     }
     drop(ledger);
 

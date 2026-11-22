@@ -366,17 +366,14 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     }
     // before anything is swapped, so a refusal changes nothing
     for d in &idirs {
+        recover(d)?;
         replaceable(d)?;
     }
     SWAPPING.store(true, Ordering::SeqCst);
     fs::rename(&kernel, kdir.join("vmlinux"))?;
     // each image dir whole, with its defaults and init, in one step
     for (img, idir) in imgs.iter().zip(&idirs) {
-        swap_dir(
-            &stage.0.join(img),
-            idir,
-            &stage.0.join(format!("old-{img}")),
-        )?;
+        swap_dir(&stage.0.join(img), idir)?;
     }
     drop(ledger);
 
@@ -543,16 +540,53 @@ fn real_dir(d: &Path) -> Result<()> {
 /// put the dir `new`, complete, at `dest` in one step: a rename when dest
 /// isn't there, else an exchange, after which the old dir is at `new`, in the
 /// stage dir that goes when setup ends. where the filesystem can't exchange,
-/// two renames: the old dir to `aside`, then the new one in
-fn swap_dir(new: &Path, dest: &Path, aside: &Path) -> Result<()> {
+/// two renames: the old dir to .NAME.old next to it, then the new one in. a
+/// setup killed in between leaves the old one there, and the next setup puts
+/// it back (`recover`)
+fn swap_dir(new: &Path, dest: &Path) -> Result<()> {
     if !replaceable(dest)? {
         return fs::rename(new, dest).with_context(|| format!("moving in {}", dest.display()));
     }
     if exchange(new, dest).with_context(|| format!("swapping in {}", dest.display()))? {
         return Ok(());
     }
-    fs::rename(dest, aside).with_context(|| format!("moving {} aside", dest.display()))?;
-    fs::rename(new, dest).with_context(|| format!("moving in {}", dest.display()))
+    let old = kept_old(dest);
+    fs::rename(dest, &old).with_context(|| format!("moving {} aside", dest.display()))?;
+    if let Err(e) = fs::rename(new, dest) {
+        let _ = fs::rename(&old, dest);
+        return Err(e).with_context(|| format!("moving in {}", dest.display()));
+    }
+    // one left behind goes at the next setup
+    sys::remove_tree_at(&old);
+    Ok(())
+}
+
+/// where swap_dir keeps the old image dir between its two renames
+fn kept_old(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.old"))
+}
+
+/// an image dir a setup killed between swap_dir's two renames left aside:
+/// back in its place when that's empty, else gone
+fn recover(dest: &Path) -> Result<()> {
+    let old = kept_old(dest);
+    match old.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", old.display())),
+        Ok(m) if !m.is_dir() => bail!("{} isn't a directory", old.display()),
+        Ok(_) => {}
+    }
+    match dest.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(&old, dest).with_context(|| format!("putting back {}", dest.display()))
+        }
+        _ if sys::remove_tree_at(&old) => Ok(()),
+        _ => bail!("couldn't remove {}", old.display()),
+    }
 }
 
 /// whether there's an image dir at dest to replace. anything but a dir there,
@@ -970,6 +1004,47 @@ mod tests {
                 assert!(v.as_integer().is_some_and(|n| n > 0), "{img} {k}");
             }
         }
+    }
+
+    #[test]
+    fn image_dirs_swap_whole() {
+        let t = std::env::temp_dir().join(format!("burner-swap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&t);
+        let (new, dest) = (t.join("stage-alpine"), t.join("alpine"));
+        let put = |d: &Path, what: &str| {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("rootfs.ext4"), what).unwrap();
+        };
+        let has = |d: &Path| fs::read_to_string(d.join("rootfs.ext4")).ok();
+        // nothing there yet: moved in
+        put(&new, "one");
+        swap_dir(&new, &dest).unwrap();
+        assert_eq!(has(&dest).as_deref(), Some("one"));
+        // there: the new one in, the old one out where the new one was
+        put(&new, "two");
+        fs::write(dest.join("base"), "from build-image").unwrap();
+        swap_dir(&new, &dest).unwrap();
+        assert_eq!(has(&dest).as_deref(), Some("two"));
+        assert!(!dest.join("base").exists());
+        assert!(!new.exists() || has(&new).as_deref() == Some("one"));
+        // a symlink there is refused, before and during
+        let link = t.join("linked");
+        std::os::unix::fs::symlink(&dest, &link).unwrap();
+        assert!(replaceable(&link).is_err());
+        put(&new, "three");
+        assert!(swap_dir(&new, &link).is_err());
+        assert_eq!(has(&dest).as_deref(), Some("two"));
+        // a setup killed between the two renames: the old one comes back
+        fs::rename(&dest, kept_old(&dest)).unwrap();
+        recover(&dest).unwrap();
+        assert_eq!(has(&dest).as_deref(), Some("two"));
+        // killed after them: the old one goes
+        put(&kept_old(&dest), "old");
+        recover(&dest).unwrap();
+        assert!(!kept_old(&dest).exists());
+        assert_eq!(has(&dest).as_deref(), Some("two"));
+        assert_eq!(kept_old(&dest), t.join(".alpine.old"));
+        fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]
