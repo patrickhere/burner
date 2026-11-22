@@ -255,6 +255,14 @@ unpack() {
     as_root install -m 0644 "$tmp/SHA256SUMS" "$SHARE/.new/$name/SHA256SUMS"
 }
 
+# a run killed between switch's two moves left the release current points
+# at in .old: back it goes
+recover_share() {
+    [ -d "$SHARE/.old" ] || return 0
+    cur=$(readlink "$SHARE/current" 2>/dev/null) || return 0
+    [ -e "$SHARE/$cur" ] || as_root mv -T "$SHARE/.old" "$SHARE/$cur"
+}
+
 # once it's installed: current is this release, previous the one before, and
 # any older one goes. sudo $SHARE/previous/install.sh goes back to it
 switch() {
@@ -327,6 +335,7 @@ main() {
     [ "$(uname -s)" = Linux ] || not_linux
     if [ -n "$uninstall" ]; then
         need_root
+        recover_share
         LOG=$(mktemp /tmp/burner-install-XXXXXX)
         KEEP_LOG=""
         trap '[ -n "$KEEP_LOG" ] || rm -f "$LOG"' EXIT
@@ -343,6 +352,7 @@ main() {
         command -v "$t" >/dev/null 2>&1 || die "this installer needs $t"
     done
     need_root
+    recover_share
     kernel=$(uname -r)
     ok "this machine" "linux $arch, kvm, kernel ${kernel%%-*}"
 
