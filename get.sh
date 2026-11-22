@@ -57,9 +57,11 @@ run() {
     shift
     printf '\n== %s\n' "$step" >>"$LOG"
     rc=0
+    # in the background either way: on the left of || a function runs with
+    # set -e off, so a step's first failure wouldn't stop it
+    "$@" >>"$LOG" 2>&1 &
+    pid=$!
     if [ -n "$TTY" ]; then
-        "$@" >>"$LOG" 2>&1 &
-        pid=$!
         while kill -0 "$pid" 2>/dev/null; do
             # first frame shown, then rotated to the back
             frame=${FRAMES%% *}
@@ -67,11 +69,9 @@ run() {
             printf '\r  %s%s%s %s' "$F" "$frame" "$R" "$step"
             sleep 0.1
         done
-        wait "$pid" || rc=$?
-        printf '\r\033[K'
-    else
-        "$@" >>"$LOG" 2>&1 || rc=$?
     fi
+    wait "$pid" || rc=$?
+    [ -z "$TTY" ] || printf '\r\033[K'
     if [ "$rc" != 0 ]; then
         printf '  %sx%s %s\n\n' "$E" "$R" "$step" >&2
         tail -n 15 "$LOG" | sed 's/^/    /' >&2
