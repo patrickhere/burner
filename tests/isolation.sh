@@ -368,13 +368,17 @@ sudo burner run --tag rofd --json-fd 2 -- 'sleep 20' </dev/null >/dev/null 2</de
 if sudo nft list table inet burner >/dev/null 2>&1; then
     ( sudo burner run --net web --ttl 60s --tag netlog -- 'sleep 15' </dev/null >/dev/null 2>&1 ) &
     for _ in $(seq 30); do pgrep -f -- '__read-netlog' >/dev/null && break; sleep 1; done
+    rpid=$(pgrep -f -- '__read-netlog' | head -n 1)
     uids=$(ps -o uid= -p "$(pgrep -d, -f -- '__read-netlog')" 2>/dev/null | sort -u | tr -d ' ')
+    # its syscall filter is on: nothing past the few it needs, no new privileges
+    filt=$(sudo grep -E '^(Seccomp|NoNewPrivs|CapEff):' "/proc/$rpid/status" 2>/dev/null | tr -s '\t ' ' ' | tr '\n' ' ')
     vid=$(sudo burner ls | awk '/ netlog /{print $1}'); [ -n "$vid" ] && sudo burner kill "$vid" >/dev/null
     wait
     sleep 1
     [ -n "$uids" ] && [ "$uids" = "$(id -u burner-parse)" ] && [ -z "$(pgrep -f -- '__read-netlog')" ] \
-      && ok "the network log's reader runs as burner-parse and goes with its run" \
-      || bad "network log reader" "uids=$uids left=$(pgrep -f -- '__read-netlog' | tr '\n' ' ')"
+      && [[ "$filt" == *"NoNewPrivs: 1"* ]] && [[ "$filt" == *"Seccomp: 2"* ]] && [[ "$filt" == *"CapEff: 0000000000000000"* ]] \
+      && ok "the network log's reader runs as burner-parse, no capabilities, under its syscall filter, and goes with its run" \
+      || bad "network log reader" "uids=$uids $filt left=$(pgrep -f -- '__read-netlog' | tr '\n' ' ')"
 else
     echo "SKIP  network log reader  (no burner net up)"
 fi

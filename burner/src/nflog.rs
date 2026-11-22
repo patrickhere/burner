@@ -315,73 +315,102 @@ mod sock {
         Ok(fd)
     }
 
-    /// no ptrace, no signals to others, no new programs, files or sockets.
-    /// a reader the guest found a bug in can then only stop, which stops
-    /// its VM, and can't reach another run's parser under the same user
-    fn deny_list() -> io::Result<()> {
+    /// the reader's syscalls, all of them: receive on fd 0, write to fd 1
+    /// and 2, memory that's never executable, its own exit and abort.
+    /// anything else kills it, which stops its VM: no files, no sockets, no
+    /// signals or ptrace to another process (another run's parser runs as
+    /// the same user), no new programs
+    pub fn allow_list(pid: u32) -> Vec<libc::sock_filter> {
         #[cfg(target_arch = "x86_64")]
         const ARCH: u32 = 0xc000_003e;
         #[cfg(target_arch = "aarch64")]
         const ARCH: u32 = 0xc000_00b7;
-        #[allow(unused_mut)]
-        let mut deny: Vec<libc::c_long> = vec![
-            libc::SYS_ptrace,
-            libc::SYS_process_vm_readv,
-            libc::SYS_process_vm_writev,
-            libc::SYS_kill,
-            libc::SYS_tkill,
-            libc::SYS_tgkill,
-            libc::SYS_pidfd_open,
-            libc::SYS_pidfd_send_signal,
-            libc::SYS_pidfd_getfd,
-            libc::SYS_execve,
-            libc::SYS_execveat,
-            libc::SYS_openat,
-            libc::SYS_socket,
-            libc::SYS_connect,
-            libc::SYS_sendto,
-            libc::SYS_sendmsg,
-        ];
-        #[cfg(target_arch = "x86_64")]
-        deny.push(libc::SYS_open);
-        let stmt = |code: u16, k: u32| libc::sock_filter {
+        // seccomp_data: nr at 0, arch at 4, the arguments' low words from 16
+        let arg = |k: u32| 16 + 8 * k;
+        let ld = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
+        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
+        let jeq = (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16;
+        let and = (libc::BPF_ALU | libc::BPF_AND | libc::BPF_K) as u16;
+        let st = |code: u16, k: u32| libc::sock_filter {
             code,
             jt: 0,
             jf: 0,
             k,
         };
-        let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
-            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        let j = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+            code: jeq,
             jt,
             jf,
             k,
         };
-        let ld = (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16;
-        let ret = (libc::BPF_RET | libc::BPF_K) as u16;
-        let mut prog = vec![
-            // seccomp_data.arch: another architecture's numbers mean nothing here
-            stmt(ld, 4),
-            jeq(ARCH, 1, 0),
-            stmt(ret, libc::SECCOMP_RET_KILL_PROCESS),
-            // seccomp_data.nr
-            stmt(ld, 0),
-        ];
+        let allow = st(ret, libc::SECCOMP_RET_ALLOW);
+        let kill = st(ret, libc::SECCOMP_RET_KILL_PROCESS);
+        let mut p = vec![st(ld, 4), j(ARCH, 1, 0), kill, st(ld, 0)];
         // x32 calls carry the same arch with a high bit set in the number
         #[cfg(target_arch = "x86_64")]
-        {
-            prog.push(libc::sock_filter {
+        p.extend([
+            libc::sock_filter {
                 code: (libc::BPF_JMP | libc::BPF_JGE | libc::BPF_K) as u16,
                 jt: 0,
                 jf: 1,
                 k: 0x4000_0000,
-            });
-            prog.push(stmt(ret, libc::SECCOMP_RET_KILL_PROCESS));
+            },
+            kill,
+        ]);
+        // a syscall with no limit on its arguments
+        let plain: &[libc::c_long] = &[
+            libc::SYS_brk,
+            libc::SYS_munmap,
+            libc::SYS_mremap,
+            libc::SYS_madvise,
+            libc::SYS_futex,
+            libc::SYS_rt_sigreturn,
+            libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigaction,
+            libc::SYS_sigaltstack,
+            libc::SYS_getpid,
+            libc::SYS_gettid,
+            libc::SYS_getrandom,
+            libc::SYS_clock_gettime,
+            libc::SYS_sched_yield,
+            libc::SYS_restart_syscall,
+            libc::SYS_exit,
+            libc::SYS_exit_group,
+        ];
+        for &nr in plain {
+            p.extend([j(nr as u32, 0, 1), allow]);
         }
-        for &nr in &deny {
-            prog.push(jeq(nr as u32, 0, 1));
-            prog.push(stmt(ret, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        // one argument that must be one of these values
+        let one_of = |p: &mut Vec<libc::sock_filter>, nr: libc::c_long, a: u32, ok: &[u32]| {
+            let n = ok.len() as u8;
+            p.push(j(nr as u32, 0, n + 3));
+            p.push(st(ld, arg(a)));
+            for (i, &v) in ok.iter().enumerate() {
+                p.push(j(v, n - i as u8, 0));
+            }
+            p.extend([kill, allow]);
+        };
+        one_of(&mut p, libc::SYS_recvfrom, 0, &[0]);
+        one_of(&mut p, libc::SYS_write, 0, &[1, 2]);
+        one_of(&mut p, libc::SYS_writev, 0, &[1, 2]);
+        // abort signals itself, and only itself
+        one_of(&mut p, libc::SYS_tgkill, 0, &[pid]);
+        // memory, never executable
+        for nr in [libc::SYS_mmap, libc::SYS_mprotect] {
+            p.extend([
+                j(nr as u32, 0, 5),
+                st(ld, arg(2)),
+                st(and, libc::PROT_EXEC as u32),
+                j(0, 1, 0),
+                kill,
+            ]);
+            p.push(allow);
         }
-        prog.push(stmt(ret, libc::SECCOMP_RET_ALLOW));
+        p.push(kill);
+        p
+    }
+
+    pub(super) fn install(prog: &mut [libc::sock_filter]) -> io::Result<()> {
         let fprog = libc::sock_fprog {
             len: prog.len() as u16,
             filter: prog.as_mut_ptr(),
@@ -429,12 +458,14 @@ mod sock {
         // attach to it or read its memory
         // SAFETY: prctl with plain integer arguments
         unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-        if deny_list().is_err() {
+        // everything it allocates up front is allocated before the filter
+        let mut buf = vec![0u8; 256 << 10];
+        let mut lines = Vec::with_capacity(1024);
+        let mut out = io::stdout().lock();
+        let mut prog = allow_list(std::process::id());
+        if install(&mut prog).is_err() {
             return ExitCode::from(2);
         }
-        let mut buf = vec![0u8; 256 << 10];
-        let mut lines = Vec::new();
-        let mut out = io::stdout().lock();
         // the run waits for this before the VM gets a tap
         if out
             .write_all(crate::run::netlog_ready().as_bytes())
@@ -621,6 +652,132 @@ mod tests {
             packet_line("t", 2, &[0x41; 40], None).is_none(),
             "ihl under 5"
         );
+    }
+
+    /// the reader's filter, for real, in forked children: what it needs
+    /// goes through, files, sockets, signals to others and exec don't
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_readers_filter() {
+        use std::ffi::CString;
+        let parent = std::process::id() as libc::pid_t;
+        let path = CString::new("/etc/hostname").unwrap();
+        let sh = CString::new("/bin/true").unwrap();
+        // prepared before fork, so the child only makes syscalls
+        let attempt = |name: &str, f: &dyn Fn()| -> libc::c_int {
+            // SAFETY: the child only installs the filter, makes raw
+            // syscalls and _exits; the parent waits for it
+            unsafe {
+                let pid = libc::fork();
+                assert!(pid >= 0, "fork");
+                if pid == 0 {
+                    let mut prog = super::sock::allow_list(libc::getpid() as u32);
+                    if super::sock::install(&mut prog).is_err() {
+                        libc::_exit(3);
+                    }
+                    f();
+                    libc::_exit(0);
+                }
+                let mut st = 0;
+                libc::waitpid(pid, &mut st, 0);
+                if libc::WIFSIGNALED(st) {
+                    -libc::WTERMSIG(st)
+                } else {
+                    let _ = name;
+                    libc::WEXITSTATUS(st)
+                }
+            }
+        };
+        let sys = libc::SIGSYS;
+        // what it does: write to stdout, memory, its own exit
+        assert_eq!(
+            attempt("write", &|| unsafe {
+                libc::write(2, b"".as_ptr().cast(), 0);
+                let m = libc::mmap(
+                    std::ptr::null_mut(),
+                    65536,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if m == libc::MAP_FAILED {
+                    libc::_exit(4);
+                }
+                libc::munmap(m, 65536);
+            }),
+            0
+        );
+        for (what, f) in [
+            (
+                "openat",
+                &(|| unsafe {
+                    libc::syscall(
+                        libc::SYS_openat,
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        libc::O_RDONLY,
+                    );
+                }) as &dyn Fn(),
+            ),
+            ("openat2", &|| unsafe {
+                let how = [0u64; 3];
+                libc::syscall(
+                    libc::SYS_openat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    how.as_ptr(),
+                    24usize,
+                );
+            }),
+            ("kill another", &|| unsafe {
+                libc::kill(parent, 0);
+            }),
+            ("rt_sigqueueinfo", &|| unsafe {
+                let info: libc::siginfo_t = std::mem::zeroed();
+                libc::syscall(
+                    libc::SYS_rt_sigqueueinfo,
+                    parent,
+                    0,
+                    &info as *const libc::siginfo_t,
+                );
+            }),
+            ("tgkill another", &|| unsafe {
+                libc::syscall(libc::SYS_tgkill, parent, parent, 0);
+            }),
+            ("ptrace", &|| unsafe {
+                libc::syscall(libc::SYS_ptrace, libc::PTRACE_ATTACH, parent, 0, 0);
+            }),
+            ("pidfd_open", &|| unsafe {
+                libc::syscall(libc::SYS_pidfd_open, parent, 0);
+            }),
+            ("socket", &|| unsafe {
+                libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            }),
+            ("execve", &|| unsafe {
+                let argv = [sh.as_ptr(), std::ptr::null()];
+                libc::execve(sh.as_ptr(), argv.as_ptr(), std::ptr::null());
+            }),
+            ("write elsewhere", &|| unsafe {
+                libc::write(5, b"x".as_ptr().cast(), 1);
+            }),
+            ("exec memory", &|| unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+            }),
+            ("recv elsewhere", &|| unsafe {
+                let mut b = [0u8; 4];
+                libc::recv(7, b.as_mut_ptr().cast(), 4, 0);
+            }),
+        ] {
+            assert_eq!(attempt(what, f), -sys, "{what} got through");
+        }
     }
 
     #[test]
