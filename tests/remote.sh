@@ -40,8 +40,9 @@ short() { tr '\n' ' ' < "$1" | head -c 300; }
 # a python expression over the json on stdin, d
 json_is() { python3 -I -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if ($1) else 1)"; }
 
-# ---- the far end: a private sshd as you, two ports. the second one puts a
-# sudo that always says no first on PATH, for the no-sudo-rule case
+# ---- the far end: a private sshd as you, three ports. the second one puts a
+# sudo that always says no first on PATH, for the no-sudo-rule case, the third
+# one a sudo rule without the lines for burner log and explain
 ME=$(id -un)
 ssh-keygen -q -t ed25519 -N '' -f "$T/hostkey" -C burner-test
 ssh-keygen -q -t ed25519 -N '' -f "$T/otherkey" -C burner-test-other
@@ -50,11 +51,15 @@ cp "$T/userkey.pub" "$T/authorized_keys"
 mkdir -p "$T/nosudo-bin" "$T/xdg/burner"
 printf '#!/bin/sh\nexit 1\n' > "$T/nosudo-bin/sudo"
 chmod 755 "$T/nosudo-bin/sudo"
+mkdir -p "$T/partsudo-bin"
+printf '#!/bin/sh\n[ "$1 $2" = "-n -l" ] && case $4 in log|explain) exit 1 ;; esac\nexec /usr/bin/sudo "$@"\n' > "$T/partsudo-bin/sudo"
+chmod 755 "$T/partsudo-bin/sudo"
 free_port() { python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
-P1=$(free_port); P2=$(free_port); PDOWN=$(free_port)
+P1=$(free_port); P2=$(free_port); P3=$(free_port); PDOWN=$(free_port)
 cat > "$T/sshd_config" <<EOF
 Port $P1
 Port $P2
+Port $P3
 ListenAddress 127.0.0.1
 HostKey $T/hostkey
 AuthorizedKeysFile $T/authorized_keys
@@ -67,27 +72,31 @@ PubkeyAuthentication yes
 AllowUsers $ME
 Match LocalPort $P2
     SetEnv PATH=$T/nosudo-bin:/usr/bin:/bin:/usr/sbin:/sbin
+Match LocalPort $P3
+    SetEnv PATH=$T/partsudo-bin:/usr/bin:/bin:/usr/sbin:/sbin
 EOF
 /usr/sbin/sshd -f "$T/sshd_config" -D -E "$T/sshd.log" &
 SSHD_PID=$!
 for _ in $(seq 50); do
     up=$(grep -c 'Server listening' "$T/sshd.log" 2>/dev/null)
-    [ "${up:-0}" -ge 2 ] && break
+    [ "${up:-0}" -ge 3 ] && break
     sleep 0.1
 done
 key=$(cut -d' ' -f1,2 "$T/hostkey.pub")
 other=$(cut -d' ' -f1,2 "$T/otherkey.pub")
-printf '[127.0.0.1]:%s %s\n[127.0.0.1]:%s %s\n' "$P1" "$key" "$P2" "$key" > "$T/known_hosts"
+printf '[127.0.0.1]:%s %s\n' "$P1" "$key" "$P2" "$key" "$P3" "$key" > "$T/known_hosts"
 printf '[127.0.0.1]:%s %s\n' "$P1" "$other" > "$T/bad_known_hosts"
 : > "$T/empty_known_hosts"
 cat > "$T/ssh_config" <<EOF
-Host lo nokey badkey nosudo down
+Host lo nokey badkey nosudo partsudo down
     HostName 127.0.0.1
     User $ME
 Host lo nokey badkey
     Port $P1
 Host nosudo
     Port $P2
+Host partsudo
+    Port $P3
 Host down
     Port $PDOWN
 Host nokey
@@ -299,6 +308,9 @@ burner = "$T/fake-burner"
 [hosts.nosudo]
 addrs = ["nosudo"]
 burner = "$T/fake-burner"
+
+[hosts.partsudo]
+addrs = ["partsudo"]
 
 [hosts.nokey]
 addrs = ["nokey"]
@@ -531,7 +543,7 @@ case $d2 in "EXIT 0 "*OK) e2=ok ;; *) e2=no ;; esac
 "$B" --json hosts >"$T/hosts.json" 2>&1
 [ "$rd" = 0 ] && grep -q "fake's own doctor" "$T/doc" && grep -q '  | ok    fake' "$T/doc" \
   && [ "$rh" = 0 ] && grep -q "^lo .*192.0.2.1 (" "$T/hosts" && grep -q "lo (0 ms)\|lo ([0-9]* ms)" "$T/hosts" \
-  && json_is 'len(d["result"]["hosts"]) == 7' < "$T/hosts.json" \
+  && json_is 'len(d["result"]["hosts"]) == 8' < "$T/hosts.json" \
   && ok "doctor over -H, burner hosts --check and --json" || bad "doctor and hosts" "doctor=$rd hosts=$rh $(short "$T/doc")"
 
 # F21 a hosts.toml others can write is refused
@@ -639,8 +651,14 @@ case $d2 in "EXIT 0 "*OK) e2=ok ;; *) e2=no ;; esac
 
 # R8 doctor over -H
 "$B" -H lo doctor >"$T/doc" 2>&1; rd=$?
-[ "$rd" = 0 ] && grep -q "run, shell, ls, kill and images allowed without a password" "$T/doc" \
+[ "$rd" = 0 ] && grep -q "run, shell, ls, kill, images, log and explain allowed without a password" "$T/doc" \
+  && ! grep -q '^warn  sudo' "$T/doc" \
   && ok "real: doctor over -H" || bad "real doctor" "rc=$rd $(short "$T/doc")"
+# a rule without the log and explain lines is a warning, the rest still works
+"$B" -H partsudo doctor >"$T/doc" 2>&1; rd=$?
+[ "$rd" = 0 ] && grep -q "^ok    sudo .*run, shell, ls, kill and images allowed without a password" "$T/doc" \
+  && grep -q "^warn  sudo .*doesn't cover burner log or explain, so -H partsudo log and explain won't work" "$T/doc" \
+  && ok "real: doctor over -H warns about a rule without log and explain" || bad "real doctor, part of the rule" "rc=$rd $(short "$T/doc")"
 
 # R9 the connection log comes back over -H: the summary on stderr, and a
 # log of 400 blocked rows whole in the json, past what fit in a record before

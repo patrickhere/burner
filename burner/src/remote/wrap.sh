@@ -44,6 +44,8 @@ if [ "$m" = doctor ] && [ "$s" = sudo ]; then
     echo "burner-$n sudo ls $(may ls)" >&2
     echo "burner-$n sudo kill $(may kill burner-000000000000)" >&2
     echo "burner-$n sudo images $(may images)" >&2
+    echo "burner-$n sudo log $(may log)" >&2
+    echo "burner-$n sudo explain $(may explain)" >&2
     echo "burner-$n sudo doctor $(may "$@")" >&2
     if [ "$(may "$@")" = no ]; then
         s=direct

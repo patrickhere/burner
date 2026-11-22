@@ -63,6 +63,14 @@ impl Report {
     }
 }
 
+fn and_list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 fn ms(d: Duration) -> String {
     format!("{} ms", d.as_millis())
 }
@@ -273,10 +281,25 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
             format!("ssh'd in as uid {uid}, burner runs without sudo"),
         );
     } else {
+        // log and explain are lines of their own in the example rule, and
+        // only those two commands need them
+        let optional = |c: &str| c == "log" || c == "explain";
         let no: Vec<&str> = s
             .sudo
             .iter()
-            .filter(|(c, ok)| c != "doctor" && !ok)
+            .filter(|(c, ok)| c != "doctor" && !optional(c) && !ok)
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let yes: Vec<&str> = s
+            .sudo
+            .iter()
+            .filter(|(c, ok)| c != "doctor" && *ok)
+            .map(|(c, _)| c.as_str())
+            .collect();
+        let no_opt: Vec<&str> = s
+            .sudo
+            .iter()
+            .filter(|(c, ok)| optional(c) && !ok)
             .map(|(c, _)| c.as_str())
             .collect();
         if s.sudo.is_empty() {
@@ -289,7 +312,7 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
             r.line(
                 Level::Ok,
                 "sudo",
-                "run, shell, ls, kill and images allowed without a password",
+                format!("{} allowed without a password", and_list(&yes)),
             );
         } else {
             r.line(
@@ -298,6 +321,18 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
                 format!(
                     "no NOPASSWD rule there for burner {}: -H needs one, see dist/sudoers.example",
                     no.join(", ")
+                ),
+            );
+        }
+        if !no_opt.is_empty() {
+            r.line(
+                Level::Warn,
+                "sudo",
+                format!(
+                    "the sudo rule there doesn't cover burner {}, so -H {name} {} won't work: \
+                     add their lines from dist/sudoers.example",
+                    no_opt.join(" or "),
+                    no_opt.join(" and ")
                 ),
             );
         }
