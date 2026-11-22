@@ -7,10 +7,14 @@ pub mod cgroup;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod dns;
+#[doc(hidden)]
 #[cfg_attr(target_os = "macos", path = "doctor_macos.rs")]
 pub mod doctor;
 #[doc(hidden)]
 pub mod exit;
+#[doc(hidden)]
+pub mod explain;
 #[doc(hidden)]
 pub mod json;
 #[doc(hidden)]
@@ -24,7 +28,15 @@ pub mod macnet;
 #[doc(hidden)]
 pub mod net;
 #[doc(hidden)]
+pub mod netlog;
+#[doc(hidden)]
+pub mod netmodel;
+#[doc(hidden)]
+pub mod nflog;
+#[doc(hidden)]
 pub mod output;
+#[doc(hidden)]
+pub mod probe;
 #[doc(hidden)]
 pub mod result;
 #[doc(hidden)]

@@ -10,7 +10,7 @@ use burnervm::json::{self, Kind};
 use burnervm::net;
 #[cfg(target_os = "macos")]
 use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, result, run};
+use burnervm::{doctor, exit, explain, probe, result, run};
 
 /// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
@@ -30,14 +30,17 @@ struct Cli {
 enum Cmd {
     /// print the config burner would use, defaults filled in
     Config,
-    /// check that this machine can run burner, and say what to fix
-    Doctor,
+    /// check that this machine can run burner, and say what to fix. --probe
+    /// also boots a VM that tries what a VM must not reach here
+    Doctor(probe::ProbeArgs),
     /// run one command in a fresh VM and hand back its output and exit code
     #[command(after_long_help = exit::help())]
     Run(run::RunArgs),
     /// a root shell in a fresh VM, gone when you exit
     #[command(after_long_help = exit::help())]
     Shell(run::ShellArgs),
+    /// what a VM could reach on this host, and with --rules the rules behind it
+    Explain(explain::ExplainArgs),
     /// set up or remove the VM network (nft table, forwarding)
     Net {
         #[arg(value_parser = ["up", "down", "show"])]
@@ -45,6 +48,8 @@ enum Cmd {
     },
     /// list running VMs
     Ls,
+    /// every connection a run's VM tried, allowed or blocked: yours, the newest without an ID
+    Log { id: Option<String> },
     /// stop a running VM
     Kill { id: String },
     /// list installed images
@@ -59,6 +64,10 @@ enum Cmd {
     Reap,
     #[command(name = "__parse-result", hide = true)]
     ParseResult { emit: String },
+    /// the connection log's reader, started by burner run
+    #[cfg(target_os = "linux")]
+    #[command(name = "__read-netlog", hide = true)]
+    ReadNetlog,
     /// the VMM for one VM, started by burner run
     #[cfg(target_os = "macos")]
     #[command(name = "vmm-krun", hide = true)]
@@ -85,6 +94,10 @@ fn main() -> ExitCode {
     json::set_on(cli.json);
     if let Cmd::ParseResult { emit } = &cli.cmd {
         return result::child_main(emit == "1");
+    }
+    #[cfg(target_os = "linux")]
+    if let Cmd::ReadNetlog = &cli.cmd {
+        return burnervm::nflog::child_main();
     }
     #[cfg(target_os = "macos")]
     match cli.cmd {
@@ -119,20 +132,72 @@ fn doctor_done(r: doctor::Report) -> ExitCode {
     json::reply("doctor", exit::EXIT_FAILED, Some(r))
 }
 
+fn probe_done(cfg: &Config, config: &std::path::Path, a: &probe::ProbeArgs) -> ExitCode {
+    let (code, p, msg) = probe::main(cfg, config, a);
+    if let Some(p) = &p
+        && !json::on()
+    {
+        print!("{}", probe::render(p));
+    }
+    if let Some(m) = msg {
+        let kind = match code {
+            exit::EXIT_USAGE => Kind::Usage,
+            exit::EXIT_FAILED => Kind::DoctorFailed,
+            _ => Kind::Sandbox,
+        };
+        if code != exit::EXIT_FAILED && !json::on() {
+            eprintln!("burner: {m}");
+        }
+        json::note_error(kind, m, false);
+    }
+    json::reply("doctor", code, p)
+}
+
+fn explain_main(cfg: &Config, a: &explain::ExplainArgs, json_on: bool) -> anyhow::Result<ExitCode> {
+    {
+        let e = match explain::build(cfg, a) {
+            Ok(e) => e,
+            Err(e) if e.to_string().starts_with("--net ") => {
+                return Ok(json::fail(
+                    "explain",
+                    exit::EXIT_USAGE,
+                    Kind::Usage,
+                    e.to_string(),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
+        if !json_on {
+            print!("{}", explain::render(&e));
+        }
+        if e.healthy() {
+            return Ok(json::reply("explain", 0, Some(e)));
+        }
+        json::note_error(
+            Kind::Net,
+            "the filter isn't loaded, or isn't what this config and host give now",
+            false,
+        );
+        Ok(json::reply("explain", exit::EXIT_FAILED, Some(e)))
+    }
+}
+
 impl Cmd {
     /// the command's name in the envelope
     fn name(&self) -> &'static str {
         match self {
             Cmd::Config => "config",
-            Cmd::Doctor => "doctor",
+            Cmd::Doctor(_) => "doctor",
             Cmd::Run(_) => "run",
             Cmd::Shell(_) => "shell",
+            Cmd::Explain(_) => "explain",
             Cmd::Net { action } => match action.as_str() {
                 "up" => "net up",
                 "down" => "net down",
                 _ => "net show",
             },
             Cmd::Ls => "ls",
+            Cmd::Log { .. } => "log",
             Cmd::Kill { .. } => "kill",
             Cmd::Images => "images",
             Cmd::Version => "version",
@@ -140,6 +205,8 @@ impl Cmd {
             Cmd::Setup(_) => "setup",
             Cmd::Reap => "reap",
             Cmd::ParseResult { .. } => "__parse-result",
+            #[cfg(target_os = "linux")]
+            Cmd::ReadNetlog => "__read-netlog",
             #[cfg(target_os = "macos")]
             Cmd::VmmKrun(_) => "vmm-krun",
             #[cfg(target_os = "macos")]
@@ -201,8 +268,8 @@ fn command_word(args: &[String]) -> Option<&'static str> {
         _ => cmd,
     };
     [
-        "config", "doctor", "run", "shell", "net up", "net down", "net show", "ls", "kill",
-        "images", "setup", "version",
+        "config", "doctor", "run", "shell", "explain", "net up", "net down", "net show", "ls",
+        "log", "kill", "images", "setup", "version",
     ]
     .into_iter()
     .find(|c| *c == full)
@@ -259,10 +326,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             Ok(json::reply("config", 0, Some(&cfg)))
         }
+        Cmd::Doctor(a) if a.probe => Ok(probe_done(&cfg, &cli.config, &a)),
         #[cfg(target_os = "linux")]
-        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg))),
+        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg))),
         #[cfg(target_os = "macos")]
-        Cmd::Doctor => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
+        Cmd::Doctor(_) => Ok(doctor_done(doctor::run(&cfg, &cli.config))),
         Cmd::Run(_) => Ok(run::main(&cfg, &run_args.expect("set for run"))),
         Cmd::Shell(_) => Ok(run::shell_main(&cfg, &run_args.expect("set for shell"))),
         // not there on this OS rather than failed, like a wrong flag
@@ -308,7 +376,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(json::reply(name, 0, Some(net::UpResult { notes })))
             }
         },
+        Cmd::Explain(a) => explain_main(&cfg, &a, cli.json),
         Cmd::Ls => run::ls(&cfg),
+        Cmd::Log { id } => run::log(&cfg, id.as_deref()),
         Cmd::Kill { id } => run::kill(&cfg, &id),
         Cmd::Images if cli.json => Ok(json::reply("images", 0, Some(run::images_result(&cfg)))),
         Cmd::Images => {
@@ -322,6 +392,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         #[cfg(target_os = "macos")]
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
+        #[cfg(target_os = "linux")]
+        Cmd::ReadNetlog => unreachable!("handled before the config loads"),
         #[cfg(target_os = "macos")]
         Cmd::VmmKrun(_) | Cmd::Macnet(_) => unreachable!("handled before the config loads"),
     }

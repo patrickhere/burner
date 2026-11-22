@@ -22,6 +22,8 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 use super::policy::{Mode, Policy};
 use super::{Link, SOCK_RCVBUF, SOCK_SNDBUF, setopt};
+use crate::netlog::{DnsInfo, Line, Outcome};
+use crate::netmodel::{Proto, Reason};
 
 /// ethernet header plus a 1500 mtu. libkrun gets no offload features, so the
 /// guest never sends more than this
@@ -98,6 +100,9 @@ struct Conn {
     host_eof: bool,
     shut: bool,
     readable: bool,
+    /// payload bytes guest to host and back, for the log
+    up: u64,
+    down: u64,
 }
 
 struct Pending {
@@ -196,10 +201,135 @@ impl Rate {
     }
 }
 
+/// the connection log's end of things: one JSON line per decision, written
+/// without ever blocking the loop. what doesn't fit is dropped and counted,
+/// and the count goes out with the next line that fits
+struct Events {
+    fd: Option<RawFd>,
+    out: Vec<u8>,
+    lost: u64,
+    /// blocked attempts decided, and those past the itemization bucket
+    blocked: u64,
+    not_itemized: u64,
+    bucket: Bucket,
+}
+
+/// what's held back for a slow reader before lines are dropped
+const EVENTS_HELD: usize = 256 << 10;
+
+impl Events {
+    fn new(fd: Option<RawFd>) -> Events {
+        let fd = fd.filter(|&fd| {
+            // SAFETY: fcntl on an fd we were handed
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                fl >= 0 && libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) >= 0
+            }
+        });
+        Events {
+            fd,
+            out: Vec::new(),
+            lost: 0,
+            blocked: 0,
+            not_itemized: 0,
+            // the linux try chain's limit: 100 a second, burst 500
+            bucket: Bucket::new(100.0, 500.0),
+        }
+    }
+
+    fn send(&mut self, l: &Line) {
+        if self.fd.is_none() {
+            return;
+        }
+        let Ok(mut s) = serde_json::to_string(l) else {
+            return;
+        };
+        s.push('\n');
+        if self.lost > 0 {
+            let lost = format!("{{\"k\":\"lost\",\"n\":{}}}\n", self.lost);
+            if self.out.len() + lost.len() + s.len() <= EVENTS_HELD {
+                self.out.extend_from_slice(lost.as_bytes());
+                self.lost = 0;
+            }
+        }
+        if self.out.len() + s.len() > EVENTS_HELD || self.lost > 0 {
+            self.lost += 1;
+            return;
+        }
+        self.out.extend_from_slice(s.as_bytes());
+        self.flush();
+    }
+
+    /// a refusal: always counted, itemized while the bucket lasts
+    fn blocked(&mut self, l: Line) {
+        self.blocked += 1;
+        if self.bucket.take() {
+            self.send(&l);
+        } else {
+            self.not_itemized += 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        let Some(fd) = self.fd else { return };
+        while !self.out.is_empty() {
+            // SAFETY: write from a buffer we own
+            let n = unsafe { libc::write(fd, self.out.as_ptr().cast(), self.out.len()) };
+            if n > 0 {
+                self.out.drain(..n as usize);
+                continue;
+            }
+            match io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) => return,
+                // the reader is gone: nobody to tell
+                _ => {
+                    self.fd = None;
+                    self.out.clear();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// the last line, with the exact counts: a short wait for room, then gone
+    fn finish(&mut self) {
+        let counts = Line::Counts {
+            blocked: self.blocked,
+            not_itemized: self.not_itemized,
+        };
+        self.send(&counts);
+        let end = StdInstant::now() + StdDuration::from_millis(500);
+        while let Some(fd) = self.fd
+            && !self.out.is_empty()
+            && StdInstant::now() < end
+        {
+            let mut p = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: poll on one pollfd we own
+            unsafe { libc::poll(&mut p, 1, 50) };
+            self.flush();
+        }
+    }
+}
+
+fn outcome_of(e: &io::Error) -> Outcome {
+    match e.kind() {
+        ErrorKind::TimedOut => Outcome::Timeout,
+        ErrorKind::ConnectionRefused => Outcome::Refused,
+        _ => Outcome::NoAnswer,
+    }
+}
+
 enum Verdict {
     Pass,
     Arp,
     Drop,
+    /// dropped, and worth a line in the log: icmp or udp that isn't dns
+    Refuse(Proto, Ipv4Addr, u16, u16),
     Syn(Key),
 }
 
@@ -232,6 +362,7 @@ struct Gw<'a> {
     up: Rate,
     down: Rate,
     tx_blocked: bool,
+    events: Events,
 }
 
 pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
@@ -310,6 +441,7 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         up: Rate::new(args.rate),
         down: Rate::new(args.rate),
         tx_blocked: false,
+        events: Events::new(args.events),
     };
     let mut buf = vec![0u8; 65536];
     loop {
@@ -346,6 +478,7 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         }
         if fds[0].revents != 0 && !gw.read_vm(&mut buf)? {
             gw.log(format_args!("the VM's end of the socket closed, exiting"));
+            gw.events.finish();
             return Ok(());
         }
         gw.poll();
@@ -355,8 +488,10 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         gw.dns_in();
         gw.poll();
         gw.reap();
+        gw.events.flush();
         if !gw.flush()? {
             gw.log(format_args!("the VM's end of the socket closed, exiting"));
+            gw.events.finish();
             return Ok(());
         }
         // backstop for a launcher that dies without its VM end ever closing
@@ -503,6 +638,14 @@ impl Gw<'_> {
             Verdict::Pass => self.dev.rx.push_back(frame.to_vec()),
             Verdict::Arp if self.arp_rate.take() => self.dev.rx.push_back(frame.to_vec()),
             Verdict::Arp | Verdict::Drop => {}
+            Verdict::Refuse(proto, dst, sport, port) => self.events.blocked(Line::Conn {
+                proto,
+                sport,
+                dst,
+                port,
+                verdict: crate::netmodel::Verdict::Blocked,
+                reason: Some(Reason::Proto),
+            }),
             Verdict::Syn(key) => self.syn(key, frame),
         }
     }
@@ -547,8 +690,15 @@ impl Gw<'_> {
             }
             IpProtocol::Udp => match UdpPacket::new_checked(ip.payload()) {
                 Ok(u) if u.dst_port() == 53 => Verdict::Pass,
+                Ok(u) => Verdict::Refuse(Proto::Udp, ip.dst_addr(), u.src_port(), u.dst_port()),
                 _ => Verdict::Drop,
             },
+            // ping included: macnet carries tcp and dns only. the guest's own
+            // errors (a port unreachable for a late dns answer) are only
+            // dropped, as on linux, where they're no new connection either
+            IpProtocol::Icmp if ip.payload().first() == Some(&8) => {
+                Verdict::Refuse(Proto::Icmp, ip.dst_addr(), 0, 0)
+            }
             _ => Verdict::Drop,
         }
     }
@@ -558,11 +708,21 @@ impl Gw<'_> {
         if self.pending.contains_key(&key) {
             return;
         }
-        let (_, dst, port) = key;
+        let (sport, dst, port) = key;
+        let conn = |verdict, reason| Line::Conn {
+            proto: Proto::Tcp,
+            sport,
+            dst,
+            port,
+            verdict,
+            reason,
+        };
         let index = match self.pol.tcp(dst, port) {
             Ok(i) => i,
             Err(why) => {
-                self.log(format_args!("tcp {dst}:{port} refused: {why}"));
+                self.log(format_args!("tcp {dst}:{port} refused: {}", why.as_str()));
+                self.events
+                    .blocked(conn(crate::netmodel::Verdict::Blocked, Some(why.reason())));
                 return;
             }
         };
@@ -570,12 +730,18 @@ impl Gw<'_> {
             self.log(format_args!(
                 "tcp {dst}:{port} refused: too many connections"
             ));
+            self.events
+                .blocked(conn(crate::netmodel::Verdict::Blocked, Some(Reason::Flows)));
             return;
         }
         if !self.new_conns.take() {
             self.log(format_args!("tcp {dst}:{port} refused: rate limit"));
+            self.events
+                .blocked(conn(crate::netmodel::Verdict::Blocked, Some(Reason::Rate)));
             return;
         }
+        self.events
+            .send(&conn(crate::netmodel::Verdict::Allowed, None));
         match connect(dst, port, index) {
             Ok(sock) => {
                 self.log(format_args!("tcp {dst}:{port} connecting"));
@@ -591,6 +757,12 @@ impl Gw<'_> {
             }
             Err(e) => {
                 self.log(format_args!("tcp {dst}:{port} failed: {e}"));
+                self.events.send(&Line::Outcome {
+                    sport,
+                    dst,
+                    port,
+                    outcome: outcome_of(&e),
+                });
                 self.reset(frame.to_vec());
             }
         }
@@ -620,6 +792,16 @@ impl Gw<'_> {
                 Some(r) => r,
             };
             let p = self.pending.remove(&key).unwrap();
+            let outcome = match &res {
+                Ok(()) => Outcome::Answered,
+                Err(e) => outcome_of(e),
+            };
+            self.events.send(&Line::Outcome {
+                sport: key.0,
+                dst,
+                port,
+                outcome,
+            });
             match res {
                 Ok(()) => self.accept(key, p),
                 Err(e) => {
@@ -672,6 +854,8 @@ impl Gw<'_> {
                 host_eof: false,
                 shut: false,
                 readable: false,
+                up: 0,
+                down: 0,
             },
         );
     }
@@ -697,6 +881,7 @@ impl Gw<'_> {
             conns,
             sockets,
             args,
+            events,
             ..
         } = self;
         conns.retain(|k, c| {
@@ -705,6 +890,13 @@ impl Gw<'_> {
                 if args.verbose {
                     eprintln!("burner net: tcp {}:{} closed", k.1, k.2);
                 }
+                events.send(&Line::Bytes {
+                    sport: k.0,
+                    dst: k.1,
+                    port: k.2,
+                    up: c.up,
+                    down: c.down,
+                });
                 sockets.remove(c.handle);
                 false
             } else {
@@ -725,17 +917,30 @@ impl Gw<'_> {
                 continue;
             };
             let gport = meta.endpoint.port;
+            let ev = |verdict, reason| Line::Dns {
+                dst,
+                sport: gport,
+                verdict,
+                reason,
+                dns: DnsInfo::query(&data, 0),
+            };
             let index = match self.pol.dns(dst) {
                 Ok(i) => i,
                 Err(why) => {
-                    self.log(format_args!("dns {dst} refused: {why}"));
+                    self.log(format_args!("dns {dst} refused: {}", why.as_str()));
+                    self.events
+                        .blocked(ev(crate::netmodel::Verdict::Blocked, Some(why.reason())));
                     continue;
                 }
             };
             if !self.dns_rate.take() {
                 self.log(format_args!("dns {dst} refused: rate limit"));
+                self.events
+                    .blocked(ev(crate::netmodel::Verdict::Blocked, Some(Reason::Rate)));
                 continue;
             }
+            self.events
+                .send(&ev(crate::netmodel::Verdict::Allowed, None));
             let now = StdInstant::now();
             let mut found = self
                 .dns
@@ -789,6 +994,11 @@ impl Gw<'_> {
         for d in &mut self.dns {
             while let Ok(n) = d.host.recv(&mut buf) {
                 d.last = now;
+                self.events.send(&Line::Answer {
+                    dst: d.resolver,
+                    sport: d.guest_port,
+                    dns: DnsInfo::response(&buf[..n]),
+                });
                 let mut meta = udp::UdpMetadata::from(IpEndpoint::new(
                     IpAddress::Ipv4(self.args.guest),
                     d.guest_port,
@@ -819,6 +1029,7 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket, up: &mut Rate, down: &mut Rate) {
                 })
                 .unwrap_or(0);
             up.spend(n);
+            c.up += n as u64;
         }
         if c.to_host.is_empty() {
             break;
@@ -863,7 +1074,10 @@ fn pump(c: &mut Conn, s: &mut tcp::Socket, up: &mut Rate, down: &mut Rate) {
                 c.host_eof = true;
                 s.close();
             }
-            Ok(Ok(n)) => down.spend(n),
+            Ok(Ok(n)) => {
+                down.spend(n);
+                c.down += n as u64;
+            }
             Ok(Err(e)) if e.kind() == ErrorKind::WouldBlock => break,
             Ok(Err(e)) if e.kind() == ErrorKind::Interrupted => {}
             _ => {

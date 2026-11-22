@@ -77,52 +77,174 @@ pub fn slot(cfg: &Config, i: u32) -> Result<Slot> {
     })
 }
 
-/// always blocked, on any network
-const SPECIAL: &[&str] = &[
-    "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
-    "127.0.0.0/8",
-    "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.0.0.0/24",
-    "192.0.2.0/24",
-    "192.168.0.0/16",
-    "198.18.0.0/15",
-    "198.51.100.0/24",
-    "203.0.113.0/24",
-    "224.0.0.0/4",
-    "240.0.0.0/4",
+/// a range that's never reachable, on any network, and what it is
+pub struct Special {
+    pub net: Ipv4Addr,
+    pub prefix: u8,
+    pub label: &'static str,
+}
+
+const fn sp(a: u8, b: u8, prefix: u8, label: &'static str) -> Special {
+    Special {
+        net: Ipv4Addr::new(a, b, 0, 0),
+        prefix,
+        label,
+    }
+}
+
+/// always blocked, on any network. the linux filter and macnet's policy both
+/// read this one list
+pub const SPECIAL: &[Special] = &[
+    sp(0, 0, 8, "this network (0/8)"),
+    sp(10, 0, 8, "private range"),
+    sp(100, 64, 10, "cgnat and tailscale"),
+    sp(127, 0, 8, "loopback"),
+    sp(169, 254, 16, "cloud metadata and link-local"),
+    sp(172, 16, 12, "private range"),
+    Special {
+        net: Ipv4Addr::new(192, 0, 0, 0),
+        prefix: 24,
+        label: "ietf protocol assignments",
+    },
+    Special {
+        net: Ipv4Addr::new(192, 0, 2, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    sp(192, 168, 16, "private range"),
+    sp(198, 18, 15, "benchmarking"),
+    Special {
+        net: Ipv4Addr::new(198, 51, 100, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    Special {
+        net: Ipv4Addr::new(203, 0, 113, 0),
+        prefix: 24,
+        label: "documentation",
+    },
+    sp(224, 0, 4, "multicast"),
+    sp(240, 0, 4, "reserved and broadcast"),
 ];
+
+/// the special range dst is in, if any
+pub fn special(dst: Ipv4Addr) -> Option<&'static Special> {
+    SPECIAL
+        .iter()
+        .find(|s| u32::from(dst) & config::mask(s.prefix) == u32::from(s.net))
+}
+
+/// why a range is in the blocked set, for explain and the connection log
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+pub enum Why {
+    /// one of the ranges that are never reachable on any network
+    Special { label: &'static str },
+    /// net.block
+    Config,
+    /// the VMs' own subnet
+    Subnet,
+    /// net.block_public_ip
+    PublicIp,
+    /// an address of this host, on dev
+    HostAddr { dev: String },
+    /// a network this host is attached to, on dev
+    HostNet { dev: String },
+    /// a route that isn't the default one
+    Route {
+        dev: String,
+        via: Option<Ipv4Addr>,
+        table: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Blocked {
+    pub net: Ipv4Addr,
+    pub prefix: u8,
+    #[serde(flatten)]
+    pub why: Why,
+}
+
+/// an address on one of the host's interfaces
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Addr {
+    pub ip: Ipv4Addr,
+    pub prefix: u8,
+    pub dev: String,
+}
+
+/// a route from `ip route show table all`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub dst: Ipv4Addr,
+    pub prefix: u8,
+    pub dev: String,
+    pub via: Option<Ipv4Addr>,
+    /// main, local, or a number
+    pub table: String,
+}
 
 /// everything a VM must never reach: the special ranges, every address and
 /// attached network on the host, every route that isn't the default one (a LAN
 /// on public addresses, a vpn, a docker network), the VM subnet and net.block.
 /// what's left is the internet through the default route
 pub fn blocked(cfg: &Config) -> Result<Vec<String>> {
-    let mut nets: Vec<(u32, u8)> = Vec::new();
-    let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
-    for s in SPECIAL
-        .iter()
-        .map(|s| s.to_string())
-        .chain(cfg.net.block.iter().cloned())
-    {
-        add(config::parse_cidr(&s).with_context(|| format!("net.block {s:?}"))?);
+    Ok(collapse(
+        blocked_sources(cfg)?
+            .iter()
+            .map(|b| (u32::from(b.net) & config::mask(b.prefix), b.prefix))
+            .collect(),
+    ))
+}
+
+/// blocked(), with where each range comes from
+pub fn blocked_sources(cfg: &Config) -> Result<Vec<Blocked>> {
+    let public = public_ip(cfg).map(|(ip, _)| ip);
+    sources_from(cfg, public, &local_addrs()?, &route_dsts(&cfg.uplink()?)?)
+}
+
+/// the pure half of blocked_sources, for tests on fixtures
+pub fn sources_from(
+    cfg: &Config,
+    public: Option<Ipv4Addr>,
+    addrs: &[Addr],
+    routes: &[Route],
+) -> Result<Vec<Blocked>> {
+    let mut out = Vec::new();
+    let mut add = |(net, prefix): (Ipv4Addr, u8), why: Why| {
+        let net = Ipv4Addr::from(u32::from(net) & config::mask(prefix));
+        out.push(Blocked { net, prefix, why });
+    };
+    for s in SPECIAL {
+        add((s.net, s.prefix), Why::Special { label: s.label });
     }
-    add(cfg.subnet()?);
-    if let Some((ip, _)) = public_ip(cfg) {
-        add((ip, 32));
+    for s in &cfg.net.block {
+        add(
+            config::parse_cidr(s).with_context(|| format!("net.block {s:?}"))?,
+            Why::Config,
+        );
     }
-    for (addr, prefix) in local_addrs()? {
-        add((addr, 32));
-        add((addr, prefix));
+    add(cfg.subnet()?, Why::Subnet);
+    if let Some(ip) = public {
+        add((ip, 32), Why::PublicIp);
     }
-    for dst in route_dsts(&cfg.uplink()?)? {
-        if dst.1 > 0 {
-            add(dst);
-        }
+    for a in addrs {
+        let dev = a.dev.clone();
+        add((a.ip, 32), Why::HostAddr { dev: dev.clone() });
+        add((a.ip, a.prefix), Why::HostNet { dev });
     }
-    Ok(collapse(nets))
+    for r in routes.iter().filter(|r| r.prefix > 0) {
+        add(
+            (r.dst, r.prefix),
+            Why::Route {
+                dev: r.dev.clone(),
+                via: r.via,
+                table: r.table.clone(),
+            },
+        );
+    }
+    Ok(out)
 }
 
 /// drop entries covered by a wider one, so nft gets no overlapping intervals
@@ -144,19 +266,29 @@ fn collapse(mut nets: Vec<(u32, u8)>) -> Vec<String> {
         .collect()
 }
 
-fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
+fn local_addrs() -> Result<Vec<Addr>> {
     let out = helper("ip", &["-j", "-4", "addr", "show"], None)?;
     if !out.status.success() {
         bail!("ip addr show failed");
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    parse_addrs(&out.stdout)
+}
+
+/// `ip -j -4 addr show`: every address with its prefix and interface
+pub fn parse_addrs(json: &[u8]) -> Result<Vec<Addr>> {
+    let v: serde_json::Value = serde_json::from_slice(json)?;
     let mut addrs = Vec::new();
     for link in v.as_array().into_iter().flatten() {
+        let dev = link["ifname"].as_str().unwrap_or("?").to_string();
         for a in link["addr_info"].as_array().into_iter().flatten() {
             let ip = a["local"].as_str().and_then(|s| s.parse().ok());
             let prefix = a["prefixlen"].as_u64().map(|p| p.min(32) as u8);
-            if let (Some(ip), Some(p)) = (ip, prefix) {
-                addrs.push((ip, p));
+            if let (Some(ip), Some(prefix)) = (ip, prefix) {
+                addrs.push(Addr {
+                    ip,
+                    prefix,
+                    dev: dev.clone(),
+                });
             }
         }
     }
@@ -168,13 +300,18 @@ fn local_addrs() -> Result<Vec<(Ipv4Addr, u8)>> {
 /// the default route does. dhcp clients add such routes for the dns servers
 /// they hand out (systemd-networkd does by default), and blocking them would
 /// block public resolvers like 1.1.1.1
-fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
+fn route_dsts(uplink: &str) -> Result<Vec<Route>> {
     let out = helper("ip", &["-j", "-4", "route", "show", "table", "all"], None)?;
     if !out.status.success() {
         bail!("ip route show failed");
     }
-    // a route list we can't read must not shrink the blocked set
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).context("reading ip route")?;
+    parse_routes(&out.stdout, uplink)
+}
+
+/// the pure half of route_dsts. a route list we can't read must not shrink
+/// the blocked set, so that's an error
+pub fn parse_routes(json: &[u8], uplink: &str) -> Result<Vec<Route>> {
+    let v: serde_json::Value = serde_json::from_slice(json).context("reading ip route")?;
     let routes = v.as_array().cloned().unwrap_or_default();
     let gateways: Vec<&str> = routes
         .iter()
@@ -189,11 +326,21 @@ fn route_dsts(uplink: &str) -> Result<Vec<(Ipv4Addr, u8)>> {
         .filter_map(|r| {
             let dst = r["dst"].as_str()?;
             let (ip, p) = match dst.split_once('/') {
-                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok()?),
+                Some((ip, p)) => (ip.parse().ok()?, p.parse().ok().filter(|&p: &u8| p <= 32)?),
                 None if dst == "default" => return None,
                 None => (dst.parse().ok()?, 32),
             };
-            Some((ip, p))
+            Some(Route {
+                dst: ip,
+                prefix: p,
+                dev: r["dev"].as_str().unwrap_or("?").to_string(),
+                via: r["gateway"].as_str().and_then(|g| g.parse().ok()),
+                table: match &r["table"] {
+                    serde_json::Value::String(t) => t.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => "main".into(),
+                },
+            })
         })
         .collect())
 }
@@ -216,8 +363,12 @@ pub struct DownResult {
 
 /// the full nft ruleset for this config
 pub fn ruleset(cfg: &Config) -> Result<String> {
-    let uplink = cfg.uplink()?;
-    let blocked = blocked(cfg)?.join(", ");
+    Ok(ruleset_for(cfg, &cfg.uplink()?, &blocked(cfg)?))
+}
+
+/// the pure half of ruleset
+fn ruleset_for(cfg: &Config, uplink: &str, blocked: &[String]) -> String {
+    let blocked = blocked.join(", ");
     let resolvers = cfg
         .net
         .resolvers
@@ -227,7 +378,7 @@ pub fn ruleset(cfg: &Config) -> Result<String> {
         .join(", ");
     let subnet = &cfg.net.subnet;
     let t = TAP_PREFIX;
-    Ok(format!(
+    format!(
         r#"table inet {TABLE}
 delete table inet {TABLE}
 table inet {TABLE} {{
@@ -236,6 +387,12 @@ table inet {TABLE} {{
     set mode_web {{ type ifname; }}
     set mode_open {{ type ifname; }}
     set tap_ip {{ type ifname . ipv4_addr; }}
+
+    # the connection log: per tap, a jump into chains that only log and
+    # return. a tap with no element here just isn't logged
+    map log_try {{ type ifname : verdict; }}
+    map log_up {{ type ifname : verdict; }}
+    map log_down {{ type ifname : verdict; }}
 
     # before defrag and conntrack (-400): spoofed, fragmented or flooding guest
     # packets never reach shared state on the host
@@ -249,11 +406,13 @@ table inet {TABLE} {{
 
     chain input {{
         type filter hook input priority filter - 10; policy accept;
+        iifname "{t}*" ct state new iifname vmap @log_try
         iifname "{t}*" drop
     }}
 
     chain forward {{
         type filter hook forward priority filter - 10; policy accept;
+        iifname "{t}*" ct state new iifname vmap @log_try
         iifname "{t}*" meta nfproto ipv6 drop
         oifname "{t}*" meta nfproto ipv6 drop
         iifname "{t}*" iifname . ip saddr != @tap_ip drop
@@ -272,6 +431,19 @@ table inet {TABLE} {{
         oifname "{t}*" ct state established,related accept
         oifname "{t}*" drop
     }}
+
+    # after forward: an accept there doesn't stop this chain, a drop does, so
+    # it only ever sees what burner let through. it logs and never decides:
+    # its returns end it like its accept policy would
+    chain log_after {{
+        type filter hook forward priority filter - 9; policy accept;
+        iifname "{t}*" udp dport 53 iifname vmap @log_up
+        iifname "{t}*" udp dport 53 return
+        iifname "{t}*" ct state new iifname vmap @log_up
+        oifname "{t}*" udp sport 53 oifname vmap @log_down
+        oifname "{t}*" udp sport 53 return
+        oifname "{t}*" ct direction reply ct status & assured == 0 oifname vmap @log_down
+    }}
 }}
 
 table ip {NAT_TABLE}
@@ -283,7 +455,7 @@ table ip {NAT_TABLE} {{
     }}
 }}
 "#
-    ))
+    )
 }
 
 fn nft(script: &str, check: bool) -> Result<()> {
@@ -335,6 +507,13 @@ fn egress_route(uplink: &str) -> Result<Vec<String>> {
     }
     route.extend(["dev".into(), uplink.into()]);
     Ok(route)
+}
+
+/// the uplink's default gateway, if it has one
+pub fn default_gateway(uplink: &str) -> Option<Ipv4Addr> {
+    let r = egress_route(uplink).ok()?;
+    let i = r.iter().position(|w| w == "via")?;
+    r.get(i + 1)?.parse().ok()
 }
 
 /// point the VM table at the uplink's current default route. safe to repeat
@@ -424,6 +603,12 @@ pub fn table_exists() -> bool {
     run("nft", &["list", "table", "inet", TABLE]).is_ok()
 }
 
+/// the table has the connection log's maps: one loaded by an older burner
+/// doesn't, and a tap can't come up in it
+fn log_maps_ok() -> bool {
+    run("nft", &["list", "map", "inet", TABLE, "log_try"]).is_ok()
+}
+
 /// load the ruleset and turn on forwarding. safe to run again: the reload is
 /// one nft transaction, and running VMs get their tap entries back right after
 pub fn up(cfg: &Config) -> Result<Vec<String>> {
@@ -450,6 +635,125 @@ pub fn up(cfg: &Config) -> Result<Vec<String>> {
     Ok(notes)
 }
 
+/// the nflog group a slot's log goes to: one each, since a group has one reader
+pub fn log_group(i: u32) -> u32 {
+    LOG_GROUP_BASE + i
+}
+
+pub const LOG_GROUP_BASE: u32 = 29217;
+/// new attempts a VM gets itemized before the rest are only counted
+const LOG_TRY_LIMIT: &str = "100/second burst 500 packets";
+const LOG_DOWN_LIMIT: &str = "200/second burst 400 packets";
+
+/// a tap's log chains and the elements that let its traffic through, as one
+/// nft transaction: the log is never missing while the tap passes traffic.
+/// safe to repeat, the chains are flushed before their rules go in. the
+/// chains only log, count and return
+fn slot_script(s: &Slot, i: u32, mode: Mode) -> String {
+    let tap = &s.tap;
+    let g = log_group(i);
+    let mut o = String::new();
+    for c in COUNTERS {
+        o += &format!("add counter inet {TABLE} {c}_{tap}\n");
+    }
+    for (c, rules) in [
+        (
+            "lt",
+            vec![
+                format!("counter name n_{tap}"),
+                format!("limit rate over {LOG_TRY_LIMIT} counter name over_{tap} return"),
+                format!("udp dport 53 log prefix \"t\" group {g} snaplen 320 return"),
+                format!("log prefix \"t\" group {g} snaplen 80"),
+            ],
+        ),
+        (
+            "lu",
+            vec![
+                // every packet here gets one message: the count of them says
+                // whether any went missing, the last one included
+                format!("counter name up_{tap}"),
+                format!("udp dport 53 log prefix \"q\" group {g} snaplen 320 return"),
+                format!("log prefix \"o\" group {g} snaplen 80"),
+            ],
+        ),
+        (
+            "ld",
+            vec![
+                format!("limit rate over {LOG_DOWN_LIMIT} return"),
+                format!("counter name down_{tap}"),
+                format!("udp sport 53 log prefix \"r\" group {g} snaplen 600 return"),
+                format!("log prefix \"a\" group {g} snaplen 80"),
+            ],
+        ),
+    ] {
+        o += &format!("add chain inet {TABLE} {c}_{tap}\nflush chain inet {TABLE} {c}_{tap}\n");
+        for r in rules {
+            o += &format!("add rule inet {TABLE} {c}_{tap} {r}\n");
+        }
+    }
+    for (map, c) in [("log_try", "lt"), ("log_up", "lu"), ("log_down", "ld")] {
+        o += &format!("add element inet {TABLE} {map} {{ \"{tap}\" : jump {c}_{tap} }}\n");
+    }
+    o += &format!(
+        "add element inet {TABLE} tap_ip {{ {tap} . {} }}\nadd element inet {TABLE} mode_{} {{ {tap} }}\n",
+        s.guest,
+        mode.name()
+    );
+    o
+}
+
+/// what removes a slot's log pieces: the elements pointing at the chains
+/// first, then the chains, then the counters their rules name
+fn slot_teardown(tap: &str) -> Vec<String> {
+    let mut o = Vec::new();
+    for map in ["log_try", "log_up", "log_down"] {
+        o.push(format!("delete element inet {TABLE} {map} {{ \"{tap}\" }}"));
+    }
+    for c in ["lt", "lu", "ld"] {
+        o.push(format!("delete chain inet {TABLE} {c}_{tap}"));
+    }
+    for c in COUNTERS {
+        o.push(format!("delete counter inet {TABLE} {c}_{tap}"));
+    }
+    o
+}
+
+/// a slot's log counters: every new attempt, those past the itemization
+/// limit, what was let out and the replies logged. None if any can't be read
+pub fn log_counts(tap: &str) -> Option<crate::netlog::NetCounts> {
+    let get = |c: &str| -> Option<u64> {
+        let name = format!("{c}_{tap}");
+        let out = helper(
+            "nft",
+            &["-j", "list", "counter", "inet", TABLE, &name],
+            None,
+        )
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_counter(&out.stdout)
+    };
+    Some(crate::netlog::NetCounts {
+        tries: get("n")?,
+        over: get("over")?,
+        up: get("up")?,
+        down: get("down")?,
+    })
+}
+
+/// the log's named counters per slot, as prefixes of their names
+const COUNTERS: [&str; 4] = ["n", "over", "up", "down"];
+
+fn parse_counter(json: &[u8]) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    v["nftables"]
+        .as_array()?
+        .iter()
+        .find_map(|o| o.get("counter"))?["packets"]
+        .as_u64()
+}
+
 /// put running VMs' taps back in the sets, after a reload or a fail-closed flush
 fn readd_running(cfg: &Config) -> Result<()> {
     let mut readd = String::new();
@@ -459,13 +763,7 @@ fn readd_running(cfg: &Config) -> Result<()> {
         };
         let s = slot(cfg, i)?;
         if mode != Mode::None && std::path::Path::new("/sys/class/net").join(&s.tap).exists() {
-            readd += &format!(
-                "add element inet {TABLE} tap_ip {{ {} . {} }}\nadd element inet {TABLE} mode_{} {{ {} }}\n",
-                s.tap,
-                s.guest,
-                mode.name(),
-                s.tap
-            );
+            readd += &slot_script(&s, i, mode);
         }
     }
     if !readd.is_empty() {
@@ -529,7 +827,7 @@ pub fn public_ip(cfg: &Config) -> Option<(Ipv4Addr, Duration)> {
 }
 
 /// a public address worth blocking. anything else an outside service says is ignored
-fn plausible_public(ip: Ipv4Addr) -> bool {
+pub fn plausible_public(ip: Ipv4Addr) -> bool {
     !(ip.is_private()
         || ip.is_loopback()
         || ip.is_link_local()
@@ -680,7 +978,16 @@ pub fn refresh_public_ip(cfg: &Config) {
 /// and if something wiped the table while taps are up, put it back or kill them
 pub fn check(cfg: &Config) {
     let has_taps = !taps_present(cfg).is_empty();
-    if !table_exists() {
+    let exists = table_exists();
+    if !exists || !log_maps_ok() {
+        // a table an older burner loaded: the same filter, without the log.
+        // reload it, the same as net up after an upgrade
+        if exists && !has_taps {
+            if up(cfg).is_err() {
+                sys::syslog("burner net: reloading the filter for the network log failed");
+            }
+            return;
+        }
         if !has_taps {
             return;
         }
@@ -738,6 +1045,9 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
     if !table_exists() || !routing_ok(cfg) {
         bail!("the VM network isn't set up, run burner net up first (or use --net none)");
     }
+    if !log_maps_ok() {
+        bail!("the VM network was set up by an older burner, run burner net up again");
+    }
     let s = slot(cfg, i)?;
     if !sys::which("conntrack") {
         bail!(
@@ -778,28 +1088,8 @@ pub fn tap_up(cfg: &Config, i: u32, mode: Mode, uid: u32) -> Result<Slot> {
         "ip",
         &["addr", "add", &format!("{}/30", s.host), "dev", &s.tap],
     )?;
-    run(
-        "nft",
-        &[
-            "add",
-            "element",
-            "inet",
-            TABLE,
-            "tap_ip",
-            &format!("{{ {} . {} }}", s.tap, s.guest),
-        ],
-    )?;
-    run(
-        "nft",
-        &[
-            "add",
-            "element",
-            "inet",
-            TABLE,
-            &format!("mode_{}", mode.name()),
-            &format!("{{ {} }}", s.tap),
-        ],
-    )?;
+    // the log chains and the pass-through elements in one go
+    nft(&slot_script(&s, i, mode), false)?;
     run("ip", &["link", "set", &s.tap, "up"])?;
     Ok(s)
 }
@@ -811,6 +1101,27 @@ pub fn tap_down(cfg: &Config, i: u32) -> bool {
     let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
         return false;
     };
+    tap_down_locked(cfg, i)
+}
+
+/// tap_down for a VM's own teardown: its log counters are read first, before
+/// they go with the tap, and kept in state/netcount/<id> for the run to read
+pub fn tap_down_for(cfg: &Config, i: u32, id: &str) -> bool {
+    let Ok(_lock) = net_lock_for(cfg, std::time::Duration::from_secs(60)) else {
+        return false;
+    };
+    if let Ok(s) = slot(cfg, i)
+        && let Some(c) = log_counts(&s.tap)
+    {
+        let dir = cfg.paths.state.join("netcount");
+        if sys::private_dir(&dir).is_ok() {
+            let _ = std::fs::write(
+                dir.join(id),
+                serde_json::json!({"tries": c.tries, "over": c.over, "up": c.up, "down": c.down})
+                    .to_string(),
+            );
+        }
+    }
     tap_down_locked(cfg, i)
 }
 
@@ -846,6 +1157,11 @@ fn net_lock_for(cfg: &Config, wait: std::time::Duration) -> Result<sys::Lock> {
 }
 
 fn drop_elements(s: &Slot) {
+    // one at a time: a piece that's already gone mustn't keep the others
+    for cmd in slot_teardown(&s.tap) {
+        let args: Vec<&str> = cmd.split(' ').collect();
+        let _ = run("nft", &args);
+    }
     let _ = run(
         "nft",
         &[
@@ -934,7 +1250,7 @@ pub fn taps_present(cfg: &Config) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -947,6 +1263,126 @@ mod tests {
             );
         }
         assert!(!s.contains("blocked4"), "the blocked set stays as it was");
+    }
+
+    #[test]
+    fn log_chains_never_decide() {
+        let cfg = Config::default();
+        let s = slot(&cfg, 3).unwrap();
+        let script = slot_script(&s, 3, Mode::Web);
+        for line in script.lines().filter(|l| l.starts_with("add rule")) {
+            for verdict in [
+                " accept",
+                " drop",
+                " reject",
+                " queue",
+                " jump",
+                " goto",
+                " continue",
+            ] {
+                assert!(!line.contains(verdict), "{verdict} in {line}");
+            }
+        }
+        // chains exist before the elements that point at them, and the
+        // elements that let traffic through come last, with them
+        let chain = script.find("add chain inet burner lt_bn3").unwrap();
+        let elem = script.find("add element inet burner log_try").unwrap();
+        let pass = script.find("add element inet burner tap_ip").unwrap();
+        assert!(chain < elem && elem < pass);
+        assert!(script.contains("group 29220 "));
+        assert!(script.contains("add element inet burner mode_web { bn3 }"));
+        assert!(
+            script.contains("flush chain inet burner lt_bn3"),
+            "safe to repeat"
+        );
+        // removal: elements, then chains, then counters
+        let down = slot_teardown("bn3").join("\n");
+        let e = down.find("delete element inet burner log_try").unwrap();
+        let c = down.find("delete chain inet burner lt_bn3").unwrap();
+        let n = down.find("delete counter inet burner n_bn3").unwrap();
+        for c in ["n_bn3", "over_bn3", "up_bn3", "down_bn3"] {
+            assert!(
+                script.contains(&format!("add counter inet burner {c}\n")),
+                "{c}"
+            );
+            assert!(
+                down.contains(&format!("delete counter inet burner {c}")),
+                "{c}"
+            );
+        }
+        // up counts every packet the up chain sees, before its log rules
+        let up = script
+            .find("add rule inet burner lu_bn3 counter name up_bn3")
+            .unwrap();
+        assert!(up < script.find("prefix \"o\"").unwrap());
+        assert!(e < c && c < n);
+        assert_eq!(log_group(1023), 30240);
+    }
+
+    /// the rules of one chain in a ruleset, trimmed
+    fn chain<'a>(rules: &'a str, name: &str) -> Vec<&'a str> {
+        let start = rules.find(&format!("chain {name} {{")).unwrap();
+        rules[start..]
+            .lines()
+            .skip(2)
+            .take_while(|l| l.trim() != "}")
+            .map(str::trim)
+            .collect()
+    }
+
+    #[test]
+    fn the_filter_itself_is_unchanged() {
+        let cfg = Config::default();
+        let r = ruleset_for(&cfg, "eth0", &["10.0.0.0/8".into()]);
+        // forward: the one new line at the top, then every rule as before
+        let fwd = chain(&r, "forward");
+        assert_eq!(fwd[0], "iifname \"bn*\" ct state new iifname vmap @log_try");
+        let before = [
+            "iifname \"bn*\" meta nfproto ipv6 drop",
+            "oifname \"bn*\" meta nfproto ipv6 drop",
+            "iifname \"bn*\" iifname . ip saddr != @tap_ip drop",
+            "iifname \"bn*\" oifname != \"eth0\" drop",
+            "iifname \"bn*\" ip daddr @blocked4 drop",
+            "iifname \"bn*\" ct state established,related accept",
+            "iifname @mode_web meta l4proto { tcp, udp } th dport 53 ip daddr @resolvers meter burner_dns_web { iifname limit rate 20/second burst 50 packets } accept",
+            "iifname @mode_open meta l4proto { tcp, udp } th dport 53 ip daddr @resolvers meter burner_dns_open { iifname limit rate 20/second burst 50 packets } accept",
+            "iifname \"bn*\" meta l4proto { tcp, udp } th dport 53 drop",
+            "iifname @mode_web icmp type echo-request meter burner_ping_web { iifname limit rate 5/second burst 10 packets } accept",
+            "iifname @mode_open icmp type echo-request meter burner_ping_open { iifname limit rate 5/second burst 10 packets } accept",
+            "iifname @mode_web tcp dport { 80, 443 } ct state new meter burner_web { iifname limit rate 20/second burst 40 packets } accept",
+            "iifname @mode_open tcp dport { 25, 465, 587 } drop",
+            "iifname @mode_open ct state new meter burner_open { iifname limit rate 50/second burst 100 packets } accept",
+            "iifname \"bn*\" drop",
+            "oifname \"bn*\" ct state established,related accept",
+            "oifname \"bn*\" drop",
+        ];
+        assert_eq!(&fwd[1..], &before[..]);
+        let input = chain(&r, "input");
+        assert_eq!(
+            input,
+            [
+                "iifname \"bn*\" ct state new iifname vmap @log_try",
+                "iifname \"bn*\" drop"
+            ]
+        );
+        // the log chain after it decides nothing: vmap jumps into chains that
+        // only return, and returns, which end it as its accept policy would
+        let after = chain(&r, "log_after");
+        assert!(r.contains("type filter hook forward priority filter - 9; policy accept;"));
+        for l in &after {
+            assert!(l.contains(" vmap @log_") || l.ends_with(" return"), "{l}");
+            for v in [" accept", " drop", " reject", " queue", " goto"] {
+                assert!(!l.contains(v), "{l}");
+            }
+        }
+        assert_eq!(after.len(), 6);
+    }
+
+    #[test]
+    fn counters() {
+        let j = br#"{"nftables":[{"metainfo":{}},{"counter":{"family":"inet","name":"lt_bn3_n","table":"burner","handle":7,"packets":42,"bytes":2520}}]}"#;
+        assert_eq!(parse_counter(j), Some(42));
+        assert_eq!(parse_counter(b"{}"), None);
     }
 
     #[test]
@@ -968,6 +1404,205 @@ mod tests {
         ] {
             assert!(!plausible_public(bad.parse().unwrap()), "{bad}");
         }
+    }
+
+    /// a homelab box: lan on eth0, a wireguard tunnel, docker, tailscale's
+    /// own table (52) and the VM table burner made
+    pub(crate) const HOMELAB_ADDRS: &str = r#"[
+ {"ifindex":1,"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8}]},
+ {"ifindex":2,"ifname":"eth0","addr_info":[{"family":"inet","local":"192.168.1.20","prefixlen":24}]},
+ {"ifindex":3,"ifname":"wg0","addr_info":[{"family":"inet","local":"10.1.0.5","prefixlen":16}]},
+ {"ifindex":4,"ifname":"docker0","addr_info":[{"family":"inet","local":"172.17.0.1","prefixlen":16}]},
+ {"ifindex":5,"ifname":"tailscale0","addr_info":[{"family":"inet","local":"100.101.102.103","prefixlen":32}]},
+ {"ifindex":9,"ifname":"bn0","addr_info":[{"family":"inet","local":"172.29.217.1","prefixlen":30}]}]"#;
+    pub(crate) const HOMELAB_ROUTES: &str = r#"[
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","table":"29217","flags":[]},
+ {"dst":"default","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+ {"dst":"9.9.9.9","gateway":"192.168.1.1","dev":"eth0","protocol":"dhcp","flags":[]},
+ {"dst":"10.1.0.0/16","dev":"wg0","protocol":"kernel","scope":"link","prefsrc":"10.1.0.5","flags":[]},
+ {"dst":"172.16.98.0/30","gateway":"10.1.0.1","dev":"wg0","flags":[]},
+ {"dst":"172.17.0.0/16","dev":"docker0","protocol":"kernel","scope":"link","prefsrc":"172.17.0.1","flags":["linkdown"]},
+ {"dst":"172.29.217.0/30","dev":"bn0","protocol":"kernel","scope":"link","prefsrc":"172.29.217.1","flags":[]},
+ {"dst":"192.168.1.0/24","dev":"eth0","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]},
+ {"dst":"100.100.100.100","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"100.64.0.0/10","dev":"tailscale0","table":"52","flags":[]},
+ {"dst":"203.0.114.0/24","dev":"tailscale0","table":"52","flags":[]},
+ {"type":"local","dst":"192.168.1.20","dev":"eth0","table":"local","protocol":"kernel","scope":"host","prefsrc":"192.168.1.20","flags":[]},
+ {"type":"broadcast","dst":"192.168.1.255","dev":"eth0","table":"local","protocol":"kernel","scope":"link","prefsrc":"192.168.1.20","flags":[]},
+ {"type":"local","dst":"127.0.0.0/8","dev":"lo","table":"local","protocol":"kernel","scope":"host","prefsrc":"127.0.0.1","flags":[]}]"#;
+    /// a vps: one public address, nothing else
+    pub(crate) const VPS_ADDRS: &str = r#"[
+ {"ifindex":1,"ifname":"lo","addr_info":[{"local":"127.0.0.1","prefixlen":8}]},
+ {"ifindex":2,"ifname":"ens6","addr_info":[{"local":"74.208.113.109","prefixlen":32}]}]"#;
+    pub(crate) const VPS_ROUTES: &str = r#"[
+ {"dst":"default","gateway":"74.208.113.1","dev":"ens6","protocol":"dhcp","flags":[]},
+ {"dst":"74.208.113.1","dev":"ens6","protocol":"dhcp","scope":"link","flags":[]},
+ {"type":"local","dst":"74.208.113.109","dev":"ens6","table":"local","protocol":"kernel","scope":"host","flags":[]}]"#;
+
+    /// blocked() before it knew why: the same adds, straight into collapse
+    fn old_blocked(
+        cfg: &Config,
+        public: Option<Ipv4Addr>,
+        addrs: &str,
+        routes: &str,
+        up: &str,
+    ) -> Vec<String> {
+        let mut nets: Vec<(u32, u8)> = Vec::new();
+        let mut add = |c: (Ipv4Addr, u8)| nets.push((u32::from(c.0) & config::mask(c.1), c.1));
+        // the list as it was before it had labels
+        let old_special = [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "172.16.0.0/12",
+            "192.0.0.0/24",
+            "192.0.2.0/24",
+            "192.168.0.0/16",
+            "198.18.0.0/15",
+            "198.51.100.0/24",
+            "203.0.113.0/24",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ];
+        for s in old_special
+            .iter()
+            .map(|s| s.to_string())
+            .chain(cfg.net.block.iter().cloned())
+        {
+            add(config::parse_cidr(&s).unwrap());
+        }
+        add(cfg.subnet().unwrap());
+        if let Some(ip) = public {
+            add((ip, 32));
+        }
+        for a in parse_addrs(addrs.as_bytes()).unwrap() {
+            add((a.ip, 32));
+            add((a.ip, a.prefix));
+        }
+        for r in parse_routes(routes.as_bytes(), up).unwrap() {
+            if r.prefix > 0 {
+                add((r.dst, r.prefix));
+            }
+        }
+        collapse(nets)
+    }
+
+    fn fixture(public: Option<Ipv4Addr>, addrs: &str, routes: &str, up: &str) -> Vec<Blocked> {
+        let mut cfg = Config::default();
+        cfg.net.block = vec!["140.82.121.0/24".into()];
+        sources_from(
+            &cfg,
+            public,
+            &parse_addrs(addrs.as_bytes()).unwrap(),
+            &parse_routes(routes.as_bytes(), up).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sources_collapse_to_the_old_set() {
+        let mut cfg = Config::default();
+        cfg.net.block = vec!["140.82.121.0/24".into()];
+        for (public, addrs, routes, up) in [
+            (None, HOMELAB_ADDRS, HOMELAB_ROUTES, "eth0"),
+            (
+                Some(Ipv4Addr::new(81, 2, 3, 4)),
+                HOMELAB_ADDRS,
+                HOMELAB_ROUTES,
+                "eth0",
+            ),
+            (None, VPS_ADDRS, VPS_ROUTES, "ens6"),
+        ] {
+            let new: Vec<(u32, u8)> = fixture(public, addrs, routes, up)
+                .iter()
+                .map(|b| (u32::from(b.net), b.prefix))
+                .collect();
+            assert_eq!(collapse(new), old_blocked(&cfg, public, addrs, routes, up));
+        }
+    }
+
+    #[test]
+    fn sources_say_why() {
+        let b = fixture(
+            Some(Ipv4Addr::new(81, 2, 3, 4)),
+            HOMELAB_ADDRS,
+            HOMELAB_ROUTES,
+            "eth0",
+        );
+        let has = |net: &str, prefix: u8, why: Why| {
+            let net: Ipv4Addr = net.parse().unwrap();
+            assert!(
+                b.iter()
+                    .any(|x| x.net == net && x.prefix == prefix && x.why == why),
+                "{net}/{prefix} {why:?} in {b:#?}"
+            );
+        };
+        has("192.168.1.20", 32, Why::HostAddr { dev: "eth0".into() });
+        has("192.168.1.0", 24, Why::HostNet { dev: "eth0".into() });
+        has(
+            "172.17.0.0",
+            16,
+            Why::HostNet {
+                dev: "docker0".into(),
+            },
+        );
+        has(
+            "172.16.98.0",
+            30,
+            Why::Route {
+                dev: "wg0".into(),
+                via: Some(Ipv4Addr::new(10, 1, 0, 1)),
+                table: "main".into(),
+            },
+        );
+        has(
+            "203.0.114.0",
+            24,
+            Why::Route {
+                dev: "tailscale0".into(),
+                via: None,
+                table: "52".into(),
+            },
+        );
+        has("81.2.3.4", 32, Why::PublicIp);
+        has("140.82.121.0", 24, Why::Config);
+        has("172.29.217.0", 24, Why::Subnet);
+        has(
+            "169.254.0.0",
+            16,
+            Why::Special {
+                label: "cloud metadata and link-local",
+            },
+        );
+        // the dhcp route to the resolver goes the default way, so it stays open
+        assert!(!b.iter().any(|x| x.net == Ipv4Addr::new(9, 9, 9, 9)));
+        // and the VM table's default route is no destination
+        assert!(!b.iter().any(|x| x.prefix == 0));
+    }
+
+    #[test]
+    fn special_ranges() {
+        for s in SPECIAL {
+            assert_eq!(u32::from(s.net) & !config::mask(s.prefix), 0, "{}", s.net);
+        }
+        let label = |ip: [u8; 4]| special(Ipv4Addr::from(ip)).map(|s| s.label);
+        assert_eq!(
+            label([169, 254, 169, 254]),
+            Some("cloud metadata and link-local")
+        );
+        assert_eq!(label([100, 100, 100, 100]), Some("cgnat and tailscale"));
+        assert_eq!(label([255, 255, 255, 255]), Some("reserved and broadcast"));
+        assert_eq!(label([140, 82, 112, 3]), None);
+    }
+
+    #[test]
+    fn unreadable_routes_are_an_error() {
+        assert!(parse_routes(b"not json", "eth0").is_err());
+        assert!(parse_addrs(b"{").is_err());
+        let odd = parse_routes(br#"[{"dst":"10.0.0.0/40","dev":"x"}]"#, "eth0").unwrap();
+        assert!(odd.is_empty(), "a prefix over 32 is no route");
     }
 
     #[test]

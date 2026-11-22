@@ -6,7 +6,7 @@
 //! exits on its own once the VM's end of the socket closes.
 
 mod net;
-mod policy;
+pub(crate) mod policy;
 pub(crate) mod route;
 pub(crate) mod sandbox;
 
@@ -41,6 +41,9 @@ pub struct MacnetArgs {
     /// an extra range the guest must never reach, repeatable
     #[arg(long)]
     block: Vec<String>,
+    /// the public address net.block_public_ip found, blocked too
+    #[arg(long)]
+    public_ip: Option<Ipv4Addr>,
     /// the guest's address and prefix (what burner's ip= hands it)
     #[arg(long, default_value = "172.29.217.2/30")]
     guest: String,
@@ -53,6 +56,10 @@ pub struct MacnetArgs {
     /// log every connection and refusal to stderr
     #[arg(short)]
     v: bool,
+    /// write the connection log's events here, one JSON line each, never
+    /// blocking: what doesn't fit is counted as lost
+    #[arg(long)]
+    events: Option<i32>,
 }
 
 pub struct Link {
@@ -62,6 +69,7 @@ pub struct Link {
     pub gateway: Ipv4Addr,
     pub rate: u64,
     pub verbose: bool,
+    pub events: Option<i32>,
 }
 
 pub fn main(a: MacnetArgs) -> ExitCode {
@@ -89,7 +97,7 @@ fn start(a: MacnetArgs) -> io::Result<()> {
             "--gateway must be another address on the --guest network",
         ));
     }
-    let pol = Policy::new(mode, a.resolver, &block, (ip, prefix));
+    let pol = Policy::new(mode, a.resolver, &block, a.public_ip, (ip, prefix));
     sandbox::enter()?;
     let args = Link {
         fd: a.fd,
@@ -98,6 +106,7 @@ fn start(a: MacnetArgs) -> io::Result<()> {
         gateway: a.gateway,
         rate: a.rate,
         verbose: a.v,
+        events: a.events,
     };
     net::run(&args, pol)
 }
@@ -142,8 +151,10 @@ pub fn spawn(
     fd: OwnedFd,
     group: u32,
     log: std::fs::File,
+    events: Option<OwnedFd>,
 ) -> io::Result<Proc> {
     let raw = fd.as_raw_fd();
+    let ev = events.as_ref().map(|e| e.as_raw_fd());
     let mut cmd = Command::new(sys::self_exe());
     cmd.arg("macnet")
         .args(["--fd", &raw.to_string(), "--mode", mode.name()])
@@ -152,6 +163,9 @@ pub fn spawn(
         .args(["--rate", &cfg.net.rate.to_string()]);
     for r in &cfg.net.resolvers {
         cmd.args(["--resolver", &r.to_string()]);
+    }
+    if let Some(e) = ev {
+        cmd.args(["--events", &e.to_string()]);
     }
     for b in &cfg.net.block {
         cmd.args(["--block", b]);
@@ -164,15 +178,17 @@ pub fn spawn(
                 "net.block_public_ip is on but there's no public address for this network",
             )
         })?;
-        cmd.args(["--block", &format!("{ip}/32")]);
+        cmd.args(["--public-ip", &ip.to_string()]);
     }
     cmd.process_group(group as libc::pid_t);
     let fds = sys::open_fds()?;
     // SAFETY: close_strays and inherit only call fcntl and close
     unsafe {
         cmd.pre_exec(move || {
-            sys::close_strays(&fds, &[raw]);
-            inherit(raw)
+            let keep: Vec<RawFd> = std::iter::once(raw).chain(ev).collect();
+            sys::close_strays(&fds, &keep);
+            inherit(raw)?;
+            ev.map_or(Ok(()), inherit)
         });
     }
     let child = cmd
@@ -184,6 +200,8 @@ pub fn spawn(
         .current_dir("/")
         .spawn()?;
     drop(fd);
+    // macnet holds the write end now: the reader sees it close when macnet goes
+    drop(events);
     Ok(Proc(child))
 }
 
@@ -241,6 +259,28 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
         setopt(fd, libc::SO_SNDBUF, SOCK_SNDBUF)?;
     }
     Ok((a, b))
+}
+
+/// the connection log's pipe: (burner run's read end, macnet's write end),
+/// close-on-exec, and the write end never raises SIGPIPE
+pub fn events_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut p = [-1; 2];
+    // SAFETY: pipe fills two fds, owned right after
+    let (r, w) = unsafe {
+        if libc::pipe(p.as_mut_ptr()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        (OwnedFd::from_raw_fd(p[0]), OwnedFd::from_raw_fd(p[1]))
+    };
+    for fd in [r.as_raw_fd(), w.as_raw_fd()] {
+        // SAFETY: fcntl on fds we own
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // SAFETY: fcntl on an fd we own
+    unsafe { libc::fcntl(w.as_raw_fd(), libc::F_SETNOSIGPIPE, 1) };
+    Ok((r, w))
 }
 
 /// for pre_exec: let exactly this fd through to the exec'd child

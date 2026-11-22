@@ -257,9 +257,32 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
     let (id, run_dir) = alloc_id(&runs)?;
     record::set_id(&id);
     let mut vm = None;
-    let res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
+    let mut res = run_vm(cfg, a, &p, &id, &run_dir, &mut vm);
     if vm.is_some() {
         timed_teardown(cfg, &id, None);
+    }
+    // the slot's log counters were read at teardown: the log is whole now
+    let died = super::netwire::died();
+    if let Some(log) = super::netwire::finish(cfg) {
+        // after everything else burner says, before the status line and json
+        if !quiet() {
+            for line in super::netwire::words(&log, a.log) {
+                eprintln!("burner: {line}");
+            }
+        }
+        if let Err(e) = crate::netlog::store(&cfg.paths.state, &log) {
+            log_line(&format!("{id}: couldn't keep the network log: {e}"));
+        }
+        record::set_network(log);
+    }
+    if died {
+        let msg = super::netwire::READER_DIED;
+        record::set_outcome(
+            RunOutcome::SandboxError,
+            None,
+            Some((Kind::Net, msg.into())),
+        );
+        res = Err(exit(EXIT_SANDBOX, Kind::Net, msg));
     }
     remove_tree(&run_dir);
     res
@@ -511,6 +534,8 @@ fn run_vm(
         outcome = supervise(&mut child, deadline, cfg, id);
     }
     record::mark(Mark::Ended);
+    // the VM is done sending: the log's reader goes before the result parser comes
+    super::netwire::stop();
     let live_bytes = live.bytes();
     // what the command wrote in all and what of it wasn't kept, when a result came
     let (mut bytes, mut skipped) = (None, 0);
@@ -828,6 +853,8 @@ fn launch(
     }
     let mut ifaces = Vec::new();
     if let Some(i) = net_slot {
+        // the log's reader first: a tap never passes traffic nobody records
+        super::netwire::start_linux(cfg, id, i, p.net)?;
         let s = net::tap_up(cfg, i, p.net, uid)?;
         let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
         ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
@@ -861,6 +888,8 @@ fn launch(
 
     let deadline = Deadline::in_secs(p.ttl);
     let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
+    // the reader has to be there still: a VM never starts without its log
+    super::netwire::alive()?;
     go_live(cfg, id, deadline)?;
     let fclog = OpenOptions::new()
         .write(true)
@@ -931,6 +960,14 @@ fn launch(
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .spawn()
         .context("starting the jailer")?;
+    // the VMM is in its cgroup now, where a reader's death would kill it;
+    // one that died before it got there cancels it here
+    let mut child = child;
+    if let Err(e) = super::netwire::alive() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     Ok(Vmm {
         child,
         log: jail.join("firecracker.log"),
@@ -1015,7 +1052,12 @@ fn launch(
                 dns.join(",")
             );
             let (vm_end, net_end) = crate::macnet::pair().context("the VM's network socket")?;
-            Some((s, vm_end, net_end))
+            // the connection log: macnet writes its decisions, a thread here reads them
+            let (ev_read, ev_write) =
+                crate::macnet::events_pipe().context("the network log's pipe")?;
+            let blocked = crate::explain::mac_sources(cfg).unwrap_or_default();
+            super::netwire::start_mac(cfg, id, p.net, s.guest, ev_read, blocked);
+            Some((s, vm_end, net_end, ev_write))
         }
         None => None,
     };
@@ -1037,7 +1079,7 @@ fn launch(
     // and so kill takes the group
     vmm.process_group(0);
     let me = std::process::id() as libc::pid_t;
-    let vm_fd = net.as_ref().map(|(_, v, _)| v.as_raw_fd());
+    let vm_fd = net.as_ref().map(|(_, v, _, _)| v.as_raw_fd());
     let fds = sys::open_fds().context("listing open fds")?;
     // SAFETY: join_from_child only calls getppid, close_strays and inherit
     // only fcntl and close
@@ -1090,12 +1132,13 @@ fn launch(
         return Err(e).context("recording the VMM");
     }
     let net = match net {
-        Some((s, vm_end, net_end)) => {
+        Some((s, vm_end, net_end, ev_write)) => {
             // the VMM holds its end now. ours has to go, or macnet would never
             // see it close when the VM stops
             drop(vm_end);
-            let started = crate::macnet::spawn(cfg, p.net, &s, net_end, child.id(), net_log)
-                .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
+            let started =
+                crate::macnet::spawn(cfg, p.net, &s, net_end, child.id(), net_log, Some(ev_write))
+                    .and_then(|n| cgroup::record_net(id, n.id()).map(|()| n));
             match started {
                 Ok(n) => Some(n),
                 Err(e) => {

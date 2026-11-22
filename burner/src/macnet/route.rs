@@ -196,6 +196,96 @@ fn parse(h: &libc::rt_msghdr, mut b: &[u8]) -> Option<Route> {
     })
 }
 
+/// every ipv4 route the mac has that isn't its default way out, with the
+/// interface's name: what macnet refuses per connection, for explain. host
+/// entries the kernel cloned or learned (arp), broadcast and multicast are
+/// left out, they're the default route's or the lan's own
+pub fn dump() -> io::Result<Vec<(Route, String)>> {
+    let default = lookup(Ipv4Addr::UNSPECIFIED, true).ok();
+    let mut mib = [
+        libc::CTL_NET,
+        libc::PF_ROUTE,
+        0,
+        libc::AF_INET,
+        libc::NET_RT_DUMP,
+        0,
+    ];
+    let mut len: libc::size_t = 0;
+    // SAFETY: sysctl with a null buffer only reports the size it needs
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            6,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // room for routes added between the two calls
+    let mut buf = vec![0u8; len + 4096];
+    let mut len = buf.len();
+    // SAFETY: the kernel writes at most len bytes into buf
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            6,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(parse_dump(&buf[..len.min(buf.len())], default.as_ref())
+        .into_iter()
+        .map(|r| (r, ifname(r.index)))
+        .collect())
+}
+
+/// the routes in a NET_RT_DUMP buffer that explain lists
+pub fn parse_dump(mut b: &[u8], default: Option<&Route>) -> Vec<Route> {
+    let mut out = Vec::new();
+    let skip = libc::RTF_WASCLONED | libc::RTF_LLINFO | libc::RTF_BROADCAST | libc::RTF_MULTICAST;
+    while b.len() >= HDR {
+        // SAFETY: at least HDR bytes are left
+        let h: libc::rt_msghdr = unsafe { std::ptr::read_unaligned(b.as_ptr().cast()) };
+        let len = h.rtm_msglen as usize;
+        if len < HDR || len > b.len() {
+            break;
+        }
+        if h.rtm_flags & skip == 0
+            && let Some(r) = parse(&h, &b[HDR..len])
+            && !r.dst.is_loopback()
+            && r.index != 0
+            && !default.is_some_and(|d| allowed(&r, d))
+            && !out.contains(&r)
+        {
+            out.push(r);
+        }
+        b = &b[len..];
+    }
+    out
+}
+
+fn ifname(index: u16) -> String {
+    let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: if_indextoname writes at most IF_NAMESIZE bytes, NUL included
+    let p = unsafe { libc::if_indextoname(u32::from(index), name.as_mut_ptr()) };
+    if p.is_null() {
+        return format!("if{index}");
+    }
+    // SAFETY: p points at name, NUL-terminated
+    unsafe { std::ffi::CStr::from_ptr(p) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn inet(sa: &[u8]) -> Option<Ipv4Addr> {
     if sa.len() < 8 || sa[1] != libc::AF_INET as u8 {
         return None;
@@ -244,6 +334,20 @@ mod tests {
             &r("1.1.1.1", 32, None, 11),
             &r("1.0.0.0", 8, None, 11)
         ));
+    }
+
+    #[test]
+    fn dumped_routes() {
+        // whatever this mac has: none of it is the default way out
+        let d = lookup(Ipv4Addr::UNSPECIFIED, true).ok();
+        for (r, name) in dump().unwrap() {
+            assert!(!name.is_empty());
+            if let Some(d) = &d {
+                assert!(!allowed(&r, d), "{r:?}");
+            }
+        }
+        assert!(parse_dump(&[0u8; 7], None).is_empty());
+        assert!(parse_dump(&[0xffu8; 300], None).is_empty());
     }
 
     #[test]

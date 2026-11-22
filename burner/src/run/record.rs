@@ -138,8 +138,8 @@ pub struct RunResult {
     pub vm: Option<VmInfo>,
     pub output: Option<OutputInfo>,
     pub result_tar: Option<TarInfo>,
-    /// the connection log's place, null until it's recorded
-    pub network: Option<()>,
+    /// the connection log, null for a run without a network
+    pub network: Option<crate::netlog::NetLog>,
     /// reserved for the report, null in schema 1 so far
     pub files: Option<()>,
     pub processes: Option<()>,
@@ -168,6 +168,7 @@ struct Rec {
     teardown: Option<Duration>,
     output: Option<OutputInfo>,
     result_tar: Option<TarInfo>,
+    network: Option<crate::netlog::NetLog>,
 }
 
 static REC: Mutex<Option<Rec>> = Mutex::new(None);
@@ -215,6 +216,10 @@ pub(super) fn set_output(o: OutputInfo) {
 
 pub(super) fn set_tar(t: TarInfo) {
     with(|r| r.result_tar = Some(t))
+}
+
+pub(super) fn set_network(n: crate::netlog::NetLog) {
+    with(|r| r.network = Some(n))
 }
 
 pub(super) fn mark(m: Mark) {
@@ -320,7 +325,7 @@ impl Rec {
             vm: r.vm.clone(),
             output: r.output.clone(),
             result_tar: r.result_tar.clone(),
-            network: None,
+            network: r.network.clone(),
             files: None,
             processes: None,
         });

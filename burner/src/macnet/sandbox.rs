@@ -84,8 +84,20 @@ mod tests {
         if std::env::var_os(CHILD).is_some() {
             let home = std::env::var("HOME").unwrap();
             let mut o = std::io::stdout();
-            // home is read before entering, the way macnet has its config by then
+            // home is read before entering, the way macnet has its config by
+            // then, and the log's pipe is open before it too
+            let (_r, w) = super::super::events_pipe().unwrap();
             super::enter().unwrap();
+            attempt(&mut o, "write to an inherited pipe", {
+                use std::os::fd::AsRawFd;
+                // SAFETY: write from a live buffer to an fd we own
+                let n = unsafe { libc::write(w.as_raw_fd(), b"x\n".as_ptr().cast(), 2) };
+                if n == 2 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
             attempt(
                 &mut o,
                 "list ~/.ssh",
@@ -181,7 +193,12 @@ mod tests {
         ] {
             assert!(text.contains(&format!("{denied}: denied")), "{denied}");
         }
-        for allowed in ["route lookup", "interface list", "udp to 9.9.9.9:53"] {
+        for allowed in [
+            "route lookup",
+            "interface list",
+            "udp to 9.9.9.9:53",
+            "write to an inherited pipe",
+        ] {
             assert!(text.contains(&format!("{allowed}: allowed")), "{allowed}");
         }
         assert!(!text.contains("tcp to 1.1.1.1:443: denied (Operation not permitted"));

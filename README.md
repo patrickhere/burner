@@ -36,7 +36,9 @@ that's linux with kvm (x86_64 or arm), or any apple silicon mac (M1 and newer, m
 - `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https plus dns and ping only, or any port but mail. the LAN, the host and other VMs are always blocked
-- `burner ls`, `burner kill ID`, `burner images`, `burner doctor`, `burner version`. `--json` on any of them gives one JSON document instead ([docs/json.md](docs/json.md))
+- after a run with a network, a few lines on stderr say what it tried: connections out, what was blocked and why, dns lookups. `burner log` has every connection of the last 32 runs, see [what a VM tried](#what-a-vm-tried)
+- `burner explain` says what a VM could reach on this host and why the rest is blocked, `burner doctor --probe` boots a VM that tries it for real
+- `burner ls`, `burner kill ID`, `burner images`, `burner doctor`, `burner log`, `burner explain`, `burner version`. `--json` on any of them gives one JSON document instead ([docs/json.md](docs/json.md))
 
 ```
 git archive HEAD | sudo burner run --net web --in tar -- 'apk add -q nodejs npm && npm ci && npm test'
@@ -83,6 +85,7 @@ sudo burner run --net web --in tar --result tar -- cmd
 - the image is mounted read-only with an overlay on a throwaway scratch disk. the command goes in as a raw tar on its own disk
 - results come back as a raw tar the guest writes to another disk. the host never mounts anything the guest wrote: the tar is read by a separate burner process running as its own user, `burner-parse`, with hard rlimits, and only regular files and directories get through
 - each VM gets a tap and its own /30. one nft table only lets those taps out the uplink, minus private ranges and the host's own addresses. bandwidth and disk io are capped per VM
+- the same table logs every new connection a VM tries, before and after the filter decides, to an nflog group of the VM's own. a reader running as `burner-parse` turns that into the run's connection log. the log rules only log and count, they never decide what happens to a packet
 - the time limit is enforced by burner and backed up by a reaper timer, and a VM's slot is only freed once its cgroup is empty
 
 nothing from the host goes into a VM unless you pipe it in. `--net web` means anything that goes in can leave, so don't pipe in secrets.
@@ -93,6 +96,7 @@ where to start reading the code:
 - `burner/src/run/launch.rs`, one run from waiting for a slot to teardown
 - `burner/src/net.rs`, `ruleset()` is the whole nft table: what a tap can and can't reach
 - `burner/src/result.rs`, the parser for the result tar, run as `burner-parse`
+- `burner/src/netlog.rs` and `nflog.rs`, the connection log: what its producers write, how it's folded, the reader. `netmodel.rs` is the policy as a function, for explain, the log's reasons and the probe
 - `guest/init`, pid 1 inside the VM: unpacks the job, runs it, writes the result disk
 - `burner-tui/`, the terminal UI, which only ever runs the burner binary
 
@@ -120,8 +124,34 @@ on a mac (see [install details](#install-details)) it's weaker than on linux, an
 - the VMM runs as you. there's no uid per VM, no jailer and no chroot, so a guest that breaks out of libkrun can do anything you can, including reading other VMs' disks. the guest gets the cpus and memory you asked for, but nothing caps the VMM's own overhead the way a cgroup does on linux, and disk io isn't capped
 - there's no packet filter, and `burner net` has nothing to set up (it exits 2). each VM's network is its own `burner macnet` process, a tcp/ip stack in user space (smoltcp) that only opens the connections the policy allows: the same blocks for the LAN, the host, other VMs and anything off the default route, no mail ports in open mode, `net.block_public_ip` and `net.rate`. it runs under a seatbelt sandbox that allows outbound sockets and route lookups and nothing else, so a bug in it can't read your files or start anything. it can still connect anywhere the mac can, though: the policy runs in that same process, so a guest that took macnet over could reach loopback services, your LAN and VPN routes, the things the policy is there to keep out
 - no ping and no udp but dns yet, in any mode
+- the connection log is macnet's own record of what it decided, written to a pipe burner run reads. it has the bytes each connection carried (linux leaves those null), and shows ping and other udp as blocked. a log macnet couldn't write in time is marked incomplete, and the VM keeps its network
+- `doctor --probe` has no witness counters on a mac: what the host saw is macnet's log, plus a canary listening on the mac's loopback. the probe VM sends 127.0.0.1 out its network, and a connection that ever reached the canary would be a leak
 - the result tar is still parsed in a separate process with rlimits, but as you, under a seatbelt profile that allows it nothing past the files it's handed, and without a memory cap (macOS won't set one)
 - there's no reaper timer. the VMM stops itself when burner exits or its time is up, and the next `burner run` or `burner ls` cleans up what's left
+
+## what a VM tried
+
+every run and shell with a network ends with a summary on stderr, after the command's output and before the `--json-fd` line:
+
+```
+burner: net web: 6 connections out, 2 blocked (5 attempts), 4 dns lookups (burner log burner-3fa1c2b7d10e for all of it)
+burner:   blocked  tcp 192.168.1.1:22          your lan (192.168.1.0/24 on eth0)   x3
+burner:   blocked  tcp 169.254.169.254:80      cloud metadata and link-local (169.254.0.0/16)   x2
+```
+
+it's recorded on the host, not asked of the guest: on linux the nft table logs every new connection a VM tries, before and after the filter decides, and a reader running as `burner-parse` (hard limits, a seccomp list, no files) turns that into rows. on a mac macnet writes down each decision it makes. either way nothing the guest prints can add, change or hide a row.
+
+- `--log summary` is the default, `--log full` prints every row, `--log none` nothing. stdout is never touched, so `--result tar` still works. scripts that read a run's stderr whole want `--log none`, or `--json-fd`, where the log is `result.network`
+- `sudo burner log` prints your last run's log, `sudo burner log ID` a given one, `--json` all of it. the last 32 runs are kept, 1 MiB each, in the state dir, so on linux they're gone after a reboot. through sudo you only see your own runs
+- a row is a destination and what happened to it: allowed and answered, refused or no answer, or blocked and why (this host, a lan or a route, a special range, net.block, your public address, another VM, a port or protocol the mode doesn't open, mail, a dns server that isn't one of net.resolvers, a rate limit). dns rows have the name and type asked and the answers
+- allowed connections are always listed. blocked attempts past 100 a second are counted, not listed, and the summary says how many. a log that may be missing something (the kernel dropped messages, counters that couldn't be read) says `incomplete`. an attempt is only called blocked when the slot's counters show the log got every message the filter sent: when one went missing, an attempt with nothing after it is `unknown`, not blocked
+- if the reader dies while the VM runs (a parser bug the guest found), the VM is stopped and the run exits 125, so nothing goes unrecorded
+- the log can't see inside connections: a VM that tunnels everything through one https connection, a vpn or dns over https shows up as that one connection. names come from the dns the guest asked, and a server the guest controls can point any name at any address, so the address and the verdict are the facts, the names are what it resolved
+- dns rebinding gets nowhere: the filter goes by address when the VM connects, so a name that resolves to your gateway, the host or cloud metadata is blocked like the address. there's no ipv6 in a VM, and taps drop ipv6 before anything else sees it
+
+`sudo burner explain` says what a VM with `--net web` (or `--net open`) could reach on this host, and what it can't and why: this host's addresses, the lan, other routes, the tailnet, cloud metadata, other VMs, net.block and your public address. as root it checks the loaded filter against this config and exits 1 if it's missing or stale. `--rules` adds the firewall rules, on a mac macnet's checks in the order it makes them.
+
+`sudo burner doctor --probe` boots a VM per mode (web, and open when the config allows it) that tries all of that for real: the gateway, the host, each lan and route, the tailnet, metadata, another VM's address, dns to a server that isn't a resolver, a name that resolves to this host, ipv6, and burnervm.dev on 443 (allowed), 22 and 25. the host decides each row from its own log, and on linux also from counters placed after burner's filter that count anything that got past it. exit 0 is all as expected, 1 is something wasn't, 125 the VM couldn't run. `--target IP:PORT` adds your own, `--internet HOST` tries another host. the only packets that leave the machine are the dns lookup and the connections to that host.
 
 ## install details
 
@@ -173,10 +203,10 @@ anyone who can run `sudo burner` with any arguments can also take the VM network
   | code | meaning |
   |---|---|
   | 0 | success. for run and shell: the command exited 0, the shell was left with `~.`, or the shell's VM was powered off |
-  | 1 | the command didn't do its job: doctor found a FAIL, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell |
+  | 1 | the command didn't do its job: doctor found a FAIL or doctor --probe something not as expected, explain found the filter missing or stale, log has no such run, kill was refused or the VM is still stopping, net up failed, the config didn't load. never from run or shell |
   | 2 | usage: bad flags or arguments, needs root (or must not be root), no terminal for shell, not on this OS. nothing was started |
   | 124 | run and shell: the time limit stopped it |
-  | 125 | run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered |
+  | 125 | run and shell: no result. the sandbox or the VM failed, no free slot, the config or an image's defaults didn't load, the input didn't unpack, the command powered off or rebooted the VM, the result tar wasn't delivered, the network log's reader stopped. doctor --probe: its VM couldn't run |
   | 130 | a signal (ctrl-c, SIGTERM, SIGHUP) stopped burner, or burner kill stopped the VM |
   | other | run and shell: the command's own exit code |
 
@@ -226,7 +256,7 @@ it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so
 
 ## tests
 
-`tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on). both need a box with burner installed and an alpine image, and run as root through sudo.
+`tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on, by address and by a name pointing at them, ipv6, and the connection log: that it has every blocked target, can't be forged, survives hostile dns and floods, and stops the VM when its reader dies). both need a box with burner installed and an alpine image, and run as root through sudo.
 
 both VM suites run on github's kvm runners on every push to main, and on a dedicated box with a LAN and vpns.
 
