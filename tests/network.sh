@@ -256,8 +256,21 @@ check $? "log: a guest can't forge rows or the summary" "$(grep '^burner: net' "
 check $? "log: hostile dns is logged as malformed, the reader lives on" "rc=$rc $(head -c 300 "$T/forge.log")"
 
 # a flood of blocked attempts: past the itemization limit they're counted,
-# not listed, and the allowed connection after it is still there
-sudo burner run --img "$IMG" --net web --ttl 3m --json-fd 2 -- "$PRE"'for b in $(seq 0 7); do for i in $(seq 1 200); do timeout 1 tcp 10.254.$b.$i 80 & done; wait; done 2>/dev/null; curl -s -o /dev/null https://github.com; echo done' </dev/null > "$T/flood.txt" 2> "$T/flood.err"
+# not listed, and the allowed connection after it is still there. a bash
+# connect per attempt (debian) is too slow to get past the limit, so where
+# there's python3 one process sends them, 2ms apart
+flood='import socket, time
+for b in range(8):
+    for i in range(1, 201):
+        s = socket.socket()
+        s.setblocking(False)
+        try:
+            s.connect((socket.inet_ntoa(bytes([10, 254, b, i])), 80))
+        except OSError:
+            pass
+        s.close()
+        time.sleep(0.002)'
+sudo burner run --img "$IMG" --net web --ttl 3m --json-fd 2 -- "$PRE"'if command -v python3 >/dev/null; then python3 -c "'"$flood"'"; else for b in $(seq 0 7); do for i in $(seq 1 200); do timeout 1 tcp 10.254.$b.$i 80 & done; wait; done 2>/dev/null; fi; curl -s -o /dev/null https://github.com; echo done' </dev/null > "$T/flood.txt" 2> "$T/flood.err"
 id=$(run_id "$T/flood.err")
 sudo burner log "$id" --json > "$T/flood.log" 2>/dev/null
 ni=$(logf "$T/flood.log" not_itemized 2>/dev/null)
@@ -377,7 +390,7 @@ awk -v d="$down" -v u="$up" 'BEGIN{exit !(d > 500000 && d < 3300000 && u > 30000
 # debian: apt-get update, the thing people use it for, works with --net web
 # and fails with --net none, where it would otherwise only warn
 if [ "$IMG" = debian ]; then
-    w=$(sudo burner run --img "$IMG" --net web --ttl 300s -- 'apt-get update -qq --error-on=any >/dev/null 2>&1; echo $?' </dev/null 2>&1)
+    w=$(sudo burner run --img "$IMG" --net web --log none --ttl 300s -- 'apt-get update -qq --error-on=any >/dev/null 2>&1; echo $?' </dev/null 2>&1)
     n=$(sudo burner run --img "$IMG" --ttl 120s -- 'timeout 60 apt-get update -qq --error-on=any >/dev/null 2>&1; echo $?' </dev/null 2>&1)
     [ "$w" = 0 ] && [ "$n" = 100 ] && ok "apt-get update works with --net web, fails with --net none" \
       || bad "apt-get update" "web=$w none=$n"
