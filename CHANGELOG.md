@@ -28,6 +28,10 @@
 - guest init mounts `/dev/shm`, falls back to `xterm-256color` when the image has no terminfo entry for your terminal (kitty, ghostty), and checks at build time that an image has every tool it needs
 - `tools/build-image` writes each image's package list next to it, and cleans up without crossing into anything still mounted
 - the test suites run against any image with `BURNER_TEST_IMG`, and github runs them on alpine and debian
+- on a mac, a run or shell keeps the mac out of idle sleep while its VM is up, like `caffeinate -i`, and lets go when it ends. a sleeping mac froze its VMs
+- `burner doctor` on a mac says when nobody is logged in at it (VMs still run over ssh), and warns when it idle-sleeps, when FileVault is on before macOS 26 (after a reboot nothing comes back until someone types the password at the mac) and when burner or libkrun has a quarantine xattr
+- `burner -H HOST doctor` checks the sudo rule's lines for `log` and `explain` too, a warning when they're missing
+- `--ttl` in `burner run --help` says the command stops a little before the limit, so its output and `/out` still come back
 - images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
 
 ## 0.2.1
