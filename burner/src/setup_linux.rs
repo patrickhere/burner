@@ -18,7 +18,8 @@ use clap::Args;
 
 use super::{
     IMAGES, MAX_SUMS, SUMS, SWAPPING, Stage, asset, defaults, download_listed, fetch_sums, go_on,
-    gunzip, idle, own_release, package_list, say, sum_for, sweep, wanted,
+    gunzip, idle, own_release, package_list, real_dir, replaceable, say, sum_for, swap_dir, sweep,
+    wanted,
 };
 use crate::config::{self, Config};
 use crate::json::{self, Kind};
@@ -143,26 +144,20 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     let ledger = idle(cfg, "swap their image")?;
     go_on()?;
     let idirs: Vec<PathBuf> = imgs.iter().map(|i| root.join("images").join(i)).collect();
+    real_dir(&root.join("images"))?;
+    // before anything is swapped, so a refusal changes nothing
     for d in &idirs {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(d)
-            .with_context(|| format!("creating {}", d.display()))?;
+        replaceable(d)?;
     }
     SWAPPING.store(true, Ordering::SeqCst);
+    // each image dir whole, in one step: what tools/build-image wrote next
+    // to an image this one replaces (packages, base) goes with the old dir
     for (img, idir) in imgs.iter().zip(&idirs) {
-        let d = stage.0.join(img);
-        for f in ["rootfs.ext4", "defaults.toml", "init"] {
-            fs::rename(d.join(f), idir.join(f))?;
-        }
-        // what tools/build-image wrote about an image this one replaces
-        if d.join("packages").exists() {
-            fs::rename(d.join("packages"), idir.join("packages"))?;
-        } else {
-            remove_if_there(&idir.join("packages"))?;
-        }
-        remove_if_there(&idir.join("base"))?;
+        swap_dir(
+            &stage.0.join(img),
+            idir,
+            &stage.0.join(format!("old-{img}")),
+        )?;
     }
     drop(ledger);
 
@@ -184,22 +179,15 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     Ok(json::reply("setup", 0, Some(res)))
 }
 
-fn remove_if_there(p: &Path) -> Result<()> {
-    match fs::remove_file(p) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(e).with_context(|| format!("removing {}", p.display()))
-        }
-        _ => Ok(()),
-    }
-}
-
 /// the SHA256SUMS install.sh kept, when it's this version's. one from
 /// another version (burner upgraded some other way) doesn't count, one that
 /// isn't root's alone is an error
 fn kept_sums(root: &Path) -> Result<Option<(PathBuf, String)>> {
     let path = root.join(SUMS);
-    let Ok(m) = path.symlink_metadata() else {
-        return Ok(None);
+    let m = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("checking {}", path.display())),
     };
     if !m.is_file() || m.len() > MAX_SUMS {
         bail!("{} isn't a SHA256SUMS file", path.display());
@@ -242,9 +230,14 @@ mod tests {
         assert!(kept_sums(&d).unwrap().is_none());
         let h = "7e7f3c7073c36e334e33e8a74ae744cea06c914f0ab9303b9e557e4106840da4";
         fs::write(d.join(SUMS), format!("{h}  {}\n", tarball())).unwrap();
-        // the temp dir is everyone's, so the file isn't trusted there
-        let r = kept_sums(&d);
-        assert!(r.is_err() || r.unwrap().is_some());
+        // in a dir anyone can write, it isn't trusted
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(kept_sums(&d).is_err());
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        // a symlink or a dir in its place isn't a SHA256SUMS
+        fs::remove_file(d.join(SUMS)).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", d.join(SUMS)).unwrap();
+        assert!(kept_sums(&d).is_err());
         fs::remove_file(d.join(SUMS)).unwrap();
         fs::create_dir(d.join(SUMS)).unwrap();
         assert!(kept_sums(&d).is_err());

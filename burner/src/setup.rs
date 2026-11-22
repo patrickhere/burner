@@ -361,26 +361,22 @@ fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     go_on()?;
     let kdir = root.join("kernel");
     let idirs: Vec<PathBuf> = imgs.iter().map(|i| root.join("images").join(i)).collect();
-    for d in std::iter::once(&kdir).chain(&idirs) {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o755)
-            .create(d)?;
+    for d in [&kdir, &root.join("images")] {
+        real_dir(d)?;
+    }
+    // before anything is swapped, so a refusal changes nothing
+    for d in &idirs {
+        replaceable(d)?;
     }
     SWAPPING.store(true, Ordering::SeqCst);
     fs::rename(&kernel, kdir.join("vmlinux"))?;
+    // each image dir whole, with its defaults and init, in one step
     for (img, idir) in imgs.iter().zip(&idirs) {
-        let d = stage.0.join(img);
-        fs::rename(d.join("rootfs.ext4"), idir.join("rootfs.ext4"))?;
-        fs::rename(d.join("defaults.toml"), idir.join("defaults.toml"))?;
-        if own {
-            fs::rename(d.join("init"), idir.join("init"))?;
-        } else {
-            match fs::remove_file(idir.join("init")) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
+        swap_dir(
+            &stage.0.join(img),
+            idir,
+            &stage.0.join(format!("old-{img}")),
+        )?;
     }
     drop(ledger);
 
@@ -522,6 +518,87 @@ pub struct RemoveResult {
     pub removed: Vec<String>,
     /// what's still in dir, images/NAME for each image left
     pub left: Vec<String>,
+}
+
+/// a dir setup writes into, made when it isn't there: never a symlink, and
+/// nobody but its owner and root may write it
+fn real_dir(d: &Path) -> Result<()> {
+    match d.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .mode(0o755)
+                .create(d)
+                .with_context(|| format!("creating {}", d.display()))?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("checking {}", d.display())),
+        Ok(m) if !m.is_dir() => bail!(
+            "{} isn't a directory, so setup won't write there",
+            d.display()
+        ),
+        Ok(_) => {}
+    }
+    crate::config::trusted_file(d)
+}
+
+/// put the dir `new`, complete, at `dest` in one step: a rename when dest
+/// isn't there, else an exchange, after which the old dir is at `new`, in the
+/// stage dir that goes when setup ends. where the filesystem can't exchange,
+/// two renames: the old dir to `aside`, then the new one in
+fn swap_dir(new: &Path, dest: &Path, aside: &Path) -> Result<()> {
+    if !replaceable(dest)? {
+        return fs::rename(new, dest).with_context(|| format!("moving in {}", dest.display()));
+    }
+    if exchange(new, dest).with_context(|| format!("swapping in {}", dest.display()))? {
+        return Ok(());
+    }
+    fs::rename(dest, aside).with_context(|| format!("moving {} aside", dest.display()))?;
+    fs::rename(new, dest).with_context(|| format!("moving in {}", dest.display()))
+}
+
+/// whether there's an image dir at dest to replace. anything but a dir there,
+/// a symlink included, is an error
+fn replaceable(dest: &Path) -> Result<bool> {
+    match dest.symlink_metadata() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("checking {}", dest.display())),
+        Ok(m) if !m.is_dir() => bail!(
+            "{} isn't a directory, so setup won't replace it",
+            dest.display()
+        ),
+        Ok(_) => Ok(true),
+    }
+}
+
+/// swap two paths in one rename. false when the filesystem can't
+fn exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let bad = |_| std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let a = CString::new(a.as_os_str().as_bytes()).map_err(bad)?;
+    let b = CString::new(b.as_os_str().as_bytes()).map_err(bad)?;
+    // SAFETY: renameat2(2) with two nul-terminated paths that outlive the call
+    #[cfg(target_os = "linux")]
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            a.as_ptr(),
+            libc::AT_FDCWD,
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    // SAFETY: renamex_np(2) with two nul-terminated paths that outlive the call
+    #[cfg(target_os = "macos")]
+    let r = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) } as libc::c_long;
+    if r == 0 {
+        return Ok(true);
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS | libc::ENOTSUP) => Ok(false),
+        _ => Err(e),
+    }
 }
 
 /// progress, on stderr and not in the json
