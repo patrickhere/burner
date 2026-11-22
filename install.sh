@@ -303,7 +303,8 @@ if [ -f "$tui" ] && [ -x "$tui" ]; then
 fi
 # every user's shell reads these, so only into dirs nobody else can write
 extra() { # src dest
-    install -d -m 0755 "$(dirname "$2")"
+    # made when it isn't there, never chmod'ed when it is
+    [ -d "$(dirname "$2")" ] || install -d -m 0755 "$(dirname "$2")"
     if (root_only "$(dirname "$2")") 2>/dev/null; then
         put 0644 "$1" "$2"
     else
