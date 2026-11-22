@@ -61,6 +61,30 @@ defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml
 | VMs at once | | 2, the rest wait |
 | bandwidth | 2.5 MB/s each way per VM (`net.rate`), so big installs are slow | |
 
+## trying an install script
+
+the usual `curl ... | bash`, with the script running in a VM instead of on your machine:
+
+```
+curl -fsSL https://example.com/install.sh | sudo burner run --net web --in stdin -- bash
+```
+
+your machine downloads the script and the VM runs it, with http, https and dns out and nothing else. or let the VM fetch it too, so the script never lands on your machine at all:
+
+```
+sudo burner run --net web -- 'curl -fsSL https://example.com/install.sh | bash'
+```
+
+both images have bash. an installer that expects glibc or apt wants `--img debian`, and a big one `--disk 8 --ttl 30m`. burner exits with the script's exit code, and the summary on stderr says where it went:
+
+```
+burner: net web: 14 connections out, 1 blocked (3 attempts), 9 dns lookups (burner log burner-3fa1c2b7d10e for all of it)
+burner:   reached: example.com, objects.githubusercontent.com, +3 more
+burner:   blocked  tcp 192.168.1.1:80          your lan (192.168.1.0/24 on eth0)   x3
+```
+
+`reached` is every host it got a connection to, in the order it first did. a `blocked` row is something it tried that burner stopped, like your lan, this host or cloud metadata. `sudo burner log ID` has every connection and dns lookup. whatever it installed is gone with the VM. to look at what it wrote, have it copy that to `/out` and add `--result tar > out.tar`.
+
 ## how it works
 
 ```
@@ -155,7 +179,7 @@ it's recorded on the host, not asked of the guest: on linux the nft table logs e
 
 ## install details
 
-burner needs linux on x86_64 or aarch64 with kvm and cgroup v2. the one-liner from [install](#install) downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and builds the alpine image.
+burner needs linux on x86_64 or aarch64 with kvm and cgroup v2. the one-liner from [install](#install) downloads the latest release, checks it against `SHA256SUMS`, installs the packages it needs (apt, dnf or pacman), runs `install.sh` and fetches the alpine image with `burner setup`. it asks whether to fetch debian too, and who may run VMs through sudo without a password (see [letting other users run VMs](#letting-other-users-run-vms)). `sh -s -- --allow alice --debian` answers both up front.
 
 piping a script to `sh` means trusting it, so read it first if you'd rather: `curl -fsSL https://get.burnervm.dev | less`, or it's `get.sh` in this repo. to do the same by hand, grab the tarball for your cpu (x86_64 or aarch64) and `SHA256SUMS` from the [latest release](https://github.com/patrickhere/burner/releases/latest), then:
 
@@ -163,12 +187,15 @@ piping a script to `sh` means trusting it, so read it first if you'd rather: `cu
 sudo apt install nftables conntrack e2fsprogs iproute2 curl   # debian/ubuntu
 sha256sum -c --ignore-missing SHA256SUMS
 tar -xzf burner-v*-$(uname -m)-linux.tar.gz
+cp SHA256SUMS burner-v*-$(uname -m)-linux/   # install.sh keeps it for burner setup
 cd burner-v*-$(uname -m)-linux
 sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), a user, units
-tools/build-image alpine         # an image to boot, uses sudo, no docker
-tools/build-image debian         # if you want debian too, needs mmdebstrap
+sudo burner setup                # the alpine image from the release, checked against that SHA256SUMS
+sudo burner setup debian         # if you want debian too
 sudo burner doctor
 ```
+
+`burner setup` only fetches images from the release of the burner that runs it, for this cpu, and checks them against the `SHA256SUMS` `install.sh` kept in `/var/lib/burner`. without one (installed from crates.io or a checkout) it checks them against the release's own `SHA256SUMS` and says so, since that comes from the same place as the images. to build them here instead: `tools/build-image alpine` (uses sudo, no docker), and `tools/build-image debian` with mmdebstrap.
 
 releases after 0.1.0 come with build provenance, so you can also check a tarball was built by this repo's release workflow: `gh attestation verify burner-v*-x86_64-linux.tar.gz -R patrickhere/burner`. the same goes for the mac build homebrew installs, `burner-v*-aarch64-macos.tar.gz`, from 0.2.1 on.
 
@@ -186,7 +213,7 @@ burner run -- 'uname -m'         # no sudo, VMs run as you
 
 the formula pins the kernel and the image by sha256 in the tap, which isn't the place the files come from, so `burner setup` installs what brew already checked. `burner setup --version v0.2.0` fetches them from a github release instead: the kernel still has to match the sha256 built into burner (the one `install.sh` pins), but the image is only checked against that release's own `SHA256SUMS`. `--from DIR` takes both from anywhere you point it at and skips the kernel pin. the formula doesn't download the debian image, so a plain `brew install` stays small, but it pins it all the same: `burner setup debian` fetches it from burner's own release and checks it against the release's `SHA256SUMS` and the formula's sha256.
 
-the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` doesn't know about the mac yet.
+the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` works the same, without sudo.
 
 headless macs work too. burner runs over ssh with nobody logged in at the screen, and from a LaunchDaemon with `UserName` set to the user burner was set up as (a LaunchAgent only loads once someone logs in). give the daemon `<key>ProcessType</key><string>Interactive</string>`: without it launchd throttles the job and boots take about 45% longer. a sleeping mac freezes its VMs and stops answering ssh. burner keeps the mac from idle sleep while its own VMs run, but for a mac you reach over `-H`, turn idle sleep off (`sudo pmset -a sleep 0`). with FileVault on, nothing comes back after a reboot until someone types its password: at the mac, or over ssh on macOS 26 and later. `sudo fdesetup authrestart` skips it once for a planned reboot. `burner doctor` says who's at the console and warns about idle sleep, FileVault on an older macOS and a quarantined burner.
 
@@ -199,6 +226,16 @@ an image with an `images/NAME/base` file is debian instead, like `images/debian`
 a few things work differently on debian. commands run under the image's `/bin/sh`, which is dash there and busybox ash on alpine, so use `bash -c '...'` when you need bash. an `--in tar` with `../` in a name fails with 125 and `input_error`, since GNU tar refuses it where busybox drops the `../`. what apt installs goes on the scratch disk, which is 4G on debian, so give big installs `--disk 8`.
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, which starts out empty: put only what you change there. `burner config` shows every setting with the defaults filled in.
+
+## upgrade and uninstall
+
+on linux, run the one-liner again to upgrade. it stops if VMs are running (`sh -s -- --force` goes on anyway), keeps the release it replaced as `/usr/local/share/burner/previous`, so `sudo /usr/local/share/burner/previous/install.sh` goes back to it, and deletes the one before that. when the guest init changed, it brings your alpine and debian images up to the new release too. by hand it's `sudo ./install.sh` from the new release, which stops for running VMs the same way unless you give it `--force`.
+
+on a mac: `brew upgrade burner`, then `burner setup` again (and `burner setup debian` if you have it), so the kernel and images are the new burner's. the one-liner does both.
+
+to take it off linux: `curl -fsSL https://get.burnervm.dev | sh -s -- --uninstall` removes burner, firecracker, the kernel, the images, the run log, the units and `/usr/local/share/burner`, and says what it left: `/etc/burner`, the sudo rule, each user's `~/.local/state/burner` and a ufw rule if you added one. `--purge` removes `/etc/burner` and the sudo rule too. by hand it's `sudo ./install.sh --uninstall` (or `--purge`) from the release.
+
+on a mac: `burner setup --remove` takes off the kernel and the images and says what's left in `~/Library/Application Support/burner`, like your config and the run log. then `brew uninstall burner`, and delete that dir if you want the rest gone too. the one-liner with `--uninstall` does both, `--purge` deletes the dir as well.
 
 ## letting other users run VMs
 
@@ -304,7 +341,7 @@ exit "$code"
 
 `burner-tui -H mini` (or `BURNER_HOST`) drives a remote host the same way, with `burner -H` and never through sudo. `h` goes to the next host: local, then the ones in hosts.toml.
 
-it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so the sudoers rule above covers it. release tarballs have it next to burner, `cargo build --release` builds it too, and `install.sh` puts it in `/usr/local/bin`.
+it only ever runs `burner` (or `$BURNER`), on linux through sudo when you're not root, so the sudoers rule above covers it. on a mac it runs burner as you, never through sudo. release tarballs have it next to burner, `cargo build --release` builds it too, and `install.sh` puts it in `/usr/local/bin`.
 
 ## why not docker, gvisor or a hosted sandbox
 
@@ -319,7 +356,7 @@ it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so
 - burner logs to syslog under the `burner` tag: `journalctl -t burner`. every run logs a start and an end line with its id, and the reaper says what it cleaned up
 - the network: `systemctl status burner-net`, and `sudo burner net show` for the rules. a VM with no internet on a docker host is usually docker's FORWARD drop policy, doctor prints the two lines that fix it
 - `cleanup-failed` in `burner ls` means a VM stopped but something of it (its cgroup, tap or jail dir) couldn't be removed yet. the reaper retries every 30s and the slot stays taken until it's gone
-- `sudo ./install.sh --uninstall` takes it all back off, except `/etc/burner`
+- [upgrade and uninstall](#upgrade-and-uninstall) says how to take it all back off
 
 ## tests
 

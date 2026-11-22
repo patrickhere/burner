@@ -13,7 +13,7 @@ every command takes `--json`, before or after the command (`burner --json ls` an
 |---|---|---|
 | `schema` | int | 1. it only goes up when a field changes type or goes away |
 | `burner` | string | the version that wrote it |
-| `command` | string or null | `run`, `shell`, `ls`, `log`, `kill`, `images`, `doctor`, `explain`, `config`, `net show`, `net up`, `net down`, `setup`, `version`, `hosts`. null only when the command line didn't parse far enough to tell |
+| `command` | string or null | `run`, `shell`, `ls`, `log`, `kill`, `images`, `doctor`, `explain`, `config`, `net show`, `net up`, `net down`, `setup`, `version`, `hosts`, `completions`. null only when the command line didn't parse far enough to tell |
 | `host` | string or null | the `-H` host it ran on, as you named it, null when local |
 | `exit` | int | what burner exits with, see the exit codes in the README |
 | `ok` | bool | burner did what was asked. for run and shell: the command ran and exited (whatever its exit code), or the shell was left with `~.` |
@@ -173,6 +173,11 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 // setup (mac): source is brew, release or from. images in the order they were named
 {"source":"release","from":"https://github.com/patrickhere/burner/releases/download/v0.3.0","kernel_pinned":true,
  "kernel":".../kernel/vmlinux","images":[".../images/alpine/rootfs.ext4",".../images/debian/rootfs.ext4"]}
+// setup --remove (mac): what it removed, and what's still in paths.root
+{"dir":".../burner","removed":[".../kernel/vmlinux",".../images/alpine"],"left":["config.toml","logs"]}
+// setup (linux): always this burner's release. sums is install (the SHA256SUMS install.sh kept) or release
+{"source":"release","from":"https://github.com/patrickhere/burner/releases/download/v0.3.1","sums":"install",
+ "images":["/var/lib/burner/images/alpine/rootfs.ext4"]}
 
 // version: needs no config
 {"version":"0.3.0","schema":1,"guest_proto":1,"backend":"firecracker","os":"linux","arch":"x86_64"}

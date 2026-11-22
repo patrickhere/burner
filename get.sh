@@ -141,7 +141,11 @@ mac() {
     run "installing the guest kernel and alpine image" burner setup
     version=$(burner --version 2>/dev/null | awk '{print $2}')
     ok "burner" "native, ${version:-installed}"
-    if [ -n "$debian" ] || yes_to "the debian image too, for install scripts that expect debian?"; then
+    # an upgrade brings the debian image along when it's there
+    if burner images 2>/dev/null | grep -qx debian; then
+        run "updating the debian image" burner setup debian
+        ok "debian image" "updated"
+    elif [ -n "$debian" ] || yes_to "the debian image too, for install scripts that expect debian?"; then
         run "fetching the debian image" burner setup debian
         ok "debian image" "installed"
     fi
