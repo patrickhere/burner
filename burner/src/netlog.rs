@@ -1144,6 +1144,9 @@ pub fn summary_lines(log: &NetLog) -> Vec<String> {
     }
     head += &format!(" (burner log {} for all of it)", log.id);
     let mut out = vec![head];
+    if let Some(r) = reached(log) {
+        out.push(format!("  reached: {r}"));
+    }
     let mut blocked: Vec<&Event> = log
         .events
         .iter()
@@ -1181,6 +1184,61 @@ pub fn summary_lines(log: &NetLog) -> Vec<String> {
         ));
     }
     out.into_iter().map(|l| sanitize(&l)).collect()
+}
+
+/// names shown on the reached line, and how long it gets
+const REACHED_NAMES: usize = 3;
+const REACHED_WIDTH: usize = 60;
+
+/// where the run went: the allowed connections' names (the address when
+/// there's none), in the order they were first seen. None when nothing
+/// was allowed out
+fn reached(log: &NetLog) -> Option<String> {
+    let mut rows: Vec<&Event> = log
+        .events
+        .iter()
+        .filter(|e| e.verdict == Verdict::Allowed && e.kind == Kind::Conn)
+        .collect();
+    rows.sort_by(|a, b| a.t.total_cmp(&b.t));
+    let mut names: Vec<String> = Vec::new();
+    for e in rows {
+        let n = e
+            .names
+            .first()
+            .cloned()
+            .unwrap_or_else(|| e.dst.to_string());
+        if !names.contains(&n) {
+            names.push(n);
+        }
+    }
+    let cut = |n: &str| -> String {
+        if n.chars().count() > REACHED_WIDTH {
+            n.chars().take(REACHED_WIDTH - 3).collect::<String>() + "..."
+        } else {
+            n.to_string()
+        }
+    };
+    let mut shown: Vec<String> = Vec::new();
+    let mut width = 0;
+    for n in &names {
+        let n = cut(n);
+        if !shown.is_empty()
+            && (shown.len() == REACHED_NAMES || width + 2 + n.len() > REACHED_WIDTH)
+        {
+            break;
+        }
+        width += n.len() + 2;
+        shown.push(n);
+    }
+    if shown.is_empty() {
+        return None;
+    }
+    let more = names.len() - shown.len();
+    let mut s = shown.join(", ");
+    if more > 0 {
+        s += &format!(", +{more} more");
+    }
+    Some(s)
 }
 
 /// the full table, as burner log and --log full print it
@@ -1495,15 +1553,16 @@ mod tests {
             l[0],
             "net web: 3 connections out, 3 blocked (5 attempts), 2 dns lookups (burner log burner-3fa1c2 for all of it)"
         );
+        assert_eq!(l[1], "  reached: pypi.org, 140.82.112.3");
         assert_eq!(
-            l[1],
+            l[2],
             "  blocked  tcp 192.168.1.1:22          your lan (192.168.1.0/24 on eth0)   x3"
         );
-        assert!(l[2].starts_with("  blocked  tcp 169.254.169.254:80      cloud metadata"));
+        assert!(l[3].starts_with("  blocked  tcp 169.254.169.254:80      cloud metadata"));
         assert!(
-            l[3].starts_with("  blocked  dns 8.8.8.8 evil.example A  not one of net.resolvers")
+            l[4].starts_with("  blocked  dns 8.8.8.8 evil.example A  not one of net.resolvers")
         );
-        assert_eq!(l.len(), 4);
+        assert_eq!(l.len(), 5);
         let t = table(&sample());
         assert!(t.starts_with("net web, 14.0s, log complete\n"), "{t}");
         assert!(t.contains("pypi.org A"), "{t}");
@@ -1733,6 +1792,47 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(mode.mode() & 0o777, 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reached_names() {
+        let log = sample();
+        assert_eq!(summary_lines(&log)[1], "  reached: pypi.org, 140.82.112.3");
+        let mut big = log.clone();
+        big.events
+            .retain(|e| e.verdict != Verdict::Allowed || e.kind != Kind::Conn);
+        assert!(reached(&big).is_none());
+        let row = log
+            .events
+            .iter()
+            .find(|e| e.kind == Kind::Conn && e.verdict == Verdict::Allowed)
+            .unwrap();
+        for i in 0..6u8 {
+            let mut e = row.clone();
+            e.t = f64::from(i);
+            e.dst = Ipv4Addr::new(1, 1, 1, i);
+            e.names = if i < 2 {
+                vec![format!("n{i}.example")]
+            } else {
+                vec![]
+            };
+            big.events.push(e);
+        }
+        // the same name twice counts once
+        let mut dup = row.clone();
+        dup.t = 9.0;
+        dup.names = vec!["n0.example".into()];
+        big.events.push(dup);
+        assert_eq!(
+            reached(&big).unwrap(),
+            "n0.example, n1.example, 1.1.1.2, +3 more"
+        );
+        let mut long = row.clone();
+        long.t = -1.0;
+        long.names = vec!["x".repeat(300)];
+        big.events.push(long);
+        let r = reached(&big).unwrap();
+        assert_eq!(r, format!("{}..., +6 more", "x".repeat(57)));
     }
 
     #[test]
