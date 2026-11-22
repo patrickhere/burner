@@ -8,6 +8,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -443,10 +445,17 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         tx_blocked: false,
         events: Events::new(args.events),
     };
+    // burner sends SIGTERM once the VMM is gone: a poll() already asleep on
+    // the VM's socket isn't woken when the other end goes with its process
+    let told = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(libc::SIGTERM, told.clone())?;
     let mut buf = vec![0u8; 65536];
     loop {
+        // a fresh poll sees the VM's end gone, and what the VM sent before it
+        // went is still read and decided
+        let stop = told.load(Ordering::Relaxed);
         let (mut fds, who) = gw.pollfds();
-        let timeout = gw.timeout();
+        let timeout = if stop { 0 } else { gw.timeout() };
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n < 0 {
             let e = io::Error::last_os_error();
@@ -491,6 +500,11 @@ pub fn run(args: &Link, pol: Policy) -> io::Result<()> {
         gw.events.flush();
         if !gw.flush()? {
             gw.log(format_args!("the VM's end of the socket closed, exiting"));
+            gw.events.finish();
+            return Ok(());
+        }
+        if stop {
+            gw.log(format_args!("told the VM is gone, exiting"));
             gw.events.finish();
             return Ok(());
         }

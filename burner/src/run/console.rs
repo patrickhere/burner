@@ -1008,6 +1008,9 @@ pub(super) fn supervise(child: &mut Child, deadline: Deadline, cfg: &Config, id:
     if kill_requested(cfg, id) {
         return Outcome::Cancelled;
     }
+    // macOS: macnet may not have noticed the VMM go, see admin::net_last_line
+    #[cfg(target_os = "macos")]
+    cgroup::stop_net(id);
     let end = Instant::now() + Duration::from_secs(5);
     while cgroup::populated(id) && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(100));

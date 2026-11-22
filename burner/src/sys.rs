@@ -25,6 +25,24 @@ pub fn boot_id() -> String {
     sysctl_string(c"kern.bootsessionuuid").unwrap_or_default()
 }
 
+/// a child of ours has exited, waited for or not. a zombie isn't reaped here,
+/// so its pid and group stay its own
+#[cfg(target_os = "macos")]
+pub fn exited(pid: u32) -> bool {
+    // SAFETY: waitid fills a zeroed siginfo_t; WNOWAIT leaves the child as it is
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let r = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        // ECHILD: it was reaped already
+        r != 0 || info.si_pid != 0
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
     let mut buf = [0u8; 128];

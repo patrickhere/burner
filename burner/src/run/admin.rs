@@ -24,6 +24,11 @@ const REAPED: &str = "reaped";
 #[cfg(target_os = "linux")]
 const REAPER_MAX_AGE: Duration = Duration::from_secs(120);
 
+/// how long teardown gives the VMM to go and then macnet to write its
+/// counts, before the group is killed either way
+#[cfg(target_os = "macos")]
+const NET_LAST_LINE: Duration = Duration::from_millis(500);
+
 /// each VM's own dir under paths.root: its disks, its VMM's log
 #[cfg(target_os = "linux")]
 pub(super) const VM_DIRS: &str = "jail/firecracker";
@@ -127,11 +132,27 @@ pub(super) fn release(cfg: &Config, id: &str, slot: Slot, wait: Duration) -> Rel
     }
 }
 
+/// macOS, with the VMM just killed: macnet's last line has the counts that
+/// make the connection log complete, and it writes it when it sees the VM's
+/// end of the socket gone. a poll() already asleep on that socket isn't woken
+/// when the VMM exits, so macnet is told with SIGTERM once the VMM is down
+#[cfg(target_os = "macos")]
+fn net_last_line(id: &str, vmm: u32) {
+    let until = Instant::now() + NET_LAST_LINE;
+    while !sys::exited(vmm) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    cgroup::stop_net(id);
+    super::netwire::net_closed(until);
+}
+
 /// stop the VM and only then free its disks and its slot. false when it couldn't be confirmed dead
 pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     let mut child = child;
     if let Some(c) = child.as_deref_mut() {
         let _ = c.kill();
+        #[cfg(target_os = "macos")]
+        net_last_line(id, c.id());
     }
     cgroup::kill(id);
     let end = Instant::now() + Duration::from_secs(15);

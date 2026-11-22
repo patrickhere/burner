@@ -132,6 +132,15 @@ pub fn kill(id: &str) {
     }
 }
 
+/// tell macnet the VM is gone: it writes its last line and exits
+pub fn stop_net(id: &str) {
+    let Ok(r) = read(id) else { return };
+    if let Some(n) = net(&r) {
+        // SAFETY: plain kill(2) of the recorded macnet, start time checked
+        unsafe { libc::kill(n.pid as libc::pid_t, libc::SIGTERM) };
+    }
+}
+
 /// only net down takes every VM down at once, and on macOS VMs have no network yet
 #[allow(dead_code)]
 pub fn kill_all() {

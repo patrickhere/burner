@@ -258,6 +258,22 @@ pub(super) fn start_mac(
     });
 }
 
+/// macOS: wait until macnet has closed its end of the log's pipe, which it
+/// does right after its last line, or until `until`
+#[cfg(target_os = "macos")]
+pub(super) fn net_closed(until: Instant) {
+    let open = || {
+        live(|l| {
+            l.as_ref()
+                .and_then(|l| l.thread.as_ref())
+                .is_some_and(|t| !t.is_finished())
+        })
+    };
+    while open() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 /// the VM is gone: let the last messages in (the reader flushes every 10 ms),
 /// then stop the reader, so it never overlaps the result parser
 pub(super) fn stop() {
