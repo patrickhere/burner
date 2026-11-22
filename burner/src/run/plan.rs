@@ -29,7 +29,8 @@ pub struct RunArgs {
     /// scratch disk in GiB
     #[arg(long)]
     disk: Option<u32>,
-    /// time limit: 90s, 10m, 1h
+    /// time limit: 90s, 10m, 1h. the command is stopped a little before it (a
+    /// quarter of it, 5s to 30s), so its output and /out still get saved
     #[arg(long)]
     ttl: Option<String>,
     /// what to do with stdin: ignore it, feed it to the command, or unpack it as a tar into /work
@@ -85,7 +86,8 @@ pub struct ShellArgs {
     /// scratch disk in GiB
     #[arg(long)]
     disk: Option<u32>,
-    /// time limit: 30m, 1h
+    /// time limit: 30m, 1h. a shell isn't stopped early like a run, it closes
+    /// at the limit
     #[arg(long)]
     ttl: Option<String>,
     /// network: none, web or open (default web, or less if the config says so)
