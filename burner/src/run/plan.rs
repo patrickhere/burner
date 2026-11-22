@@ -24,11 +24,11 @@ pub struct RunArgs {
     /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
-    /// memory in MiB
-    #[arg(long)]
+    /// memory: 512M, 2G, or a number of MiB
+    #[arg(long, value_name = "SIZE", value_parser = mem_size)]
     mem: Option<u32>,
-    /// scratch disk in GiB
-    #[arg(long)]
+    /// scratch disk: 4G, or a number of GiB
+    #[arg(long, value_name = "SIZE", value_parser = disk_size)]
     disk: Option<u32>,
     /// time limit: 90s, 10m, 1h. the command is stopped a little before it (a
     /// quarter of it, 5s to 30s), so its output and /out still get saved
@@ -77,9 +77,6 @@ pub struct RunArgs {
     cmd: Vec<String>,
     #[arg(skip)]
     pub(super) shell: bool,
-    /// shell --img was given
-    #[arg(skip)]
-    shell_img: bool,
     /// --net wasn't given: lower it to limits.net instead of refusing
     #[arg(skip)]
     net_default: bool,
@@ -95,11 +92,11 @@ pub struct ShellArgs {
     /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
-    /// memory in MiB
-    #[arg(long)]
+    /// memory: 512M, 2G, or a number of MiB
+    #[arg(long, value_name = "SIZE", value_parser = mem_size)]
     mem: Option<u32>,
-    /// scratch disk in GiB
-    #[arg(long)]
+    /// scratch disk: 4G, or a number of GiB
+    #[arg(long, value_name = "SIZE", value_parser = disk_size)]
     disk: Option<u32>,
     /// time limit: 30m, 1h. a shell isn't stopped early like a run, it closes
     /// at the limit
@@ -203,8 +200,6 @@ impl RunArgs {
             Some("--json-mark")
         } else if self.wait.is_some() {
             Some("--wait")
-        } else if self.shell_img {
-            Some("--img")
         } else {
             None
         }
@@ -308,7 +303,11 @@ impl ShellArgs {
 /// a shell is a run with the caller's terminal and no command
 pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
     RunArgs {
-        img: a.spec.clone().unwrap_or_else(|| "alpine".into()),
+        img: a
+            .img
+            .clone()
+            .or_else(|| a.spec.clone())
+            .unwrap_or_else(|| "alpine".into()),
         cpus: a.cpus,
         mem: a.mem,
         disk: a.disk,
@@ -327,7 +326,6 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
-        shell_img: a.img.is_some(),
     }
 }
 
@@ -461,6 +459,39 @@ fn image_defaults(cfg: &Config, img: &str) -> Result<ImageDefaults> {
             format!("{}: {e}", path.display()),
         )),
     }
+}
+
+/// a size: a number, then M or G (MB, MiB, GB and GiB too, any case). None
+/// for the number's own unit
+fn size_unit(s: &str) -> Result<(u64, Option<u64>), String> {
+    let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(at);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("{s:?}: use a size like 512M or 2G"))?;
+    let mib = match unit.to_ascii_lowercase().as_str() {
+        "" => None,
+        "m" | "mb" | "mib" => Some(1),
+        "g" | "gb" | "gib" => Some(1024),
+        _ => return Err(format!("{s:?}: use a size like 512M or 2G")),
+    };
+    Ok((n, mib))
+}
+
+/// --mem in MiB: 512, 512M, 2G
+fn mem_size(s: &str) -> Result<u32, String> {
+    let (n, mib) = size_unit(s)?;
+    u32::try_from(n.saturating_mul(mib.unwrap_or(1))).map_err(|_| format!("{s:?} is too big"))
+}
+
+/// --disk in GiB: 4, 4G, 4096M
+fn disk_size(s: &str) -> Result<u32, String> {
+    let (n, mib) = size_unit(s)?;
+    let mib = n.saturating_mul(mib.unwrap_or(1024));
+    if !mib.is_multiple_of(1024) {
+        return Err(format!("{s:?}: the disk is whole GiB (4G)"));
+    }
+    u32::try_from(mib / 1024).map_err(|_| format!("{s:?} is too big"))
 }
 
 pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
@@ -666,6 +697,48 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
             r#"{"images":[{"name":"alpine","rootfs_bytes":268435456,"init_matches":true,"defaults":{"vcpus":null,"mem_mib":512,"disk_gib":null,"ttl_secs":null}}]}"#
+        );
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(mem_size("512"), Ok(512));
+        assert_eq!(mem_size("512M"), Ok(512));
+        assert_eq!(mem_size("512mib"), Ok(512));
+        assert_eq!(mem_size("2G"), Ok(2048));
+        assert_eq!(mem_size("2gb"), Ok(2048));
+        assert_eq!(disk_size("4"), Ok(4));
+        assert_eq!(disk_size("4G"), Ok(4));
+        assert_eq!(disk_size("4096M"), Ok(4));
+        assert!(disk_size("500M").is_err(), "not whole GiB");
+        for bad in ["", "G", "2T", "1.5G", "-1", " 2G", "2 G", "99999999999G"] {
+            assert!(mem_size(bad).is_err() && disk_size(bad).is_err(), "{bad:?}");
+        }
+        // the far end gets plain MiB and GiB, which 0.3.0 takes too
+        let n = "0123456789abcdef0123456789abcdef";
+        let a = parse(&["--mem", "2G", "--disk", "4G", "--", "x"]).remote_argv(n, false);
+        assert_eq!(a[3..7], ["--mem", "2048", "--disk", "4"]);
+    }
+
+    #[test]
+    fn shell_takes_img() {
+        #[derive(clap::Parser)]
+        struct S {
+            #[command(flatten)]
+            a: ShellArgs,
+        }
+        let sh = |args: &[&str]| {
+            <S as clap::Parser>::try_parse_from(
+                std::iter::once("shell").chain(args.iter().copied()),
+            )
+            .map(|s| shell_run_args(&s.a).img)
+        };
+        assert_eq!(sh(&[]).unwrap(), "alpine");
+        assert_eq!(sh(&["debian"]).unwrap(), "debian");
+        assert_eq!(sh(&["--img", "debian"]).unwrap(), "debian");
+        assert!(
+            sh(&["--img", "debian", "alpine"]).is_err(),
+            "one or the other"
         );
     }
 
