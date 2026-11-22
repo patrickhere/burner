@@ -184,7 +184,12 @@ echo "guest kernel $KERNEL_VERSION"
 fetch "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$KERNEL_BUILD/$ARCH/vmlinux-$KERNEL_VERSION" \
     "$KERNEL_SHA" "$work/vmlinux"
 
-"$bin" config >/dev/null 2>&1 || "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
+# a config this burner won't take stops it here, before anything changes
+if [ -s /etc/burner/config.toml ]; then
+    "$bin" config >/dev/null || die "the new burner doesn't take /etc/burner/config.toml (above), nothing was changed"
+else
+    "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
+fi
 ver=$("$bin" --version | awk '{print $2}')
 
 # the SHA256SUMS get.sh checked this release against, kept for burner setup:
