@@ -173,6 +173,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> Report {
             format!("burner macnet won't start: {e}. --net none still works"),
         ),
     }
+    headless(&mut r);
 
     if !json::on() {
         println!();
@@ -184,6 +185,148 @@ pub fn run(cfg: &Config, config_path: &Path) -> Report {
     }
     r.root = sys::is_root();
     r
+}
+
+/// what matters for a mac nobody sits at: who's at the console, sleep,
+/// FileVault after a reboot, and a quarantined burner
+fn headless(r: &mut Report) {
+    match console_user() {
+        Some(u) if u == "root" => r.line(
+            Level::Ok,
+            "session",
+            "nobody logged in at the mac. VMs run over ssh and from a LaunchDaemon anyway",
+        ),
+        Some(u) => r.line(Level::Ok, "session", format!("{u} at the console")),
+        None => {}
+    }
+
+    let pmset = output(Command::new("/usr/bin/pmset").arg("-g"));
+    match pmset.as_deref().and_then(idle_sleep) {
+        Some(0) => r.line(Level::Ok, "sleep", "idle sleep off"),
+        Some(m) => r.line(
+            Level::Warn,
+            "sleep",
+            format!(
+                "the mac sleeps after {m} min idle, and VMs freeze while it sleeps. \
+                 burner keeps it awake while its VMs run, but ssh can't wake it: \
+                 sudo pmset -a sleep 0 for a mac you reach over -H"
+            ),
+        ),
+        None => r.line(Level::Warn, "sleep", "couldn't read pmset -g"),
+    }
+
+    let fv = output(Command::new("/usr/bin/fdesetup").arg("status"));
+    let major = crate::sys::macos_version().as_deref().and_then(major);
+    match (fv.as_deref().and_then(filevault_on), major) {
+        (Some(true), Some(v)) if v < 26 => r.line(
+            Level::Warn,
+            "filevault",
+            "on: after a reboot ssh and burner only come back once someone types \
+             the FileVault password at the mac (macOS 26 takes it over ssh). \
+             planned reboots: sudo fdesetup authrestart",
+        ),
+        (Some(true), _) => r.line(
+            Level::Ok,
+            "filevault",
+            "on, macOS 26 and later take its password over ssh after a reboot",
+        ),
+        (Some(false), _) => r.line(Level::Ok, "filevault", "off"),
+        (None, _) => {}
+    }
+
+    let mut files = vec![sys::self_exe()];
+    if let Ok(k) = crate::krun::probe() {
+        files.push(k.into());
+    }
+    let marked: Vec<String> = files
+        .iter()
+        .filter(|f| quarantined(f))
+        .map(|f| f.display().to_string())
+        .collect();
+    if marked.is_empty() {
+        r.line(Level::Ok, "quarantine", "not on burner or libkrun");
+    } else {
+        r.line(
+            Level::Warn,
+            "quarantine",
+            format!(
+                "{} has com.apple.quarantine (a browser download). it ran anyway over ssh \
+                 on macOS 27, other versions may refuse it: xattr -d com.apple.quarantine {}",
+                marked.join(", "),
+                marked.join(" ")
+            ),
+        );
+    }
+}
+
+/// stdout of a short command that worked
+fn output(cmd: &mut Command) -> Option<String> {
+    let o = sys::run_timeout(cmd, None, Duration::from_secs(10)).ok()?;
+    o.status
+        .success()
+        .then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+/// who owns /dev/console: root while the mac sits at the login window
+fn console_user() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/dev/console").ok()?.uid();
+    // SAFETY: getpwuid's result is read before anything else calls it
+    unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return Some(uid.to_string());
+        }
+        Some(
+            std::ffi::CStr::from_ptr((*pw).pw_name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// pmset -g's idle sleep timer in minutes, 0 when it never sleeps
+fn idle_sleep(pmset: &str) -> Option<u32> {
+    pmset.lines().find_map(|l| {
+        let mut w = l.split_whitespace();
+        (w.next() == Some("sleep"))
+            .then(|| w.next()?.parse().ok())
+            .flatten()
+    })
+}
+
+/// fdesetup status: "FileVault is On." or "FileVault is Off."
+fn filevault_on(status: &str) -> Option<bool> {
+    let l = status.lines().next()?;
+    if l.starts_with("FileVault is On") {
+        Some(true)
+    } else if l.starts_with("FileVault is Off") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn major(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
+}
+
+fn quarantined(f: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(p) = std::ffi::CString::new(f.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a size-only getxattr on a NUL-terminated path
+    unsafe {
+        libc::getxattr(
+            p.as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        ) >= 0
+    }
 }
 
 fn dotted(v: [u32; 3]) -> String {
@@ -328,5 +471,30 @@ fn images(r: &mut Report, cfg: &Config) {
                 crate::setup::fix_hint(&other)
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_pmset() {
+        let out = "System-wide power settings:\nCurrently in use:\n standby              0\n \
+                   Sleep On Power Button 1\n SleepServices        0\n disksleep            10\n \
+                   sleep                0 (sleep prevented by powerd, mds)\n displaysleep         10\n";
+        assert_eq!(idle_sleep(out), Some(0));
+        assert_eq!(idle_sleep(" displaysleep 10\n sleep 1\n"), Some(1));
+        assert_eq!(idle_sleep(" displaysleep 10\n"), None);
+    }
+
+    #[test]
+    fn reads_fdesetup_and_versions() {
+        assert_eq!(filevault_on("FileVault is On.\n"), Some(true));
+        assert_eq!(filevault_on("FileVault is Off.\n"), Some(false));
+        assert_eq!(filevault_on("Error: something\n"), None);
+        assert_eq!(major("27.0.1"), Some(27));
+        assert_eq!(major("15.7"), Some(15));
+        assert_eq!(major(""), None);
     }
 }

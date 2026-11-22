@@ -43,6 +43,12 @@ pub fn exited(pid: u32) -> bool {
     }
 }
 
+/// "27.0.1"
+#[cfg(target_os = "macos")]
+pub fn macos_version() -> Option<String> {
+    sysctl_string(c"kern.osproductversion")
+}
+
 #[cfg(target_os = "macos")]
 fn sysctl_string(name: &std::ffi::CStr) -> Option<String> {
     let mut buf = [0u8; 128];
