@@ -874,6 +874,21 @@ impl Collector {
         }
     }
 
+    /// messages the kernel sent that never arrived, by the counters. None
+    /// when the counters can't be the ones these messages were counted in:
+    /// fewer than arrived, as after a filter reload set them back to zero
+    fn gap(&self, c: &NetCounts) -> Option<u64> {
+        let sent = c
+            .tries
+            .checked_sub(c.over)?
+            .checked_add(c.up)?
+            .checked_add(c.down)?;
+        let got = self.tries_seen + self.up_seen + self.down_seen;
+        (self.tries_seen <= c.tries && self.up_seen <= c.up && self.down_seen <= c.down)
+            .then(|| sent.checked_sub(got))
+            .flatten()
+    }
+
     /// the log as it stands once the VM is gone and every message is in
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
@@ -893,20 +908,17 @@ impl Collector {
         // every packet from a tap, right after the log's jump
         let (counts_ok, established) = match check {
             Check::Mac(said) => (said, true),
-            Check::Linux(Some(c))
-                if self.tries_seen <= c.tries
-                    && self.up_seen <= c.up
-                    && self.down_seen <= c.down =>
-            {
-                let sent = (c.tries - c.over) + c.up + c.down;
-                let got = self.tries_seen + self.up_seen + self.down_seen;
-                // the counters also catch a gap at the very end, which no
-                // sequence number shows
-                self.lost = self.lost.max(sent - got);
-                self.unlisted(c.over - self.allowed_without_try.min(c.over));
-                (true, self.up_seen == c.up)
-            }
-            Check::Linux(_) => (false, false),
+            // the counters also catch a gap at the very end, which no
+            // sequence number shows
+            Check::Linux(Some(c)) => match self.gap(&c) {
+                Some(gap) => {
+                    self.lost = self.lost.max(gap);
+                    self.unlisted(c.over - self.allowed_without_try.min(c.over));
+                    (true, self.up_seen == c.up)
+                }
+                None => (false, false),
+            },
+            Check::Linux(None) => (false, false),
         };
         while let Some(t) = self.pending.pop_front() {
             if established || t.hook == 1 {
@@ -1618,6 +1630,26 @@ mod tests {
         assert!(log.events.is_empty());
         assert_eq!((log.invalid, log.lost, log.complete), (8, 2, false));
         assert!(summary_lines(&log)[0].contains("log incomplete (2 lost)"));
+    }
+
+    #[test]
+    fn counters_behind_the_log() {
+        // the counters were set back mid-run: past the guard on each one,
+        // fewer sent than arrived. that's counters that don't fit, not a panic
+        let t0 = Instant::now();
+        let mut c = Collector::new(model(Mode::Web), GUEST, t0);
+        for p in [22, 23, 24, 25] {
+            c.line(pkt("t", 6, "172.29.217.2", "10.0.0.1", 1, p, 2), t0);
+        }
+        let reset = NetCounts {
+            tries: c.tries_seen,
+            over: 3,
+            up: 0,
+            down: 0,
+        };
+        let log = finish_with(c, t0, Check::Linux(Some(reset)));
+        assert!(!log.complete);
+        assert_eq!(log.lost, 0);
     }
 
     #[test]
