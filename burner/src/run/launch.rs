@@ -576,8 +576,6 @@ fn run_vm(
         outcome = supervise(&mut child, deadline, cfg, id);
     }
     record::mark(Mark::Ended);
-    // the VM is done sending: the log's reader goes before the result parser comes
-    super::netwire::stop();
     let live_bytes = live.bytes();
     // what the command wrote in all and what of it wasn't kept, when a result came
     let (mut bytes, mut skipped) = (None, 0);
@@ -587,6 +585,8 @@ fn run_vm(
         record::set_outcome(o, None, Some((kind, msg)));
     };
     let code = match outcome {
+        // the VM may still be sending: the log's reader stays until it's
+        // gone, and finish() stops it after teardown, as for a shell
         Outcome::Timeout | Outcome::Cancelled | Outcome::Interrupted | Outcome::Detached => {
             timed_teardown(cfg, id, Some(&mut child));
             *held = None;
@@ -614,6 +614,8 @@ fn run_vm(
         // a firecracker error after the job still has a result disk worth reading;
         // without an exit code from the guest it ends up as a sandbox failure anyway
         Outcome::Done | Outcome::Failed => {
+            // the VM is done sending: the log's reader goes before the result parser comes
+            super::netwire::stop();
             let log = run_dir.join("log.bin");
             let tar_path = run_dir.join("result.tar");
             let meta = result::parse(

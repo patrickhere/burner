@@ -278,6 +278,19 @@ size=$(sudo stat -c %s "/run/burner/logs/$id.json" 2>/dev/null)
 logq "$T/flood.log" verdict=allowed port=443 && [ "${ni:-0}" -gt 0 ] && [ "$(logf "$T/flood.log" complete)" = true ] && [ "${size:-9999999}" -le 1048576 ]
 check $? "log: a flood of 1600 blocked attempts is counted ($ni not listed), the allowed one after it is listed, log ${size}B" "ni=$ni size=$size complete=$(logf "$T/flood.log" complete 2>/dev/null)"
 
+# a run stopped (ctrl-c) while its VM keeps trying blocked addresses: the
+# reader stays until the VM is gone, so the log is still complete
+( sudo burner run --tag intlog --img "$IMG" --net web --ttl 2m --json-fd 2 -- "$PRE"'i=0; while :; do i=$((i + 1)); timeout 1 tcp 10.254.9.$((i % 200 + 1)) 80; sleep 0.02; done' </dev/null >/dev/null 2>"$T/int.err"; echo "rc=$?" > "$T/int.rc" ) &
+ip=$!
+for _ in $(seq 60); do sudo burner ls | grep -q ' intlog ' && break; sleep 0.5; done
+sleep 5
+sudo pkill -INT -f '^burner run --tag intlog'
+wait "$ip"
+id=$(run_id "$T/int.err")
+sudo burner log "$id" --json > "$T/int.log" 2>/dev/null
+grep -qx 'rc=130' "$T/int.rc" && logq "$T/int.log" verdict=blocked port=80 && [ "$(logf "$T/int.log" complete)" = true ]
+check $? "log: a run stopped mid-attempts still has a complete log" "$(cat "$T/int.rc") complete=$(logf "$T/int.log" complete 2>/dev/null) lost=$(logf "$T/int.log" lost 2>/dev/null)"
+
 # the reader going away under a running VM stops the VM: nothing unrecorded
 ( sudo burner run --img "$IMG" --net web --ttl 2m -- 'sleep 60' </dev/null > "$T/death.txt" 2>&1; echo "rc=$?" >> "$T/death.txt" ) &
 dp=$!
