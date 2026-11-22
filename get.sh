@@ -243,6 +243,10 @@ main() {
     else
         ok "alpine image" "already there"
     fi
+    # debian is built only when asked for, it needs mmdebstrap and takes a while
+    if grep -q 'rebuild debian' "$LOG"; then
+        warn "the debian image needs a rebuild for the new guest init: $SHARE/current/tools/build-image debian"
+    fi
 
     # the first sentence of each doctor warning, doctor itself has the rest
     warns=$(as_root /usr/local/bin/burner doctor 2>/dev/null | sed -n 's/^warn *[a-z]* *//p')
@@ -262,7 +266,8 @@ main() {
     printf "    sudo burner run -- 'uname -a; cat /etc/alpine-release'\n"
     printf '    sudo burner shell alpine\n'
     if [ -x /usr/local/bin/burner-tui ]; then printf '    burner-tui\n'; fi
-    printf '\n  %smore images: %s/current/tools/build-image NAME%s\n' "$D" "$SHARE" "$R"
+    printf '\n  %sdebian 13: %s/current/tools/build-image debian (needs mmdebstrap)%s\n' "$D" "$SHARE" "$R"
+    printf '  %smore images: %s/current/tools/build-image NAME%s\n' "$D" "$SHARE" "$R"
     printf '  %sdocs: https://github.com/%s%s\n\n' "$D" "$REPO" "$R"
 }
 

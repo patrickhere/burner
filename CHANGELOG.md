@@ -1,12 +1,33 @@
 # changelog
 
-## unreleased
+## 0.3.0
 
+- `--json` on every command: one JSON document with the same envelope everywhere (`exit`, `ok`, the command's `result`, burner's own lines as `errors` and `warnings`), schema in docs/json.md. `burner run --json` puts only that on stdout and the command's output on stderr. `--json-fd N` on run and shell writes it to fd N and leaves stdout and stderr alone, through sudo `--json-fd 2`. `--status-fd` stays byte for byte what it was
+- one table of exit codes for every command, in the README and in `--help` for run and shell. a run's json says how it went: the outcome, the VM's settings, time queued, booting and in the command, the output and the result tar
+- `burner ls --json` moves under `result` and sizes and times get their units (`mem_mib`, `age_secs`, `started_unix`). burner-tui reads both shapes
+- `burner version`, with `--json`: version, backend, json schema and guest protocol, no config needed
+- a `--json-fd`, `--status-fd` or `--json` stdout that isn't open for writing is a usage error before anything starts, not a json lost at the end
+- the connection log: every connection a VM tried, allowed or blocked and why, and the dns it asked, recorded on the host. on linux nft logs each new connection to a reader running as `burner-parse` with hard limits and a syscall allowlist, on a mac macnet writes down each decision. nothing the guest prints can add, change or hide a row
+- a summary on stderr after every run and shell with a network, `--log full` for every row, `--log none` for nothing. `burner log [ID]` shows the last 32 runs, `--json` has all of it, and the run's json has it as `result.network`
+- a run whose log reader dies is stopped with 125, so nothing goes unrecorded. on a mac a log macnet couldn't write is marked incomplete
+- `burner explain [--net web|open] [--rules]`: what a VM could reach on this host, what it can't and why, and as root whether the loaded filter matches this config
+- `burner doctor --probe` boots a VM per mode that tries the gateway, the host, each lan and route, the tailnet, metadata, other VMs, dns to another server, a name that resolves to this host and ipv6. the host decides each row from its own log, on linux also from counters after the filter
+- the network suite checks dns rebinding (a name that points at a blocked address is blocked like the address), ipv6 (no address or route in a VM, taps drop it), and the log (every blocked target is in it, it can't be forged, it survives hostile dns and floods)
+- a filter loaded by an older burner is reloaded by the reaper, and a new run says to run `burner net up` instead of failing on it
+- the sudoers example lets `burner log` and `burner explain` through
 - remote hosts: `burner -H HOST run`, `shell`, `ls`, `kill`, `images`, `config`, `doctor` and `version` over ssh, as you, with your own keys and ssh config. hosts go in `~/.config/burner/hosts.toml`, each with several addresses tried at once (a LAN one and a tailnet one), or `-H` takes any ssh host. `BURNER_HOST` for a whole shell, `-H local` for here
 - what a remote host sends back is checked here: output escaped, a shell's terminal filtered and reset here, `~.` handled here, a result tar parsed again here, and the exit code from a line only burner there can write. remote failures are 125 with outcome `unreachable`, `remote_error` or `lost`, never ssh's 255
 - `burner -H HOST doctor` checks the way there and shows that host's own doctor. `burner hosts [--check]` lists hosts.toml
 - burner-tui takes `-H HOST` and switches hosts with `h`
 - `tests/remote.sh`: burner -H over ssh to localhost, with a stand-in for the far end or the real burner
+- a debian 13 image next to alpine, `--img debian` or `burner shell debian`, with python3, curl, sudo and gpg (no git). on linux `tools/build-image debian` builds it with mmdebstrap from a pinned snapshot.debian.org timestamp, and the build fails unless every package matches the lock file for that arch. on a mac `burner setup debian` fetches it, checked against the release and the homebrew formula's pin. the release carries it for x86_64 and aarch64, with its package list
+- `burner setup` takes image names, `burner setup alpine debian`. no names is alpine, as before
+- commands in a run use the image's `/bin/sh`: busybox ash on alpine, dash on debian
+- a run ends about a tenth of a second sooner: guest init no longer starts a `cat` for every process when it looks for leftovers after the job
+- guest init mounts `/dev/shm`, falls back to `xterm-256color` when the image has no terminfo entry for your terminal (kitty, ghostty), and checks at build time that an image has every tool it needs
+- `tools/build-image` writes each image's package list next to it, and cleans up without crossing into anything still mounted
+- the test suites run against any image with `BURNER_TEST_IMG`, and github runs them on alpine and debian
+- images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
 
 ## 0.2.1
 

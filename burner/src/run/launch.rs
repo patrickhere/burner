@@ -415,7 +415,7 @@ fn run_vm(
         #[cfg(target_os = "linux")]
         let fix = format!("rebuild it: tools/build-image {}", p.img);
         #[cfg(target_os = "macos")]
-        let fix = "burner setup fetches one that matches";
+        let fix = crate::setup::fix_hint(std::slice::from_ref(&p.img));
         if legacy {
             let msg = format!(
                 "image {} was built with a different guest init, {fix}",

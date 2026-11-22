@@ -47,7 +47,7 @@ tar -c file.zip | sudo burner run --in tar --result tar -- 'unzip -q file.zip -d
 
 exit codes and the rest of what a wrapper needs are under [from scripts and agents](#from-scripts-and-agents).
 
-the image is plain alpine with git and curl, so the first example installs node itself. build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
+the image is plain alpine with git and curl, so the first example installs node itself. there's a debian 13 image too, `--img debian` or `burner shell debian`, for install scripts and `apt install` steps that expect debian. it has python3, curl, sudo and gpg but no git (`apt-get install -y git` with `--net web`). build your own with a package list in `images/NAME/packages` and `tools/build-image NAME`, see [install details](#install-details).
 
 defaults, and the most a run can ask for (`[limits]` in `/etc/burner/config.toml`). an image's `defaults.toml` can change the defaults:
 
@@ -166,6 +166,7 @@ tar -xzf burner-v*-$(uname -m)-linux.tar.gz
 cd burner-v*-$(uname -m)-linux
 sudo ./install.sh                # firecracker, jailer, guest kernel (pinned + checksummed), a user, units
 tools/build-image alpine         # an image to boot, uses sudo, no docker
+tools/build-image debian         # if you want debian too, needs mmdebstrap
 sudo burner doctor
 ```
 
@@ -176,19 +177,24 @@ on a mac, burner runs VMs itself with [libkrun](https://github.com/containers/li
 ```
 brew install burnervm/tap/burner
 burner setup                     # the guest kernel and alpine image homebrew fetched with it
+burner setup debian              # if you want debian too, fetched from the release
 burner doctor
 burner run -- 'uname -m'         # no sudo, VMs run as you
 ```
 
 0.1.x on a mac ran burner inside a lima VM. upgrading to the native formula leaves that VM behind: `limactl delete burnervm` removes it, and `brew uninstall lima` if nothing else uses lima. on windows 11, WSL2 with nested virtualization should work like a linux box (`/dev/kvm` has to exist inside it), but it hasn't been tried yet.
 
-the formula pins the kernel and the image by sha256 in the tap, which isn't the place the files come from, so `burner setup` installs what brew already checked. `burner setup --version v0.2.0` fetches them from a github release instead: the kernel still has to match the sha256 built into burner (the one `install.sh` pins), but the image is only checked against that release's own `SHA256SUMS`. `--from DIR` takes both from anywhere you point it at and skips the kernel pin.
+the formula pins the kernel and the image by sha256 in the tap, which isn't the place the files come from, so `burner setup` installs what brew already checked. `burner setup --version v0.2.0` fetches them from a github release instead: the kernel still has to match the sha256 built into burner (the one `install.sh` pins), but the image is only checked against that release's own `SHA256SUMS`. `--from DIR` takes both from anywhere you point it at and skips the kernel pin. the formula doesn't download the debian image, so a plain `brew install` stays small, but it pins it all the same: `burner setup debian` fetches it from burner's own release and checks it against the release's `SHA256SUMS` and the formula's sha256.
 
 the config, kernel and images live in `~/Library/Application Support/burner`, run state in your per-user temp dir. `--net` works as on linux minus ping and non-dns udp, and the [threat model](#what-it-protects-against) is weaker, see the end of that section. `burner-tui` doesn't know about the mac yet.
 
 or from source, with rust 1.88 or newer: `cargo build --release` in a checkout, then the same `sudo ./install.sh` and on. the crates are on crates.io as `burnervm` and `burnervm-tui` (the commands are still `burner` and `burner-tui`), but `cargo install` alone isn't enough: burner also needs the firecracker, jailer, guest kernel and units that `install.sh` sets up.
 
 an image is `images/NAME/packages`, one alpine package per line. `tools/build-image NAME` takes the alpine minirootfs (pinned + checksummed), installs those packages into it with apk in a chroot and writes `/var/lib/burner/images/NAME/rootfs.ext4`. it builds for the host's arch only. an `images/NAME/Dockerfile` with no packages file next to it still gets built the old way, through docker.
+
+an image with an `images/NAME/base` file is debian instead, like `images/debian`. `base` names the suite and a snapshot.debian.org timestamp (`debian trixie 20261121T000000Z`), and `tools/build-image NAME` builds it with mmdebstrap from that snapshot: debian's Essential set and apt, plus one debian package per line from `packages`. it needs mmdebstrap on the host, `sudo apt install mmdebstrap` on debian and ubuntu or `sudo dnf install mmdebstrap` on fedora. apt checks the snapshot against the keys in `keys.asc` only, and the build fails unless every package and version matches `lock-x86_64` or `lock-aarch64`, so a debian image built anywhere from the same base has the same packages in it. the snapshot moves once per burner release: after bumping `base`, `BURNER_RELOCK=1 tools/build-image NAME` writes the lock for that arch. in a VM, apt uses debian's own mirrors and gets today's packages.
+
+a few things work differently on debian. commands run under the image's `/bin/sh`, which is dash there and busybox ash on alpine, so use `bash -c '...'` when you need bash. an `--in tar` with `../` in a name fails with 125 and `input_error`, since GNU tar refuses it where busybox drops the `../`. what apt installs goes on the scratch disk, so give big installs `--disk 4` or more.
 
 if ufw is on, `burner doctor` prints the one route rule it needs. settings live in `/etc/burner/config.toml`, which starts out empty: put only what you change there. `burner config` shows every setting with the defaults filled in.
 
@@ -314,11 +320,11 @@ it only ever runs `burner` (or `$BURNER`), through sudo when you're not root, so
 
 ## tests
 
-`tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on, by address and by a name pointing at them, ipv6, and the connection log: that it has every blocked target, can't be forged, survives hostile dns and floods, and stops the VM when its reader dies). both need a box with burner installed and an alpine image, and run as root through sudo.
+`tests/isolation.sh` (memory and fork bombs, disk and console floods, a hostile result tar, time limits, slots, argument fuzzing) and `tests/network.sh` (what a VM can and can't reach, with targets found on the host it runs on, by address and by a name pointing at them, ipv6, and the connection log: that it has every blocked target, can't be forged, survives hostile dns and floods, and stops the VM when its reader dies). both boot the alpine image, or the one in `BURNER_TEST_IMG` (`sudo env BURNER_TEST_IMG=debian bash tests/isolation.sh`), need a box with burner installed and that image built, and run as root through sudo.
 
-`tests/remote.sh` tests `burner -H` over ssh to a private sshd on localhost, all of it in a temp dir. `--fake-only` puts a stand-in burner on the far end (hostile records, escapes, tars, a shell that hangs) and runs anywhere, a mac included; without it the real burner runs there too. run it as yourself, not root.
+`tests/remote.sh` tests `burner -H` over ssh to a private sshd on localhost, all of it in a temp dir. `--fake-only` puts a stand-in burner on the far end (hostile records, escapes, tars, a shell that hangs) and runs anywhere, a mac included; without it the real burner runs there too, booting alpine. run it as yourself, not root.
 
-both VM suites run on github's kvm runners on every push to main, and on a dedicated box with a LAN and vpns.
+both VM suites run on github's kvm runners on every push to main, once on alpine and once on debian, and on a dedicated box with a LAN and vpns.
 
 ## license
 

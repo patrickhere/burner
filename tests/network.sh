@@ -2,6 +2,8 @@
 # network tests: what a VM can reach. run as a sudoer, after burner net up. prints PASS/FAIL per test.
 set -u
 cd /tmp || exit 1
+# the image every VM here boots: BURNER_TEST_IMG=debian sudo -E bash tests/network.sh
+IMG=${BURNER_TEST_IMG:-alpine}
 T=$(mktemp -d /tmp/burner-net-XXXX)
 trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
@@ -63,8 +65,8 @@ probes=""; blocked=(); targets=(); rebinds=()
 # address; a resolver that refuses those makes the check moot, not passed
 rebind() {  # name ip port
     local host="${2//./-}.sslip.io"
-    probes+="p resolves-$1 \"nslookup $host | grep -qx 'Address: $2'\""$'\n'
-    probes+="p rebind-$1 \"nc -z -w 4 $host $3\""$'\n'
+    probes+="p resolves-$1 \"nslookup $host | grep -qE '^Address( [0-9]+)?: $2( |\\\$)'\""$'\n'
+    probes+="p rebind-$1 \"tcp $host $3\""$'\n'
     rebinds+=("$1 $2 $3 $host")
 }
 for c in "${candidates[@]}"; do
@@ -73,7 +75,7 @@ for c in "${candidates[@]}"; do
     reach "$ip" "$port" || continue
     seen[$ip]=1
     name="$kind-$ip-$port"
-    probes+="p $name \"nc -z -w 4 $ip $port\""$'\n'
+    probes+="p $name \"tcp $ip $port\""$'\n'
     blocked+=("$name")
     targets+=("$ip $port")
     k=${kind%%-*}
@@ -90,11 +92,34 @@ echo "      ${#blocked[@]} host-side targets the host can reach"
 # a name nobody else asks for, to find byte for byte in the log
 capture="burner-$RANDOM$RANDOM.example.com"
 
+# the tools the probes use, in any image: what the image lacks comes from its
+# busybox if that has it, and tcp HOST PORT is a tcp connect with nc -z, or
+# with bash where nc has no -z (debian's busybox). udp HOST PORT sends stdin
+# as one datagram the same way, nc -u or bash. a tool that's still missing
+# stays missing, and the probe that needs it says MISSING
+PRE='
+mkdir -p /tmp/probe-bin; PATH=/tmp/probe-bin:$PATH
+for t in nc nslookup arping; do
+    command -v $t >/dev/null || ! busybox --list 2>/dev/null | grep -qx $t || ln -s "$(command -v busybox)" /tmp/probe-bin/$t
+done
+if command -v nc >/dev/null && ! nc -z -w 1 127.0.0.1 9 2>&1 | grep -qiE "usage|invalid option|unrecognized option"; then
+    printf "#!/bin/sh\nexec nc -z -w 4 \"\$1\" \"\$2\"\n" > /tmp/probe-bin/tcp
+elif [ -x /bin/bash ]; then
+    printf "#!/bin/bash\nexec 3<>\"/dev/tcp/\$1/\$2\"\n" > /tmp/probe-bin/tcp
+fi
+if command -v nc >/dev/null && ! nc -u -w 1 127.0.0.1 9 </dev/null 2>&1 | grep -qiE "usage|invalid option|unrecognized option"; then
+    printf "#!/bin/sh\nexec nc -u -w 1 \"\$1\" \"\$2\"\n" > /tmp/probe-bin/udp
+elif [ -x /bin/bash ]; then
+    printf "#!/bin/bash\nexec cat > \"/dev/udp/\$1/\$2\"\n" > /tmp/probe-bin/udp
+fi
+for t in tcp udp; do [ -f /tmp/probe-bin/$t ] && chmod 755 /tmp/probe-bin/$t; done
+'
+
 # probes run inside the VM; each prints OPEN or BLOCKED, or MISSING when the
 # image lacks its tool and BROKEN when the tool refused its arguments, so a
 # probe that couldn't run never reads as blocked
 # all probes at once: most of them are blocked and would each wait out their timeout
-PROBES='
+PROBES="$PRE"'
 n=0
 p() { n=$((n + 1)); (
     if ! command -v timeout >/dev/null || ! command -v grep >/dev/null || ! command -v "${2%% *}" >/dev/null; then echo "MISSING $1"
@@ -102,12 +127,12 @@ p() { n=$((n + 1)); (
     elif grep -qiE "usage:|invalid option|unrecognized option|illegal option|applet not found" /tmp/probe-out.$n; then echo "BROKEN $1"
     else echo "BLOCKED $1"; fi ) > /tmp/probe.$n & }
 '"$probes"'
-p tap-host-side      "nc -z -w 4 172.29.217.1 22"
-p metadata           "nc -z -w 4 169.254.169.254 80"
-p other-vm           "nc -z -w 4 172.29.217.2 22"
+p tap-host-side      "tcp 172.29.217.1 22"
+p metadata           "tcp 169.254.169.254 80"
+p other-vm           "tcp 172.29.217.2 22"
 p dns-other-resolver "nslookup github.com 8.8.8.8"
-p smtp-out           "nc -z -w 4 gmail-smtp-in.l.google.com 25"
-p ssh-out            "nc -z -w 4 github.com 22"
+p smtp-out           "tcp gmail-smtp-in.l.google.com 25"
+p ssh-out            "tcp github.com 22"
 p dns                "nslookup github.com"
 p ping-internet      "ping -c1 -W3 1.1.1.1"
 p https-github       "curl -sfS -m 10 -o /dev/null https://github.com"
@@ -126,14 +151,30 @@ expect() {  # file name OPEN|BLOCKED
     if grep -qx "$3 $2" "$1"; then ok "$4: $2 $3"; else bad "$4: $2" "got $(grep " $2\$" "$1" | cut -d' ' -f1)"; fi
 }
 
-# a second VM sits at 172.29.217.2 (it starts first) so other-vm is a real target
-( sudo burner run --net web --ttl 8m --tag peer -- 'nc -lk -p 22 >/dev/null 2>&1 & sleep 400' </dev/null >/dev/null 2>&1 ) &
-sleep 6
+# a second VM sits at 172.29.217.2 (it starts first) so other-vm is a real
+# target. it says PEER-READY with its address once its own listener takes a
+# connection, and other-vm only counts as blocked after that, while it's
+# still up
+( sudo burner run --img "$IMG" --net web --ttl 8m --tag peer -- "$PRE"'(while :; do nc -l -p 22 </dev/null >/dev/null 2>&1; done) &
+up=""; for i in $(seq 20); do tcp 127.0.0.1 22 2>/dev/null && { up=1; break; }; sleep 0.5; done
+[ -n "$up" ] && echo "PEER-READY $(ip -4 -o addr show dev eth0 | awk "{print \$4}")"
+sleep 400' </dev/null > "$T/peer.out" 2>&1 ) &
+peer=no
+for _ in $(seq 60); do grep -q '^PEER-READY 172\.29\.217\.2/' "$T/peer.out" 2>/dev/null && { peer=yes; break; }; sleep 1; done
+# other-vm in mode $2's results $1, only with the peer listening
+peer_check() {
+    if [ "$peer" = yes ] && sudo burner ls | grep -q ' peer '; then
+        expect "$1" other-vm BLOCKED "$2"
+    else
+        bad "$2: other-vm" "the peer VM wasn't up and listening at 172.29.217.2: $(tr '\n' ' ' < "$T/peer.out" | head -c 200)"
+    fi
+}
 
-sudo burner run --net web --json-fd 2 -- "$PROBES" </dev/null > "$T/web.txt" 2> "$T/web.err"
-for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ssh-out ipv6-global ipv6-route ipv6-link; do
+sudo burner run --img "$IMG" --net web --json-fd 2 -- "$PROBES" </dev/null > "$T/web.txt" 2> "$T/web.err"
+for t in "${blocked[@]}" tap-host-side metadata dns-other-resolver smtp-out ssh-out ipv6-global ipv6-route ipv6-link; do
     expect "$T/web.txt" "$t" BLOCKED web
 done
+peer_check "$T/web.txt" web
 rebind_expect() {  # file mode
     for r in "${rebinds[@]}"; do
         read -r k _ _ host <<< "$r"
@@ -150,10 +191,11 @@ web_open="dns https-github https-pypi https-npm https-crates"
 if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then web_open+=" ping-internet"; else echo "SKIP  web: ping-internet  (the host can't ping out either)"; fi
 for t in $web_open; do expect "$T/web.txt" "$t" OPEN web; done
 
-sudo burner run --net open -- "$PROBES" </dev/null > "$T/open.txt" 2>&1
-for t in "${blocked[@]}" tap-host-side metadata other-vm dns-other-resolver smtp-out ipv6-global ipv6-route ipv6-link; do
+sudo burner run --img "$IMG" --net open -- "$PROBES" </dev/null > "$T/open.txt" 2>&1
+for t in "${blocked[@]}" tap-host-side metadata dns-other-resolver smtp-out ipv6-global ipv6-route ipv6-link; do
     expect "$T/open.txt" "$t" BLOCKED open
 done
+peer_check "$T/open.txt" open
 rebind_expect "$T/open.txt" open
 for t in ssh-out https-github dns; do expect "$T/open.txt" "$t" OPEN open; done
 pv=$(sudo burner ls | awk '/ peer /{print $1}'); [ -n "$pv" ] && sudo burner kill "$pv" >/dev/null; wait 2>/dev/null
@@ -205,7 +247,7 @@ check $? "summary: on stderr, last before the json" "$last"
 # a real connection. the reader survives the hostile dns and logs what follows
 loop_dns='\000\001\001\000\000\001\000\000\000\000\000\000\300\014\000\001\000\001'
 fake='{"k":"conn","proto":"tcp","sport":1,"dst":"6.6.6.6","port":443,"verdict":"allowed","reason":null}'
-sudo burner run --net web --json-fd 2 -- "echo '$fake'; echo '$fake' >&2; echo 'burner: net web: 0 connections out, 0 blocked, 0 dns lookups (burner log burner-000000000000 for all of it)' >&2; printf 'garbage%.0s' 1 2 3 | nc -u -w 1 9.9.9.9 53; printf '$loop_dns' | nc -u -w 1 9.9.9.9 53; curl -s -o /dev/null https://github.com; echo done" </dev/null > "$T/forge.txt" 2> "$T/forge.err"; rc=$?
+sudo burner run --img "$IMG" --net web --json-fd 2 -- "$PRE""echo '$fake'; echo '$fake' >&2; echo 'burner: net web: 0 connections out, 0 blocked, 0 dns lookups (burner log burner-000000000000 for all of it)' >&2; printf 'garbage%.0s' 1 2 3 | udp 9.9.9.9 53; printf '$loop_dns' | udp 9.9.9.9 53; curl -s -o /dev/null https://github.com; echo done" </dev/null > "$T/forge.txt" 2> "$T/forge.err"; rc=$?
 id=$(run_id "$T/forge.err")
 sudo burner log "$id" --json > "$T/forge.log" 2>/dev/null
 ! logq "$T/forge.log" dst=6.6.6.6 && grep -q "^burner: net web: 1 connection out.*burner log $id " "$T/forge.err"
@@ -215,7 +257,7 @@ check $? "log: hostile dns is logged as malformed, the reader lives on" "rc=$rc 
 
 # a flood of blocked attempts: past the itemization limit they're counted,
 # not listed, and the allowed connection after it is still there
-sudo burner run --net web --ttl 3m --json-fd 2 -- 'for b in $(seq 0 7); do for i in $(seq 1 200); do nc -z -w 1 10.254.$b.$i 80 & done; wait; done 2>/dev/null; curl -s -o /dev/null https://github.com; echo done' </dev/null > "$T/flood.txt" 2> "$T/flood.err"
+sudo burner run --img "$IMG" --net web --ttl 3m --json-fd 2 -- "$PRE"'for b in $(seq 0 7); do for i in $(seq 1 200); do timeout 1 tcp 10.254.$b.$i 80 & done; wait; done 2>/dev/null; curl -s -o /dev/null https://github.com; echo done' </dev/null > "$T/flood.txt" 2> "$T/flood.err"
 id=$(run_id "$T/flood.err")
 sudo burner log "$id" --json > "$T/flood.log" 2>/dev/null
 ni=$(logf "$T/flood.log" not_itemized 2>/dev/null)
@@ -224,7 +266,7 @@ logq "$T/flood.log" verdict=allowed port=443 && [ "${ni:-0}" -gt 0 ] && [ "$(log
 check $? "log: a flood of 1600 blocked attempts is counted ($ni not listed), the allowed one after it is listed, log ${size}B" "ni=$ni size=$size complete=$(logf "$T/flood.log" complete 2>/dev/null)"
 
 # the reader going away under a running VM stops the VM: nothing unrecorded
-( sudo burner run --net web --ttl 2m -- 'sleep 60' </dev/null > "$T/death.txt" 2>&1; echo "rc=$?" >> "$T/death.txt" ) &
+( sudo burner run --img "$IMG" --net web --ttl 2m -- 'sleep 60' </dev/null > "$T/death.txt" 2>&1; echo "rc=$?" >> "$T/death.txt" ) &
 dp=$!
 for _ in $(seq 30); do pgrep -u burner-parse -f -- __read-netlog >/dev/null && break; sleep 1; done
 sudo pkill -u burner-parse -f -- __read-netlog
@@ -235,7 +277,7 @@ check $? "log: a dead reader stops its VM (125)" "$(tr '\n' ' ' < "$T/death.txt"
 # the same while the VM is still starting: the reader killed as soon as it
 # shows up, before or after it said it's ready. the run never goes on
 # without it, it ends 125 either way
-( sudo burner run --net web --ttl 2m -- 'echo RAN; sleep 30' </dev/null > "$T/early.txt" 2>&1; echo "rc=$?" >> "$T/early.txt" ) &
+( sudo burner run --img "$IMG" --net web --ttl 2m -- 'echo RAN; sleep 30' </dev/null > "$T/early.txt" 2>&1; echo "rc=$?" >> "$T/early.txt" ) &
 ep=$!
 for _ in $(seq 600); do sudo pkill -u burner-parse -f -- __read-netlog && break; sleep 0.05; done
 wait "$ep"
@@ -243,10 +285,10 @@ grep -qx 'rc=125' "$T/early.txt" && grep -qE "network log reader (stopped|didn't
 check $? "log: a reader killed while its VM starts ends the run (125)" "$(tr '\n' ' ' < "$T/early.txt")"
 
 # the summary leaves stdout alone, and --log none says nothing
-sudo burner run --net web --result tar -- 'echo hi > /out/a; nslookup github.com >/dev/null' </dev/null > "$T/res.tar" 2> "$T/res.err"
+sudo burner run --img "$IMG" --net web --result tar -- "$PRE"'echo hi > /out/a; nslookup github.com >/dev/null' </dev/null > "$T/res.tar" 2> "$T/res.err"
 tar -tf "$T/res.tar" | grep -qx out/a && grep -q '^burner: net web: ' "$T/res.err"
 check $? "summary: --result tar is still a tar, the summary on stderr" "$(tail -n 3 "$T/res.err" | tr '\n' ' ')"
-out=$(sudo burner run --net web --log none -- 'nslookup github.com >/dev/null; echo ok' </dev/null 2>&1)
+out=$(sudo burner run --img "$IMG" --net web --log none -- "$PRE"'nslookup github.com >/dev/null; echo ok' </dev/null 2>&1)
 [ "$out" = ok ] && ok "summary: --log none prints nothing of the log" || bad "summary: --log none" "$out"
 
 # explain names every target the suite found, or the range it's in, as blocked
@@ -292,7 +334,7 @@ sudo nft list tables | grep -q burner_probe
 sudo burner config | sed 's|^block = \[\]|block = ["not-an-address"]|' | sudo tee /etc/burner/broken-block.toml >/dev/null
 sudo systemctl stop burner-reap.timer
 sudo burner reap
-( sudo burner run --net web --log none --ttl 90s -- 'curl -s -o /var/tmp/d "https://speed.cloudflare.com/__down?bytes=90000000" & for i in $(seq 20); do sleep 2; wc -c < /var/tmp/d; done' </dev/null > "$T/fc.txt" 2>&1 ) &
+( sudo burner run --img "$IMG" --net web --log none --ttl 90s -- 'curl -s -o /var/tmp/d "https://speed.cloudflare.com/__down?bytes=90000000" & for i in $(seq 20); do sleep 2; wc -c < /var/tmp/d; done' </dev/null > "$T/fc.txt" 2>&1 ) &
 fc=$!
 sleep 12
 emptied=no
@@ -308,7 +350,7 @@ sudo systemctl start burner-reap.timer
 # 20 samples, 2s apart: growing before, flat for the last 10 (from ~5s after the flush)
 grew=$(head -n 5 "$T/fc.txt" | sort -un | wc -l)
 flat=$(tail -n 10 "$T/fc.txt" | sort -u | wc -l)
-after=$(sudo burner run --net web --log none -- 'nslookup github.com >/dev/null 2>&1 && echo ok' </dev/null 2>&1)
+after=$(sudo burner run --img "$IMG" --net web --log none -- "$PRE"'nslookup github.com >/dev/null 2>&1 && echo ok' </dev/null 2>&1)
 [ "$emptied" = yes ] && [ "$grew" -ge 3 ] && [ "$flat" = 1 ] && [ "$after" = ok ] \
   && ok "failed refresh: open connection cut, network back after the next good pass" \
   || bad "fail closed" "emptied=$emptied grew=$grew flat=$flat after=$after samples=$(tr '\n' ' ' < "$T/fc.txt")"
@@ -316,21 +358,30 @@ after=$(sudo burner run --net web --log none -- 'nslookup github.com >/dev/null 
 # spoofing: a VM that takes another address gets nothing through. nc has to
 # get out from the real address first and the new address has to take, so a
 # missing tool or a VM with no network can't read as held
-out=$(sudo burner run --net open --log none -- 'for t in ip nc; do command -v $t >/dev/null || { echo "MISSING $t"; exit 0; }; done; nc -z -w 4 1.1.1.1 443 || { echo "NO BASELINE"; exit 0; }; ip addr flush dev eth0 && ip addr add 172.29.217.6/30 dev eth0 || { echo "SPOOF FAILED"; exit 0; }; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; ip route show default | grep -q . || { echo "NO ROUTE"; exit 0; }; if nc -z -w 4 1.1.1.1 443; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
+out=$(sudo burner run --img "$IMG" --net open --log none -- "$PRE"'for t in ip tcp timeout; do command -v $t >/dev/null || { echo "MISSING $t"; exit 0; }; done; timeout 6 tcp 1.1.1.1 443 2>/dev/null || { echo "NO BASELINE"; exit 0; }; ip addr flush dev eth0 && ip addr add 172.29.217.6/30 dev eth0 || { echo "SPOOF FAILED"; exit 0; }; ip route add default via 172.29.217.5 2>/dev/null; ip route add default via 172.29.217.1 dev eth0 onlink 2>/dev/null; ip route show default | grep -q . || { echo "NO ROUTE"; exit 0; }; if timeout 6 tcp 1.1.1.1 443 2>/dev/null; then echo LEAK; else echo HELD; fi' </dev/null 2>&1)
 [ "$out" = HELD ] && ok "spoofed source address dropped" || bad "spoofing" "$out"
 
 # none: no network interface at all
-out=$(sudo burner run -- 'ls /sys/class/net | tr "\n" " "' </dev/null)
+out=$(sudo burner run --img "$IMG" -- 'ls /sys/class/net | tr "\n" " "' </dev/null)
 [ "$out" = "lo " ] && ok "--net none: only lo" || bad "--net none" "$out"
 
 # bandwidth: ~2.5 MB/s each way. best of two, since one slow transfer over the
 # internet says nothing about the cap, and the cap is checked on the best one
 best() { tr ' ' '\n' | sort -g | tail -n 1; }
-down=$(sudo burner run --net web --ttl 180s -- 'for i in 1 2; do curl -s -m 60 -o /dev/null -w "%{speed_download} " "https://speed.cloudflare.com/__down?bytes=25000000"; done' </dev/null | best)
-up=$(sudo burner run --net web --ttl 180s -- 'head -c 15000000 /dev/zero > /var/tmp/u; for i in 1 2; do curl -s -m 60 -o /dev/null -w "%{speed_upload} " -X POST --data-binary @/var/tmp/u https://speed.cloudflare.com/__up; done' </dev/null | best)
+down=$(sudo burner run --img "$IMG" --net web --ttl 180s -- 'for i in 1 2; do curl -s -m 60 -o /dev/null -w "%{speed_download} " "https://speed.cloudflare.com/__down?bytes=25000000"; done' </dev/null | best)
+up=$(sudo burner run --img "$IMG" --net web --ttl 180s -- 'head -c 15000000 /dev/zero > /var/tmp/u; for i in 1 2; do curl -s -m 60 -o /dev/null -w "%{speed_upload} " -X POST --data-binary @/var/tmp/u https://speed.cloudflare.com/__up; done' </dev/null | best)
 awk -v d="$down" -v u="$up" 'BEGIN{exit !(d > 500000 && d < 3300000 && u > 300000 && u < 5000000)}' \
   && ok "rate limited both ways: down $(awk -v d="$down" 'BEGIN{printf "%.1f", d/1e6}') MB/s, up $(awk -v u="$up" 'BEGIN{printf "%.1f", u/1e6}') MB/s" \
   || bad "rate limits" "down=$down up=$up"
+
+# debian: apt-get update, the thing people use it for, works with --net web
+# and fails with --net none, where it would otherwise only warn
+if [ "$IMG" = debian ]; then
+    w=$(sudo burner run --img "$IMG" --net web --ttl 300s -- 'apt-get update -qq --error-on=any >/dev/null 2>&1; echo $?' </dev/null 2>&1)
+    n=$(sudo burner run --img "$IMG" --ttl 120s -- 'timeout 60 apt-get update -qq --error-on=any >/dev/null 2>&1; echo $?' </dev/null 2>&1)
+    [ "$w" = 0 ] && [ "$n" = 100 ] && ok "apt-get update works with --net web, fails with --net none" \
+      || bad "apt-get update" "web=$w none=$n"
+fi
 
 # cleanup: no taps, set elements or state left
 sleep 1

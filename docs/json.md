@@ -168,9 +168,9 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 {"notes":["..."]}
 {"stopped_vms":0}
 
-// setup (mac): source is brew, release or from
+// setup (mac): source is brew, release or from. images in the order they were named
 {"source":"release","from":"https://github.com/patrickhere/burner/releases/download/v0.3.0","kernel_pinned":true,
- "kernel":".../kernel/vmlinux","image":".../images/alpine/rootfs.ext4"}
+ "kernel":".../kernel/vmlinux","images":[".../images/alpine/rootfs.ext4",".../images/debian/rootfs.ext4"]}
 
 // version: needs no config
 {"version":"0.3.0","schema":1,"guest_proto":1,"backend":"firecracker","os":"linux","arch":"x86_64"}

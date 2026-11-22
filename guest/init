@@ -4,6 +4,31 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# tools/build-image runs this in the image's chroot before it writes the
+# image: what this init needs and the image doesn't have, so an image that
+# would boot and then fail says so at build time. never as pid 1, and it
+# only prints
+if [ "${1:-}" = selftest ] && [ "$$" != 1 ]; then
+    missing=""
+    for t in mount umount pivot_root setsid stty tar dd tee od head tail wc sed grep tr cat mkdir rm sleep; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    # set is a special builtin: an option the shell doesn't know ends it
+    # shellcheck disable=SC3040
+    (set -o pipefail) 2>/dev/null || missing="$missing pipefail(/bin/sh)"
+    command -v unshare >/dev/null 2>&1 \
+        || echo "selftest: no unshare, so poweroff -f in a run or a shell stops the whole VM"
+    command -v busybox >/dev/null 2>&1 || command -v reboot >/dev/null 2>&1 \
+        || echo "selftest: no busybox or reboot, so every VM takes 3s longer to stop"
+    command -v blockdev >/dev/null 2>&1 \
+        || echo "selftest: no blockdev, so burner shell doesn't follow terminal resizes"
+    if [ -n "$missing" ]; then
+        echo "selftest: guest init needs these and the image doesn't have them:$missing"
+        exit 1
+    fi
+    exit 0
+fi
+
 halt() {
     sync
     if command -v busybox >/dev/null 2>&1; then busybox reboot -f; fi
@@ -103,8 +128,10 @@ mount -t devtmpfs dev /dev 2>/dev/null
 exec < /dev/console > /dev/console 2>&1
 mkdir -p /dev/pts /tmp /run; mount -t devpts devpts /dev/pts 2>/dev/null
 mount -t tmpfs -o mode=1777 tmpfs /tmp 2>/dev/null
+# shared memory for python's multiprocessing and anything else on sem_open
+mkdir -p /dev/shm; mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
 umount -l /rom 2>/dev/null
-hostname burner 2>/dev/null
+hostname burner 2>/dev/null || echo burner > /proc/sys/kernel/hostname
 dns=$(sed -n 's/.*burner\.dns=\([0-9.,]*\).*/\1/p' /proc/cmdline)
 if [ -n "$dns" ]; then
     rm -f /etc/resolv.conf
@@ -139,7 +166,17 @@ if grep -q 'burner\.shell=1' /proc/cmdline; then
     ) &
     sizer=$!
     term=$(sed -n 's/.*burner\.term=\([a-z0-9.+-]*\).*/\1/p' /proc/cmdline)
-    export TERM="${term:-xterm}" HOME=/root
+    term=${term:-xterm}
+    # bash's readline and less look TERM up in terminfo. a terminal the image
+    # has no entry for (kitty, ghostty) gets xterm-256color, if it has that
+    ti() {
+        for d in /etc/terminfo /lib/terminfo /usr/share/terminfo; do
+            [ -e "$d/$(printf %.1s "$1")/$1" ] && return 0
+        done
+        return 1
+    }
+    ti "$term" || ! ti xterm-256color || term=xterm-256color
+    export TERM="$term" HOME=/root
     cd /root 2>/dev/null || cd /
     sh=/bin/sh; [ -x /bin/bash ] && sh=/bin/bash
     # shellcheck disable=SC1091
@@ -211,8 +248,10 @@ stty -opost 2>/dev/null
 # job, proto) in result/fail, $2 why. a burner from before result/fail
 # takes the 125 in rc for the command's exit code, as it always did
 fail() {
-    echo "BURNER-$token-BEGIN"; echo "burner: $2"; echo "BURNER-$token-END"
-    echo "burner: $2" > /result/log.txt
+    # printf, not echo: $2 can carry names from the caller's tar, and some
+    # shells' echo (dash's) acts on backslashes in them
+    echo "BURNER-$token-BEGIN"; printf 'burner: %s\n' "$2"; echo "BURNER-$token-END"
+    printf 'burner: %s\n' "$2" > /result/log.txt
     echo "$1" > /result/fail
     echo 125 > /result/rc
 }
@@ -222,7 +261,8 @@ fail() {
 # any failure goes in /result/error, which fails the run. the job's output is
 # still drained so the job itself never gets SIGPIPE
 capture() {
-    # busybox ash has pipefail, plain posix sh doesn't. this only runs on busybox
+    # busybox ash and debian's dash have pipefail, plain posix sh doesn't.
+    # the selftest checks the image's /bin/sh has it
     # shellcheck disable=SC3040
     set -o pipefail
     # one byte at a time so it streams as the job writes, and stops at exactly 64K
@@ -246,29 +286,45 @@ capture() {
     echo "$total $n" > /result/total
 }
 
-# the session id of a pid, from /proc/PID/stat. comm can hold spaces and ")",
-# so everything up to the last ") " goes first
+# the session id of pid $1 in $s, from /proc/PID/stat. comm is the
+# process's own to set and can hold spaces, ")", globs and newlines, so
+# only what follows the last ")" counts, split with globbing off. read, not
+# a cat per process: strays looks at every process, and an exec each cost a
+# debian image a quarter second per run. read gets only the first line, so
+# a name with a newline cuts the fields short. a line that doesn't look
+# like a whole stat line gives "?", a stray, never init's own session
 sid() {
-    st=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
-    st=${st##*) }
+    s="?"
+    read -r st 2>/dev/null < "/proc/$1/stat" || return 1
+    case $st in *")"*) ;; *) return 0 ;; esac
+    st=${st##*)}
+    set -f
     # shellcheck disable=SC2086
     set -- $st
-    echo "$4"
+    set +f
+    [ $# -ge 40 ] || return 0
+    case $1 in [A-Za-z]) ;; *) return 0 ;; esac
+    case $2$3$4 in ''|*[!0-9-]*) return 0 ;; esac
+    s=$4
 }
 
 # something the job left running in the background (a server, a daemon) still
 # holds the output pipe, so capture would wait for it until the time limit.
 # once the job has exited, everything outside init's own session goes. a few
-# rounds, since a stray can fork while this looks
+# rounds, since a stray can fork while this looks, and none after a round
+# that found nothing
 strays() {
-    me=$(sid 1)
+    sid 1; me=$s
     for _ in 1 2 3; do
+        found=""
         for d in /proc/[0-9]*; do
             p=${d#/proc/}
-            s=$(sid "$p") || continue
-            # 0 is the kernel's own threads
-            [ "$s" = "$me" ] || [ "$s" = 0 ] || kill -KILL "$p" 2>/dev/null
+            sid "$p" || continue
+            # 0 is the kernel's own threads. "?" is never anyone's session
+            { [ "$s" != "?" ] && { [ "$s" = "$me" ] || [ "$s" = 0 ]; }; } \
+                || { kill -KILL "$p" 2>/dev/null; found=1; }
         done
+        [ -n "$found" ] || break
     done
 }
 

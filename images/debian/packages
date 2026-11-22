@@ -1,0 +1,16 @@
+# one debian package per line, on top of debian's Essential set and apt
+mount               # not Essential, guest init needs mount and umount
+mawk                # awk, Required but not Essential
+busybox             # only for poweroff, halt and reboot
+netbase             # /etc/services, /etc/protocols
+procps              # ps, top, kill, free
+less
+ca-certificates
+curl
+iproute2            # ip
+iputils-ping        # ping
+xz-utils
+debian-archive-keyring  # what apt in a VM checks debian's mirrors against
+sudo                # install scripts call it even as root
+gpg                 # install scripts that add an apt key (gpg --dearmor)
+python3

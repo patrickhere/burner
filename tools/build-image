@@ -1,7 +1,9 @@
 #!/bin/bash
 # build <root>/images/NAME/rootfs.ext4 from images/NAME/packages and guest/init.
 # root is $BURNER_ROOT, default /var/lib/burner. needs sudo and curl, no docker.
-# images/NAME/Dockerfile still works (with docker) when there's no packages file.
+# with images/NAME/base the image is debian, built with mmdebstrap from a
+# pinned snapshot. images/NAME/Dockerfile still works (with docker) when
+# there's no packages file.
 set -euo pipefail
 name="${1:?usage: build-image NAME}"
 [[ "$name" =~ ^[a-z0-9-]{1,32}$ ]] || { echo "bad image name" >&2; exit 2; }
@@ -13,12 +15,26 @@ img="$src/images/$name"
 # release's latest-releases.yaml and its gpg signature, key 0482D84022F52DF1C4E7CD43293ACD0907D9495A
 alpine=3.24.4
 case "$(uname -m)" in
-    x86_64) arch=x86_64 sum=cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012 ;;
-    aarch64) arch=aarch64 sum=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de ;;
+    x86_64) arch=x86_64 darch=amd64 sum=cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012 ;;
+    aarch64) arch=aarch64 darch=arm64 sum=4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de ;;
     *) echo "images build on x86_64 or aarch64 only, for the same arch as this host" >&2; exit 2 ;;
 esac
 
-if [ -f "$img/packages" ]; then
+if [ -f "$img/base" ]; then
+    # one line: debian SUITE SNAPSHOT, like debian trixie 20261121T000000Z
+    read -r base suite stamp _ <<< "$(grep -v '^#' "$img/base")"
+    [ "$base" = debian ] || { echo "$img/base: the only base build-image knows is debian" >&2; exit 2; }
+    [[ "$suite" =~ ^[a-z]+$ ]] || { echo "$img/base: bad suite $suite" >&2; exit 2; }
+    [[ "$stamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo "$img/base: bad snapshot $stamp, it looks like 20261121T000000Z" >&2; exit 2; }
+    for f in packages keys.asc; do
+        [ -f "$img/$f" ] || { echo "no $f for $name" >&2; exit 2; }
+    done
+    command -v mmdebstrap >/dev/null || {
+        echo "debian images are built with mmdebstrap: sudo apt install mmdebstrap (debian, ubuntu) or sudo dnf install mmdebstrap (fedora)" >&2
+        exit 2
+    }
+    mode=debian
+elif [ -f "$img/packages" ]; then
     mode=packages
 elif [ -f "$img/Dockerfile" ]; then
     mode=docker
@@ -29,15 +45,17 @@ fi
 
 work=$(mktemp -d /tmp/burner-build-XXXX)
 cleanup() {
-    sudo rm -rf "$work"
+    # a build killed halfway may leave something mounted in there. the
+    # chroot steps run in their own mount namespace, so this is only in case
+    sudo rm -rf --one-file-system "$work"
     if [ "$mode" = docker ]; then docker rm -f "burner-build-$name" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 r="$work/root"
 mkdir "$r"
 
-if [ "$mode" = packages ]; then
-    pkgs=()
+pkgs=()
+if [ "$mode" != docker ]; then
     while read -r line; do
         read -ra words <<< "${line%%#*}"
         for p in ${words[@]+"${words[@]}"}; do
@@ -45,7 +63,87 @@ if [ "$mode" = packages ]; then
             pkgs+=("$p")
         done
     done < "$img/packages"
+fi
 
+if [ "$mode" = debian ]; then
+    snap=https://snapshot.debian.org/archive
+    epoch=$(date -u -d "${stamp:0:4}-${stamp:4:2}-${stamp:6:2}T${stamp:9:2}:${stamp:11:2}:${stamp:13:2}Z" +%s)
+    # apt checks the snapshot's signatures against these keys only, not the host's
+    mkdir "$work/keys"
+    cp "$img/keys.asc" "$work/keys/burner-$name.asc"
+    opts=(
+        # a pinned snapshot's Release files are past their Valid-Until. the
+        # signature is still checked, and an older one fails the lock below
+        --aptopt='Acquire::Check-Valid-Until "false"'
+        --aptopt='Acquire::Retries "3"'
+        --aptopt='APT::Install-Recommends "false"'
+        # these stay in the image, so what apt installs in a VM stays small too
+        --dpkgopt='path-exclude=/usr/share/man/*'
+        --dpkgopt='path-exclude=/usr/share/info/*'
+        --dpkgopt='path-exclude=/usr/share/locale/*'
+        --dpkgopt='path-include=/usr/share/locale/locale.alias'
+        --dpkgopt='path-exclude=/usr/share/doc/*'
+        --dpkgopt='path-include=/usr/share/doc/*/copyright'
+        --dpkgopt='path-exclude=/usr/share/lintian/*'
+    )
+    [ ${#pkgs[@]} -gt 0 ] && opts+=(--include="$(IFS=,; echo "${pkgs[*]}")")
+    # root mode, in a mount and pid namespace of its own: what mmdebstrap
+    # mounts in the tree and anything a package script leaves running go
+    # away with it
+    sudo unshare --mount --pid --fork --propagation private \
+        env SOURCE_DATE_EPOCH="$epoch" mmdebstrap --quiet --mode=root --variant=apt \
+        --architectures="$darch" --keyring="$work/keys" "${opts[@]}" \
+        "$suite" "$r" \
+        "deb $snap/debian/$stamp $suite main" \
+        "deb $snap/debian/$stamp $suite-updates main" \
+        "deb $snap/debian-security/$stamp $suite-security main"
+
+    # the packages and versions have to be the ones in the lock, so a build
+    # from the same base gets the same packages anywhere
+    dpkg-query --admindir="$r/var/lib/dpkg" -W -f '${db:Status-Status} ${Package} ${Version}\n' \
+        | awk '$1 == "installed" { print $2, $3 }' | LC_ALL=C sort > "$work/packages"
+    lock="$img/lock-$arch"
+    if [ "${BURNER_RELOCK:-}" = 1 ]; then
+        cp "$work/packages" "$lock"
+        echo "$name: wrote images/$name/lock-$arch"
+    elif [ ! -f "$lock" ]; then
+        echo "$name: no images/$name/lock-$arch yet. to write it: BURNER_RELOCK=1 tools/build-image $name" >&2
+        exit 1
+    elif ! cmp -s "$lock" "$work/packages"; then
+        echo "$name: the packages differ from images/$name/lock-$arch:" >&2
+        diff "$lock" "$work/packages" | sed -n 's/^< /-/p; s/^> /+/p' >&2
+        echo "after bumping images/$name/base on purpose: BURNER_RELOCK=1 tools/build-image $name" >&2
+        exit 1
+    fi
+    echo "$name: $suite at snapshot $stamp, $(wc -l < "$work/packages") packages, matches images/$name/lock-$arch"
+
+    # in a VM apt gets today's packages from debian's own mirrors, checked
+    # with the image's own keyring. the snapshot is slow and its security
+    # suite expires
+    sudo rm -f "$r/etc/apt/sources.list" "$r"/etc/apt/sources.list.d/*.list "$r/etc/apt/apt.conf.d/99mmdebstrap"
+    [ -f "$r/usr/share/keyrings/debian-archive-keyring.gpg" ] || { echo "$name: no debian-archive-keyring in the image" >&2; exit 1; }
+    printf '%s\n' "Types: deb" "URIs: https://deb.debian.org/debian" "Suites: $suite $suite-updates" \
+        "Components: main" "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" "" \
+        "Types: deb" "URIs: https://security.debian.org/debian-security" "Suites: $suite-security" \
+        "Components: main" "Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg" \
+        | sudo tee "$r/etc/apt/sources.list.d/debian.sources" >/dev/null
+    # what changes every build or came from the host this ran on
+    # shellcheck disable=SC2016
+    sudo sh -c 'cd "$1" && find var/log -type f -delete && rm -f etc/machine-id var/lib/dbus/machine-id \
+        var/cache/ldconfig/aux-cache var/cache/apt/*.bin var/lib/dpkg/*-old var/cache/debconf/*-old' sh "$r"
+    # without systemd debian has no poweroff, halt or reboot. busybox's
+    # signal pid 1 the way alpine's do, and only these three, so busybox
+    # doesn't stand in for real tools someone installs later
+    if [ -x "$r/usr/bin/busybox" ]; then
+        sudo install -d -m 0755 "$r/usr/local/sbin"
+        for a in poweroff halt reboot; do sudo ln -sfn /usr/bin/busybox "$r/usr/local/sbin/$a"; done
+    fi
+    sudo install -d -m 0755 "$r/overlay" "$r/mnt"
+    sudo install -d -m 1777 "$r/var/tmp"
+    # /sbin is a link to usr/sbin on debian, so the real path: nothing
+    # written as root through a link in the tree
+    sudo install -m 0755 "$src/guest/init" "$r/usr/sbin/burner-init"
+elif [ "$mode" = packages ]; then
     tgz="alpine-minirootfs-$alpine-$arch.tar.gz"
     curl -fsSL --proto =https --retry 3 -o "$work/$tgz" \
         "https://dl-cdn.alpinelinux.org/alpine/v${alpine%.*}/releases/$arch/$tgz"
@@ -83,6 +181,16 @@ fi
 sudo rm -f "$r/.dockerenv" "$r/etc/resolv.conf" "$r/etc/hosts" "$r/etc/hostname"
 printf '127.0.0.1 localhost\n127.0.1.1 burner\n::1 localhost\n' | sudo tee "$r/etc/hosts" >/dev/null
 echo burner | sudo tee "$r/etc/hostname" >/dev/null
+# an image that would boot and then fail in guest init fails here instead
+sudo chroot "$r" /bin/sh /sbin/burner-init selftest || { echo "$name can't run burner's guest init" >&2; exit 1; }
+# every package in the image and its version, kept next to it. debian's
+# came from dpkg already
+if [ "$mode" = debian ]; then
+    :
+elif [ -f "$r/lib/apk/db/installed" ]; then
+    sudo cat "$r/lib/apk/db/installed" | awk '/^P:/ { p = substr($0, 3) } /^V:/ { print p, substr($0, 3) }' \
+        | LC_ALL=C sort > "$work/packages"
+fi
 mb=$(sudo du -sm "$r" | cut -f1)
 truncate -s $(( mb * 13 / 10 + 64 ))M "$work/rootfs.ext4"
 sudo mkfs.ext4 -q -F -L "burner-$name" -d "$r" "$work/rootfs.ext4"
@@ -92,6 +200,14 @@ sudo install -d -m 0755 "$dest"
 sudo install -m 0644 "$work/rootfs.ext4" "$dest/rootfs.ext4.new"
 sudo mv -f "$dest/rootfs.ext4.new" "$dest/rootfs.ext4"
 [ -f "$img/defaults.toml" ] && sudo install -m 0644 "$img/defaults.toml" "$dest/defaults.toml"
+for f in packages base; do
+    from="$work/$f"; [ "$f" = base ] && from="$img/base"
+    if [ -s "$from" ]; then
+        sudo install -m 0644 "$from" "$dest/$f"
+    else
+        sudo rm -f "$dest/$f"
+    fi
+done
 # what burner doctor compares against its own copy, to spot images built from an older init
 sudo install -m 0644 "$src/guest/init" "$dest/init"
 echo "$name: $(du -h "$dest/rootfs.ext4" | cut -f1) ($mb M content) -> $dest"
