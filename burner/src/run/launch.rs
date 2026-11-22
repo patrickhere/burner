@@ -953,6 +953,8 @@ fn launch(
         // the log's reader first: a tap never passes traffic nobody records
         super::netwire::start_linux(cfg, id, i, p.net)?;
         let s = net::tap_up(cfg, i, p.net, uid)?;
+        // and its watch, from a starting point before the VM can send
+        super::netwire::watch_linux(&s.tap)?;
         let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
         ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
                            "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
