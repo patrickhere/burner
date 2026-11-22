@@ -248,6 +248,17 @@ unpack() {
     # kept, so tools/build-image is there for more images later
     # explicit mode: a root umask of 077 would make it unreadable to the build step
     as_root install -d -m 0755 "$SHARE"
+    # root runs install.sh from in there: nobody else may be able to write it
+    # or anything above it, the path as written or where it leads
+    for p in "$SHARE" "$(readlink -f "$SHARE")"; do
+        while [ -n "$p" ] && [ "$p" != / ]; do
+            [ "$(stat -c %u "$p")" = 0 ] || { echo "$p isn't owned by root" >&2; return 1; }
+            case "$(stat -c %A "$p")" in
+                ?????w???? | ????????w?) echo "$p is writable by others than root" >&2; return 1 ;;
+            esac
+            p=$(dirname "$p")
+        done
+    done
     as_root rm -rf "$SHARE/.new"
     as_root install -d -m 0755 "$SHARE/.new"
     as_root tar -xzf "$tmp/$name.tar.gz" -C "$SHARE/.new" --no-same-owner
