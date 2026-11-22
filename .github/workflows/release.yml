@@ -1,8 +1,9 @@
 # a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
 # and what it needs, and publishes them with SHA256SUMS and build provenance as a
-# github release. the release also carries the debian image for both arches, and
-# for burner on apple silicon a mac build for the homebrew formula, the arm guest
-# kernel and a ready alpine image. each image comes with the list of packages in it
+# github release. the release also carries the alpine and debian images for both
+# arches, what burner setup fetches, and for burner on apple silicon a mac build
+# for the homebrew formula and the arm guest kernel. each image comes with the
+# list of packages in it
 name: release
 
 on:
@@ -65,9 +66,9 @@ jobs:
           path: burner-*.tar.gz
           if-no-files-found: error
 
-  # the images, built with tools/build-image on each arch: debian for both,
-  # and what burner setup fetches on a mac, the kernel install.sh pins and
-  # the alpine image for aarch64
+  # the images, built with tools/build-image on each arch: alpine and debian,
+  # what burner setup fetches on linux and on a mac, and for the mac the
+  # kernel install.sh pins
   images:
     strategy:
       fail-fast: true
@@ -104,16 +105,17 @@ jobs:
             "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$build/aarch64/vmlinux-$ver"
           echo "$sha  out/vmlinux-aarch64" | sha256sum -c -
       - name: alpine image
-        if: matrix.arch == 'aarch64'
         run: |
           tools/build-image alpine
-          gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > out/alpine-aarch64.ext4.gz
+          gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > "out/alpine-$ARCH.ext4.gz"
           # apk installs whatever the mirror has today, so this is the record of
           # what went into the image: every package and its version, which
           # build-image writes next to it
-          cp "$BURNER_ROOT/images/alpine/packages" out/alpine-aarch64.packages
-          grep -q '^apk-tools ' out/alpine-aarch64.packages || { echo "no package list from the image" >&2; exit 1; }
-          cat out/alpine-aarch64.packages
+          cp "$BURNER_ROOT/images/alpine/packages" "out/alpine-$ARCH.packages"
+          for p in apk-tools bash; do
+            grep -q "^$p " "out/alpine-$ARCH.packages" || { echo "no $p in the image's package list" >&2; exit 1; }
+          done
+          cat "out/alpine-$ARCH.packages"
       - name: debian image
         run: |
           # fails unless the packages match images/debian/lock-$ARCH
@@ -216,12 +218,12 @@ jobs:
           [ "${#tarballs[@]}" = 3 ] || { echo "expected 3 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
           [ -f "burner-$TAG-aarch64-macos.tar.gz" ] || { echo "no mac build" >&2; exit 1; }
           # a missing image fails the release instead of shipping without it
-          for f in vmlinux-aarch64 {alpine-aarch64,debian-x86_64,debian-aarch64}.{ext4.gz,packages}; do
+          for f in vmlinux-aarch64 {alpine,debian}-{x86_64,aarch64}.{ext4.gz,packages}; do
             [ -f "$f" ] || { echo "no $f" >&2; exit 1; }
           done
           images=(*.ext4.gz)
-          [ "${#images[@]}" = 3 ] || { echo "expected 3 images, got: ${images[*]}" >&2; exit 1; }
-          sha256sum burner-*.tar.gz vmlinux-aarch64 *.ext4.gz *.packages > SHA256SUMS
+          [ "${#images[@]}" = 4 ] || { echo "expected 4 images, got: ${images[*]}" >&2; exit 1; }
+          sha256sum -- burner-*.tar.gz vmlinux-aarch64 *.ext4.gz *.packages > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
