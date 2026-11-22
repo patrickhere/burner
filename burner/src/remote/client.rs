@@ -343,6 +343,8 @@ pub(super) fn forward_json(reply: &str, host: &str) -> Option<String> {
     if !v.is_object() {
         return None;
     }
+    // and once parsed: a \u009b escape is a C1 control only then
+    crate::runlog::clean(&mut v);
     v["host"] = Value::String(host.into());
     Some(v.to_string() + "\n")
 }
@@ -1237,6 +1239,11 @@ mod tests {
         assert_eq!(
             forward_json(raw, "vps").unwrap(),
             "{\"a?\":[\"x?31m\",\"?\",1],\"b\":{\"c\":\"ok\\n\"},\"host\":\"vps\"}\n"
+        );
+        // escaped in the json, raw once parsed
+        assert_eq!(
+            forward_json(r#"{"a":"x\u009b31m\u007f\u0085"}"#, "vps").unwrap(),
+            "{\"a\":\"x?31m??\",\"host\":\"vps\"}\n"
         );
         // a host the far end sends twice is one, ours
         let twice = r#"{"host":"evil","exit":0,"host":null}"#;
