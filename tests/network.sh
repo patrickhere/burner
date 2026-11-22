@@ -383,6 +383,7 @@ else
     # root reads the caller's -H copies only from files the caller owns, never
     # through a link, and none that claims to be this machine's own run
     U=$(as_me mktemp -d /tmp/burner-netu-XXXX)
+    trap 'rm -rf "$T"; sudo rm -rf "$U"' EXIT
     as_me mkdir -p "$U/state/burner/logs" "$U/elsewhere"
     as_me python3 -I - "$U" "$me" <<'PY'
 import json, sys
@@ -419,6 +420,7 @@ PY
     [ "$uarc" = 0 ] && head -n 1 "$T/ua.txt" | grep -q '  fakehost  alpine  exit 0  echo copy$'
     check $? "run log: burner log ID finds a -H copy without sudo" "rc=$uarc $(head -c 200 "$T/ua.txt")"
     sudo rm -rf "$U"
+    trap 'rm -rf "$T"' EXIT
 fi
 
 # explain names every target the suite found, or the range it's in, as blocked
