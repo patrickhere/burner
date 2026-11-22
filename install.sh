@@ -148,9 +148,10 @@ account() { # name
     esac
 }
 
-# dirs root writes into must not be writable by anyone else
+# dirs root writes into must not be writable by anyone else: every dir above
+# the real path, so a symlink can't lead past a dir someone else can write
 root_only() { # path
-    p=$1
+    p=$(readlink -f "$1" 2>/dev/null) || p=$1
     while [ -n "$p" ] && [ "$p" != / ]; do
         if [ -e "$p" ]; then
             [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
@@ -321,7 +322,9 @@ if [ -n "$extras" ]; then
     extra "$work/comp/zsh" "$COMP_ZSH"
     extra "$work/comp/fish" "$COMP_FISH"
     # a page for a command this release doesn't have goes
-    rm -f "$MAN1/burner.1" "$MAN1"/burner-*.1
+    if [ -d "$MAN1" ] && (root_only "$MAN1") 2>/dev/null; then
+        rm -f "$MAN1/burner.1" "$MAN1"/burner-*.1
+    fi
     for f in "$work/man"/burner*.1; do
         extra "$f" "$MAN1/$(basename "$f")"
     done
