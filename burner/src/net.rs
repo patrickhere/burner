@@ -1406,16 +1406,37 @@ pub fn tunnels_here() -> Vec<Tunnel> {
 }
 
 /// net.resolvers that sit in a blocked range, with the range in words. VMs
-/// can never reach those. a full tunnel's halves are left out: they block
-/// everything, and the vpn's own line says so
+/// can never reach those. a full tunnel's two halves are left out: they
+/// block everything, and the vpn's own line says so. one half alone isn't a
+/// tunnel tunnels() reports, so it counts like any route
 pub fn blocked_resolvers(
     cfg: &Config,
     blocked: &[Blocked],
     platform: crate::netmodel::Platform,
 ) -> Vec<(Ipv4Addr, String)> {
+    fn half(b: &Blocked, net: Ipv4Addr) -> Option<&str> {
+        match &b.why {
+            Why::Route { dev, .. } if b.prefix == 1 && b.net == net => Some(dev.as_str()),
+            _ => None,
+        }
+    }
+    let tunnel_devs: Vec<&str> = blocked
+        .iter()
+        .filter_map(|b| half(b, Ipv4Addr::UNSPECIFIED))
+        .filter(|dev| {
+            is_vpn_dev(dev)
+                && blocked
+                    .iter()
+                    .any(|o| half(o, Ipv4Addr::new(128, 0, 0, 0)) == Some(*dev))
+        })
+        .collect();
     let full: Vec<Blocked> = blocked
         .iter()
-        .filter(|b| !matches!(&b.why, Why::Route { .. } if b.prefix <= 1))
+        .filter(|b| {
+            let dev =
+                half(b, Ipv4Addr::UNSPECIFIED).or_else(|| half(b, Ipv4Addr::new(128, 0, 0, 0)));
+            !dev.is_some_and(|d| tunnel_devs.contains(&d))
+        })
         .cloned()
         .collect();
     let m = crate::netmodel::Model::new(cfg, Mode::Web, platform, full);
@@ -1459,13 +1480,8 @@ pub fn resolver_checks(
             ),
         ));
     }
-    let ask: Vec<Ipv4Addr> = cfg
-        .net
-        .resolvers
-        .iter()
-        .copied()
-        .filter(|ip| !bad.iter().any(|(b, _)| b == ip))
-        .collect();
+    // every one, blocked or not: what answers here is a fact of its own
+    let ask: Vec<Ipv4Addr> = cfg.net.resolvers.clone();
     let answers: Vec<(Ipv4Addr, std::result::Result<Duration, String>)> = ask
         .iter()
         .map(|&ip| {
@@ -1502,7 +1518,7 @@ pub fn resolver_checks(
         ));
     }
     if !silent.is_empty() {
-        let what = if good.is_empty() && bad.is_empty() {
+        let what = if good.is_empty() {
             "none of net.resolvers answer dns from here, so VMs with a network get no dns"
         } else {
             "VMs get no dns from these, they don't answer from here"
@@ -1567,8 +1583,15 @@ pub fn ask_resolver(ip: Ipv4Addr, limit: Duration) -> std::result::Result<Durati
 }
 
 /// a reply's rcode, if b is a dns reply to id
+/// a reply's rcode, if b is a dns reply to id that echoes the one question
+/// asked (". NS IN")
 fn answer_rcode(b: &[u8], id: u16) -> Option<u8> {
-    if b.len() < 12 || u16::from_be_bytes([b[0], b[1]]) != id || b[2] & 0x80 == 0 {
+    if b.len() < 17
+        || u16::from_be_bytes([b[0], b[1]]) != id
+        || b[2] & 0x80 == 0
+        || b[4..6] != [0, 1]
+        || b[12..17] != [0, 0, 2, 0, 1]
+    {
         return None;
     }
     Some(b[3] & 0x0f)
@@ -2123,6 +2146,19 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux).is_empty());
+        // one half alone isn't a tunnel: 9.9.9.9 and 1.1.1.1 behind it fail
+        let one = r#"[{"dst":"0.0.0.0/1","gateway":"10.8.0.1","dev":"tun0","flags":[]},
+            {"dst":"default","gateway":"192.168.1.1","dev":"eth0","flags":[]}]"#;
+        let b = sources_from(
+            &cfg,
+            None,
+            &parse_addrs(addrs.as_bytes()).unwrap(),
+            &parse_routes(one.as_bytes(), "eth0").unwrap(),
+        )
+        .unwrap();
+        let r = blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux);
+        assert_eq!(r.len(), 2, "{r:?}");
+        assert!(r[0].1.contains("0.0.0.0/1 via 10.8.0.1 on tun0"), "{r:?}");
     }
 
     #[test]
@@ -2143,7 +2179,9 @@ pub(crate) mod tests {
 
     #[test]
     fn dns_replies() {
-        let mut r = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0];
+        let mut r = vec![
+            0x12, 0x34, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 2, 0, 1,
+        ];
         assert_eq!(answer_rcode(&r, 0x1234), Some(0));
         assert_eq!(answer_rcode(&r, 0x1235), None);
         r[3] = 0x85;
@@ -2152,6 +2190,14 @@ pub(crate) mod tests {
         r[2] = 0x01;
         assert_eq!(answer_rcode(&r, 0x1234), None);
         assert_eq!(answer_rcode(&r[..11], 0x1234), None);
+        r[2] = 0x81;
+        // a header with no question, or another question
+        assert_eq!(answer_rcode(&r[..12], 0x1234), None);
+        r[14] = 1;
+        assert_eq!(answer_rcode(&r, 0x1234), None);
+        r[14] = 2;
+        r[5] = 0;
+        assert_eq!(answer_rcode(&r, 0x1234), None);
         // nothing on a loopback port that never answers
         let e = ask_resolver(Ipv4Addr::new(127, 0, 0, 1), Duration::from_millis(300));
         assert!(e.is_err(), "{e:?}");
