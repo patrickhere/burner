@@ -20,9 +20,16 @@ clean_state() {
 id=$(sudo burner run --img "$IMG" -- '. /etc/os-release; echo "$ID"' </dev/null 2>&1)
 [ "$id" = "$IMG" ] && ok "VMs boot $IMG" || bad "image" "asked for $IMG, os-release ID=$id"
 
-# 1 exit code + live output
-out=$(sudo burner run --img "$IMG" -- 'echo hi; exit 7' </dev/null 2>&1); rc=$?
+# 1 exit code + live output. with --net given nothing else is said; a run
+# left without one whose command fails gets one line saying it had no network
+out=$(sudo burner run --img "$IMG" --net none -- 'echo hi; exit 7' </dev/null 2>&1); rc=$?
 [ "$rc" = 7 ] && [ "$out" = hi ] && ok "exit code and output" || bad "exit code and output" "rc=$rc out=$out"
+o1=$(sudo burner run --img "$IMG" -- 'echo hi; exit 7' </dev/null 2>"$T/hint.err"); r1=$?
+o2=$(sudo burner run --img "$IMG" -- 'echo hi' </dev/null 2>&1); r2=$?
+[ "$r1" = 7 ] && [ "$o1" = hi ] && [ "$(wc -l < "$T/hint.err")" = 1 ] && grep -q '^burner: this run had no network' "$T/hint.err" \
+  && [ "$r2" = 0 ] && [ "$o2" = hi ] \
+  && ok "a failed run without --net says it had no network, a good one says nothing" \
+  || bad "no-network hint" "r=$r1,$r2 out=$o1 err=$(head -c 200 "$T/hint.err") ok-run=$o2"
 
 # 2 --in tar
 mkdir -p "$T/proj"; echo 'print me' > "$T/proj/a.txt"
@@ -186,8 +193,10 @@ for _ in $(seq 40); do vid=$(sudo burner ls | awk '$2 == "victim2" && /running/ 
 # 12b ls and kill: root's, like log, so without sudo they say so with exit 2.
 # through sudo ls shows only the caller's VMs, under a header row; root sees
 # every one, and a VM another user started can't be killed by this one
-burner ls >/dev/null 2>"$T/nr.ls"; r1=$?
-burner kill burner-000000000000 >/dev/null 2>"$T/nr.kill"; r2=$?
+# the suite itself may run as root (sudo bash tests/isolation.sh): nobody
+# is a user that surely isn't
+sudo -u nobody burner ls >/dev/null 2>"$T/nr.ls"; r1=$?
+sudo -u nobody burner kill burner-000000000000 >/dev/null 2>"$T/nr.kill"; r2=$?
 ( sudo env SUDO_UID=4242 burner run --img "$IMG" --tag elses -- 'sleep 300' </dev/null >/dev/null 2>&1 ) &
 ov=""
 for _ in $(seq 40); do ov=$(sudo env -u SUDO_UID burner ls | awk '$2 == "elses" {print $1}'); [ -n "$ov" ] && break; sleep 0.25; done
