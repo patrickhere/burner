@@ -69,7 +69,13 @@ the usual `curl ... | bash`, with the script running in a VM instead of on your 
 curl -fsSL https://example.com/install.sh | sudo burner run --net web --in stdin -- bash
 ```
 
-your machine downloads the script and the VM runs it, with http, https and dns out and nothing else. a download that breaks off halfway still hands the VM half a script and the pipe still says 0, so `set -o pipefail` in your shell makes that show. or let the VM fetch it too, so the script never lands on your machine at all, and only runs once it's all there:
+your machine downloads the script and the VM runs it, with http, https and dns out and nothing else. a download that breaks off halfway hands the VM half a script, which runs that far. to run it only once it's all there, save it first:
+
+```
+curl -fsSLo install.sh https://example.com/install.sh && sudo burner run --net web --in stdin -- bash < install.sh
+```
+
+or let the VM fetch it too, so the script never lands on your machine at all:
 
 ```
 sudo burner run --net web -- 'curl -fsSLo /tmp/install.sh https://example.com/install.sh && bash /tmp/install.sh'
