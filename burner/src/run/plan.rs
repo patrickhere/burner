@@ -447,13 +447,25 @@ pub(super) struct Plan {
     pub(super) no_wait: bool,
 }
 
+/// what to say for an image that isn't here: how to get one of the stock
+/// images, or where to look for the rest
+fn missing_image(img: &str) -> String {
+    if !["alpine", "debian"].contains(&img) {
+        return format!("unknown image {img:?} (burner images)");
+    }
+    #[cfg(target_os = "linux")]
+    let how = match img {
+        "debian" => "tools/build-image debian from burner's source builds it (it needs mmdebstrap)",
+        _ => "tools/build-image alpine from burner's source builds it",
+    };
+    #[cfg(target_os = "macos")]
+    let how = format!("burner setup {img} fetches it");
+    format!("no {img} image here (burner images): {how}")
+}
+
 pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
     if !valid_name(&a.img) || !images(cfg).contains(&a.img) {
-        return Err(exit(
-            EXIT_USAGE,
-            Kind::UnknownImage,
-            format!("unknown image {:?} (burner images)", a.img),
-        ));
+        return Err(exit(EXIT_USAGE, Kind::UnknownImage, missing_image(&a.img)));
     }
     let d = image_defaults(cfg, &a.img)?;
     let l = &cfg.limits;
@@ -553,6 +565,20 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_images_say_how_to_get_them() {
+        let d = missing_image("debian");
+        #[cfg(target_os = "linux")]
+        assert!(d.contains("tools/build-image debian") && d.contains("mmdebstrap"));
+        #[cfg(target_os = "macos")]
+        assert!(d.contains("burner setup debian"));
+        assert!(missing_image("alpine").contains("alpine"));
+        assert_eq!(
+            missing_image("node"),
+            "unknown image \"node\" (burner images)"
+        );
+    }
 
     #[test]
     fn images_json() {
