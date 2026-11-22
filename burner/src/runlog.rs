@@ -781,7 +781,12 @@ fn read(path: &Path, s: &Source) -> Option<Kept> {
     } else {
         serde_json::from_value(hv).ok()?
     };
-    if head.id != id || head.host.is_some() != copy || s.owner.is_some_and(|o| head.owner != o) {
+    // a record version this burner doesn't know may mean other things
+    if head.record != RECORD
+        || head.id != id
+        || head.host.is_some() != copy
+        || s.owner.is_some_and(|o| head.owner != o)
+    {
         return None;
     }
     let mut result: Value = serde_json::from_slice(&b[nl + 1..]).ok()?;
@@ -1205,6 +1210,14 @@ mod tests {
         fs::write(
             d.join(format!("{}.json", id(13))),
             line(&head(&id(13), None), &swapped),
+        )
+        .unwrap();
+        // a record version from a later burner
+        let mut v2 = head(&id(15), None);
+        v2.record = RECORD + 1;
+        fs::write(
+            d.join(format!("{}.json", id(15))),
+            line(&v2, &result(&id(15), None)),
         )
         .unwrap();
         // a copy whose result is another run's

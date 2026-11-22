@@ -102,6 +102,11 @@ pub fn log(cfg: &Config, a: &LogArgs) -> Result<ExitCode> {
             None => out += &format!("{}: no connection log was kept for it\n", k.head.id),
         }
         print!("{out}");
+        if !store.this_machine {
+            eprintln!(
+                "burner: that's one of your -H runs; this machine's own need root (sudo burner log)"
+            );
+        }
     }
     Ok(json::reply("log", 0, Some(log_json(&k, net))))
 }
