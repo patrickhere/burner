@@ -34,6 +34,15 @@
 - `--ttl` in `burner run --help` says the command stops a little before the limit, so its output and `/out` still come back
 - images need a rebuild for the new guest init: `tools/build-image alpine` on linux, `burner setup` on a mac
 
+things to know:
+
+- `outcome`, `rc` and `guest_*` in a run's json are the guest's word: the job is root in the VM and can write what guest init reports. a `timeout` it claims only counts once the host's clock got to the limit
+- on a mac the connection log and `doctor --probe` are macnet's own account, and a log marked incomplete there doesn't stop the VM
+- `burner -H HOST log` and `explain` need the `log` and `explain` lines from `dist/sudoers.example` in the sudo rule there. with them, those users can see the host's network layout through `explain`
+- stop running VMs before upgrading: the new filter starts the log's counters over, so a run that spans the upgrade gets an incomplete log
+- the debian image stays at its snapshot until the next burner release. `apt-get update && apt-get upgrade` in the VM when you need today's packages
+- connection logs (the addresses and dns names of the last 32 runs) are kept in the state dir of the host that ran the VM, root-only on linux. over `-H` they stay on that host
+
 ## 0.2.1
 
 - `burner setup` on a mac takes the kernel and image homebrew fetched again. it refused them because homebrew's Cellar is writable by the admin group, whose members can become root anyway. a directory only you, root or the admin group can write counts as safe now, world write and other groups still don't
