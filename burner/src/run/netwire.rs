@@ -132,15 +132,33 @@ fn pump(
     on_eof();
 }
 
-/// what the reader has passed on: every message the counters count, and
-/// the ones it says were lost. other lines (ready, junk, a packet from the
-/// wrong address) don't count as keeping up
+/// what the reader has passed on: the messages the counters count. other
+/// lines (ready, junk, a packet from the wrong address, what it says was
+/// lost) don't count as keeping up. when nflog drops messages the reader
+/// still reads the ones that filled its socket, so it passes those on
 #[cfg(any(target_os = "linux", test))]
 fn passed_on(c: &Collector) -> u64 {
     c.tries_seen
         .saturating_add(c.up_seen)
         .saturating_add(c.down_seen)
-        .saturating_add(c.lost)
+}
+
+/// linux: whether a process is stopped (SIGSTOP, or held by a tracer). a
+/// stopped reader passes nothing on, whether or not the VM sends anything
+#[cfg(target_os = "linux")]
+fn stopped(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .is_some_and(|s| stat_stopped(&s))
+}
+
+/// the state in a /proc/PID/stat line, after the name in parens (which
+/// can hold anything, parens and spaces too)
+#[cfg(any(target_os = "linux", test))]
+fn stat_stopped(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|st| st == "T" || st == "t")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -290,6 +308,7 @@ fn watchdog(tap: &str, id: &str, mut w: Watch, l: &Watched) {
             return;
         }
         let why = match w.tick(now, before, sent, after) {
+            _ if stopped(l.pid) => READER_STALLED,
             Health::Fine => continue,
             Health::Stalled => READER_STALLED,
             Health::Blind => COUNTS_UNREAD,
@@ -304,6 +323,8 @@ fn watchdog(tap: &str, id: &str, mut w: Watch, l: &Watched) {
 /// what the watchdog shares with the run
 #[cfg(target_os = "linux")]
 struct Watched {
+    /// the reader's
+    pid: u32,
     coll: Arc<Mutex<Option<Collector>>>,
     stopping: Arc<AtomicBool>,
     stalled: Arc<Mutex<Option<&'static str>>>,
@@ -315,16 +336,16 @@ struct Watched {
 #[cfg(target_os = "linux")]
 pub(super) fn watch_linux(tap: &str) -> anyhow::Result<()> {
     let Some((id, l)) = live(|l| {
-        l.as_ref().map(|l| {
-            (
-                l.id.clone(),
-                Watched {
-                    coll: l.coll.clone(),
-                    stopping: l.stopping.clone(),
-                    stalled: l.stalled.clone(),
-                },
-            )
-        })
+        let l = l.as_ref()?;
+        Some((
+            l.id.clone(),
+            Watched {
+                pid: l.child.as_ref()?.id(),
+                coll: l.coll.clone(),
+                stopping: l.stopping.clone(),
+                stalled: l.stalled.clone(),
+            },
+        ))
     }) else {
         return Ok(());
     };
@@ -707,7 +728,19 @@ mod tests {
         let mut c = Collector::new(model, Ipv4Addr::new(172, 29, 217, 2), Instant::now());
         c.take("not a line", Instant::now());
         c.take("{\"k\":\"lost\",\"n\":3}", Instant::now());
-        assert_eq!(passed_on(&c), 3);
+        assert_eq!((passed_on(&c), c.lost, c.invalid), (0, 3, 1));
+    }
+
+    #[test]
+    fn stopped_states() {
+        let line = |name: &str, st: &str| format!("4242 ({name}) {st} 1 4242 4242 0 -1 4194560");
+        assert!(stat_stopped(&line("burner", "T")));
+        assert!(stat_stopped(&line("burner", "t")));
+        assert!(!stat_stopped(&line("burner", "S")));
+        assert!(!stat_stopped(&line("burner", "R")));
+        // a name that looks like a stopped state doesn't fool it
+        assert!(!stat_stopped(&line("x) T (y", "S")));
+        assert!(!stat_stopped(""));
     }
 
     #[test]
