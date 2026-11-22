@@ -554,6 +554,26 @@ pub(super) struct Plan {
     pub(super) no_wait: bool,
 }
 
+/// where get.sh keeps this release's tools/build-image
+#[cfg(target_os = "linux")]
+const BUILD_IMAGE: &str = "/usr/local/share/burner/current/tools/build-image";
+
+/// how to build `img` from source: the full path when get.sh put the
+/// script there
+#[cfg(target_os = "linux")]
+fn build_image(img: &str, installed: bool) -> String {
+    if installed {
+        format!("{BUILD_IMAGE} {img}")
+    } else {
+        format!("tools/build-image {img} from burner's source")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_image_here() -> bool {
+    std::path::Path::new(BUILD_IMAGE).is_file()
+}
+
 /// what to say for an image that isn't here: how to get one of the stock
 /// images, or where to look for the rest
 fn missing_image(img: &str) -> String {
@@ -561,13 +581,44 @@ fn missing_image(img: &str) -> String {
         return format!("unknown image {img:?} (burner images)");
     }
     #[cfg(target_os = "linux")]
-    let how = match img {
-        "debian" => "tools/build-image debian from burner's source builds it (it needs mmdebstrap)",
-        _ => "tools/build-image alpine from burner's source builds it",
-    };
+    let how = missing_how(img, build_image_here());
     #[cfg(target_os = "macos")]
     let how = format!("burner setup {img} fetches it");
     format!("no {img} image here (burner images): {how}")
+}
+
+#[cfg(target_os = "linux")]
+fn missing_how(img: &str, installed: bool) -> String {
+    let needs = if img == "debian" {
+        " (it needs mmdebstrap)"
+    } else {
+        ""
+    };
+    format!(
+        "sudo burner setup {img} fetches it, or {} builds it{needs}",
+        build_image(img, installed)
+    )
+}
+
+/// how to get an image whose guest init isn't this burner's
+#[cfg(target_os = "linux")]
+pub(super) fn image_fix(img: &str) -> String {
+    image_fix_linux(img, build_image_here())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn image_fix(img: &str) -> String {
+    crate::setup::fix_hint(&[img.to_string()])
+}
+
+#[cfg(target_os = "linux")]
+fn image_fix_linux(img: &str, installed: bool) -> String {
+    let build = build_image(img, installed);
+    if ["alpine", "debian"].contains(&img) {
+        format!("sudo burner setup {img} gets this version's, or rebuild it: {build}")
+    } else {
+        format!("rebuild it: {build}")
+    }
 }
 
 pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
@@ -677,10 +728,32 @@ mod tests {
     #[test]
     fn missing_images_say_how_to_get_them() {
         let d = missing_image("debian");
-        #[cfg(target_os = "linux")]
-        assert!(d.contains("tools/build-image debian") && d.contains("mmdebstrap"));
-        #[cfg(target_os = "macos")]
         assert!(d.contains("burner setup debian"));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(d.contains("tools/build-image debian") && d.contains("mmdebstrap"));
+            assert_eq!(
+                missing_how("alpine", true),
+                "sudo burner setup alpine fetches it, or \
+                 /usr/local/share/burner/current/tools/build-image alpine builds it"
+            );
+            assert_eq!(
+                missing_how("debian", false),
+                "sudo burner setup debian fetches it, or tools/build-image debian from \
+                 burner's source builds it (it needs mmdebstrap)"
+            );
+            assert_eq!(
+                image_fix_linux("debian", true),
+                "sudo burner setup debian gets this version's, or rebuild it: \
+                 /usr/local/share/burner/current/tools/build-image debian"
+            );
+            assert_eq!(
+                image_fix_linux("node", false),
+                "rebuild it: tools/build-image node from burner's source"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(image_fix("alpine"), "run burner setup alpine");
         assert!(missing_image("alpine").contains("alpine"));
         assert_eq!(
             missing_image("node"),

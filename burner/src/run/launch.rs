@@ -18,7 +18,7 @@ use serde_json::json;
 use super::admin::VM_DIRS;
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
 use super::console::{Ended, ShellIo, deliver, print_rest, relay, stream, supervise};
-use super::plan::{Input, Plan, RunArgs, plan};
+use super::plan::{Input, Plan, RunArgs, image_fix, plan};
 use super::record::{self, Mark, OutputInfo, RunOutcome, ShellEnd, TarInfo, VmInfo};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, exit,
@@ -449,19 +449,16 @@ fn run_vm(
         .ok()
         .as_deref()
         != Some(crate::doctor::GUEST_INIT);
+    if legacy {
+        let msg = format!(
+            "image {} was built with a different guest init, {}",
+            p.img,
+            image_fix(&p.img)
+        );
+        json::note_warning(Kind::Image, &msg, false);
+        diag.put(format!("burner: {msg}\n").as_bytes(), None);
+    }
     if p.shell {
-        #[cfg(target_os = "linux")]
-        let fix = format!("rebuild it: tools/build-image {}", p.img);
-        #[cfg(target_os = "macos")]
-        let fix = crate::setup::fix_hint(std::slice::from_ref(&p.img));
-        if legacy {
-            let msg = format!(
-                "image {} was built with a different guest init, {fix}",
-                p.img
-            );
-            json::note_warning(Kind::Image, &msg, false);
-            diag.put(format!("burner: {msg}\n").as_bytes(), None);
-        }
         let io = ShellIo {
             legacy,
             tty_rec,
@@ -751,8 +748,9 @@ fn run_vm(
             // an image built from another burner's guest init: its results can't be trusted
             if meta.rc.is_some() && meta.proto != Some(GUEST_PROTO) {
                 let msg = format!(
-                    "image {} runs a guest init from another burner version, rebuild it: tools/build-image {}",
-                    p.img, p.img
+                    "image {} runs a guest init from another burner version, {}",
+                    p.img,
+                    image_fix(&p.img)
                 );
                 ends(RunOutcome::SandboxError, Kind::Sandbox, msg);
                 code = EXIT_SANDBOX;
