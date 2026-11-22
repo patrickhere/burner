@@ -422,6 +422,11 @@ fn run_vm(
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     record::mark(Mark::Slot);
     *held = Some(());
+    // the id for burner kill from another terminal, once kill can find it.
+    // a shell has the terminal, and scripts get it in the json
+    if !p.shell && a.remote.is_none() && sys::is_tty(2) {
+        diag.put(format!("burner: {id} started\n").as_bytes(), None);
+    }
     // held until this returns, after teardown
     #[cfg(target_os = "macos")]
     let _awake = sys::Awake::hold(&format!("burner {id}"));
