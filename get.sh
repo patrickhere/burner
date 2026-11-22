@@ -252,7 +252,8 @@ roots_alone() { # path
     for p in "$1" "$(readlink -f "$1")"; do
         while [ -n "$p" ] && [ "$p" != / ]; do
             [ "$(stat -c %u "$p")" = 0 ] || { echo "$p isn't owned by root" >&2; return 1; }
-            case "$(stat -c %A "$p")" in
+            # a symlink's own mode means nothing, its owner and its dir do
+            [ -L "$p" ] || case "$(stat -c %A "$p")" in
                 ?????w???? | ????????w?) echo "$p is writable by others than root" >&2; return 1 ;;
             esac
             p=$(dirname "$p")
