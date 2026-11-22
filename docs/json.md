@@ -58,6 +58,8 @@ where it goes:
 
 sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked before a VM starts: one that isn't open for writing (stdout or stderr redirected from a file included) is exit 2, kind `usage`. `shell` refuses `--json` (the terminal has stdout) and takes `--json-fd`. with `--status-fd` on the same fd, the status line comes first and the json last.
 
+`--json-mark NONCE` writes the json as one line, `burner-NONCE status ` and then the document, the same record the far end of `-H` sends its client. NONCE is 16 to 64 letters, digits and dashes (`openssl rand -hex 16`). the VM never sees it, so a line the guest printed can't pass for burner's, even when burner was killed before it wrote its own, and with `--result tar` (where the command's output is on stderr too). the marker can come right after guest output that didn't end in a newline, so look for it anywhere in a line. it needs `--json-fd` or `--json`; over `-H` the client marks the json it writes here, and the nonce never goes to the far end.
+
 `result` is null for a usage error (bad flags, unknown image, not root, no terminal) and when burner failed before the run had an id (a config that didn't load, the reaper not running). otherwise:
 
 | field | what |

@@ -55,10 +55,11 @@ pub struct RunArgs {
     /// use 2: the json is then the last line on stderr
     #[arg(long, value_name = "FD")]
     pub(super) json_fd: Option<i32>,
-    /// mark the json with this nonce, so a line the guest wrote can't pass
-    /// for it
-    #[arg(long, value_name = "NONCE")]
-    json_mark: Option<String>,
+    /// write the json as one line `burner-NONCE status {...}`, so a line the
+    /// guest wrote can't pass for it. NONCE is 16 to 64 letters, digits and
+    /// dashes nobody else knows (openssl rand -hex 16)
+    #[arg(long, value_name = "NONCE", value_parser = json_nonce)]
+    pub(super) json_mark: Option<String>,
     /// the connection log after a run with a network, on stderr: a summary,
     /// the full table, or nothing. it's kept either way (burner log)
     #[arg(long, value_enum, default_value_t = LogMode::Summary)]
@@ -111,7 +112,7 @@ pub struct ShellArgs {
     #[arg(long, value_name = "FD")]
     json_fd: Option<i32>,
     /// mark the json with this nonce, see run
-    #[arg(long, value_name = "NONCE")]
+    #[arg(long, value_name = "NONCE", value_parser = json_nonce)]
     json_mark: Option<String>,
     /// how long to queue for a slot: 30s, 5m [default: 10m]
     #[arg(long, value_name = "TIME")]
@@ -122,6 +123,16 @@ pub struct ShellArgs {
     /// burner -H on the far end of ssh, see run. the ~ escape is the client's
     #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
     remote: Option<String>,
+}
+
+/// --json-mark: 16 to 64 ascii letters, digits and dashes, so the marker
+/// is one word and a guest can't guess it
+fn json_nonce(s: &str) -> Result<String, String> {
+    if (16..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        Ok(s.into())
+    } else {
+        Err("the nonce is 16 to 64 letters, digits and dashes (openssl rand -hex 16)".into())
+    }
 }
 
 /// the remote protocol this burner speaks
@@ -202,9 +213,7 @@ impl RunArgs {
 
     /// a flag that parses but isn't built yet
     pub(super) fn unbuilt(&self) -> Option<&'static str> {
-        if self.json_mark.is_some() {
-            Some("--json-mark")
-        } else if self.wait.is_some() {
+        if self.wait.is_some() {
             Some("--wait")
         } else {
             None
@@ -926,6 +935,26 @@ mod tests {
         let s = <S as clap::Parser>::try_parse_from(["shell", "--log", "none", "debian"]).unwrap();
         let sh = shell_run_args(&s.a).remote_argv(n, false);
         assert_eq!(sh[3..], ["--log", "none", "debian"]);
+    }
+
+    #[test]
+    fn json_marks() {
+        let n = "0123456789abcdef0123456789abcdef";
+        assert_eq!(json_nonce(n).as_deref(), Ok(n));
+        assert!(json_nonce("A1b2-C3d4-E5f6-G7h8").is_ok());
+        for bad in [
+            "",
+            "short",
+            "0123456789abcde",
+            &"a".repeat(65),
+            "0123456789abcdef 1",
+            "0123456789abcdef\n",
+        ] {
+            assert!(json_nonce(bad).is_err(), "{bad:?}");
+        }
+        // the client marks its own json, the far end never gets the nonce
+        let a = parse(&["--json-mark", n, "--json-fd", "2", "--", "x"]);
+        assert!(!a.remote_argv(n, false).iter().any(|w| w.contains("json")));
     }
 
     #[test]

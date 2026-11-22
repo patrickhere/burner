@@ -276,7 +276,7 @@ things to know:
   | other | run and shell: the command's own exit code |
 
   a command can exit 2, 124, 125 or 130 itself, so for run use `--json-fd` to tell them apart
-- `--json` on any command prints one JSON document instead of text, schema in [docs/json.md](docs/json.md): `exit`, `ok`, the command's `result`, and burner's own lines as `errors` and `warnings`. `burner run --json` puts only that on stdout and the command's output on stderr. `--json-fd N` on run and shell writes it to fd N and leaves stdout and stderr alone, so a command that exits 124 itself isn't mistaken for a timeout: `result.outcome` says which. `outcome`, `rc` and `guest_*` are the guest's word, since the job is root in the VM and can write what guest init reports. a `timeout` only counts once the host's clock got to the limit. sudo closes fds above 2, so through sudo use `--json-fd 2` and read the last line of stderr. check burner's exit status first: with `--result tar` the command's output is on stderr too, and if burner was killed before it wrote its line, the last line is the command's
+- `--json` on any command prints one JSON document instead of text, schema in [docs/json.md](docs/json.md): `exit`, `ok`, the command's `result`, and burner's own lines as `errors` and `warnings`. `burner run --json` puts only that on stdout and the command's output on stderr. `--json-fd N` on run and shell writes it to fd N and leaves stdout and stderr alone, so a command that exits 124 itself isn't mistaken for a timeout: `result.outcome` says which. `outcome`, `rc` and `guest_*` are the guest's word, since the job is root in the VM and can write what guest init reports. a `timeout` only counts once the host's clock got to the limit. sudo closes fds above 2, so through sudo use `--json-fd 2` and read the last line of stderr. with `--result tar` the command's output is on stderr too, and if burner was killed before it wrote its line, the last line is the command's. `--json-mark NONCE` closes that gap: the json comes as `burner-NONCE status {...}`, and the VM never sees the nonce, so a line without it isn't burner's
 - `--status-fd N` is the older one-line form, kept as it was. it has `outcome`, `rc` (the command's exit code, only when outcome is `exited`), `exit` (what burner exits with), `id` and `secs`. outcome is one of `exited`, `timeout`, `killed`, `interrupted`, `busy`, `sandbox_error`, `input_error` (an `--in tar` that didn't unpack in the VM, so the command never ran), `poweroff` (the command powered off or halted the VM before it exited), `reboot` (the same with a reboot) or `usage`. an image built with an older guest init still reports an input that didn't unpack as `exited` with rc 125, and gets no `poweroff` or `reboot`
 - when every slot is taken (`max_vms`, or the memory total), a run waits for one, says `burner: waiting for a slot` on stderr, and gives up after 10 min. `--no-wait` fails right away instead. both end with 125 and outcome `busy`
 - `sudo burner ls --json` prints the envelope with `result` holding `vms`, `max_vms`, `total_mem_mib` and `used_mem_mib`. each VM has `id`, `tag` (null without one), `img`, `vcpus`, `mem_mib`, `disk_gib`, `net`, `status` (`preparing`, `running` or `cleanup-failed`), `owner`, `started_unix`, `age_secs`, `ttl_secs` and `ttl_left_secs`. before 0.3 that object was the whole output, with `mem`, `disk`, `age`, `ttl` and `ttl_left` and the totals without `_mib`; burner-tui reads both. through sudo `ls` lists only the caller's VMs (root's own `ls` lists every one), and `max_vms` and the memory totals are the machine's. `--tag` on a run makes yours easy to find
@@ -287,9 +287,10 @@ a wrapper that tells a failing test from a timeout or a busy box:
 ```sh
 #!/bin/sh
 log=$(mktemp)
-git archive HEAD | sudo burner run --net web --in tar --tag tests --json-fd 2 -- 'sh ./test.sh' 2>"$log"
+mark=$(openssl rand -hex 16)
+git archive HEAD | sudo burner run --net web --in tar --tag tests --json-fd 2 --json-mark "$mark" -- 'sh ./test.sh' 2>"$log"
 code=$?
-outcome=$(tail -n 1 "$log" | jq -r .result.outcome)
+outcome=$(sed -n "s/.*burner-$mark status //p" "$log" | jq -r .result.outcome)
 case $outcome in
     exited) echo "tests exited $code" ;;
     timeout) echo "tests hit the time limit" ;;

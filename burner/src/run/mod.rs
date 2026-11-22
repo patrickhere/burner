@@ -31,7 +31,9 @@ pub(crate) use console::Escape;
 pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
-pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, finished, json_target, main, refuse};
+pub use launch::{
+    GUEST_PROTO, VMM, check_fds, config_failed, finished, json_line, json_target, main, refuse,
+};
 pub use log::{LogArgs, log};
 
 /// the line the network log's reader writes first

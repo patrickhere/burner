@@ -84,6 +84,16 @@ pub fn json_target(a: &RunArgs) -> Option<i32> {
     }
 }
 
+/// the json as it goes to its fd: as it is, or with --json-mark as the
+/// marked record the far end of -H sends its client, which remote/frame.rs
+/// reads. the guest never sees the nonce, so it can't print one
+pub fn json_line(a: &RunArgs, env: &str) -> String {
+    match &a.json_mark {
+        Some(m) => format!("burner-{m} status {env}"),
+        None => env.to_string(),
+    }
+}
+
 /// a line for the burner -H client on the far end of ssh, on stderr. sudo
 /// closes every other fd, and stdout is the command's
 fn to_client(a: &RunArgs, kind: &str, body: &str) {
@@ -142,6 +152,10 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
             "--json writes to stdout, --json-fd to another fd: pick one".into()
         }
         _ if a.result.is_some() && json_target(a) == Some(1) => tar_out.into(),
+        // the far end's json goes back as a record, the client marks its own
+        _ if a.json_mark.is_some() && a.remote.is_none() && json_target(a).is_none() => {
+            "--json-mark marks the json, give --json-fd too (2 through sudo)".into()
+        }
         _ => {
             let cmd = if a.shell { "shell" } else { "run" };
             format!("burner {cmd} {}: not yet", a.unbuilt()?)
@@ -161,7 +175,7 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     }
     let env = envelope(a, f);
     if let (true, Some(fd)) = (json_ok, json_target(a)) {
-        json::write_fd(fd, &env);
+        json::write_fd(fd, &json_line(a, &env));
     }
     to_client(a, "status", &env);
     Some(ExitCode::from(EXIT_USAGE))
@@ -198,7 +212,7 @@ pub fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
     }
     let env = envelope(a, f);
     if let Some(fd) = json_target(a) {
-        json::write_fd(fd, &env);
+        json::write_fd(fd, &json_line(a, &env));
     }
     to_client(a, "status", &env);
     ExitCode::from(code)
@@ -1649,6 +1663,44 @@ mod tests {
         }
         assert!(!fd_ok(w) && !writable(w), "a closed fd");
         assert!(!fd_ok(0) && !fd_ok(1), "only 2 and up for fd_ok");
+    }
+
+    #[test]
+    fn marked_json_is_a_frame_record() {
+        use crate::remote::frame::{Frames, Record};
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: RunArgs,
+        }
+        let n = "6b1f0e2a9c4d4e7f8a0b1c2d3e4f5a6b";
+        let a = <T as clap::Parser>::try_parse_from([
+            "run",
+            "--json-mark",
+            n,
+            "--json-fd",
+            "2",
+            "--",
+            "x",
+        ])
+        .unwrap()
+        .a;
+        let env = "{\"schema\":1,\"exit\":0}\n";
+        let line = json_line(&a, env);
+        assert_eq!(line, format!("burner-{n} status {env}"));
+        // a guest that printed a lookalike without a newline, then burner's line
+        let fake =
+            "{\"schema\":1,\"exit\":0}\nburner-0000000000000000 status {\"exit\":0}\nno newline";
+        let mut f = Frames::new(n);
+        let (mut out, mut recs) = (Vec::new(), Vec::new());
+        f.feed(format!("{fake}{line}").as_bytes(), &mut out, &mut recs);
+        f.finish(&mut out);
+        assert_eq!(recs, [Record::Status(env.trim_end().into())]);
+        assert_eq!(out, fake.as_bytes());
+        let plain = <T as clap::Parser>::try_parse_from(["run", "--json-fd", "2", "--", "x"])
+            .unwrap()
+            .a;
+        assert_eq!(json_line(&plain, env), env);
     }
 
     #[test]
