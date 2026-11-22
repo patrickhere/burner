@@ -470,15 +470,32 @@ fn words_there(mut args: impl Iterator<Item = String>) -> String {
 fn run_there(host: &remote::hosts::Host, words: &str) -> (Option<String>, String) {
     let burner = host.burner.as_deref().unwrap_or("burner");
     let burner = remote::frame::printable(&remote::quote::remote(burner), 200);
+    // hosts.toml's port and user, which ssh alone wouldn't know
+    let port = host.port.map_or_else(String::new, |p| format!("-p {p} "));
+    let first = host.addrs.first().unwrap_or(&host.name);
+    let first = match &host.user {
+        Some(u) => format!("{u}@{first}"),
+        None => first.clone(),
+    };
+    let first = remote::frame::printable(&first, 200);
     match remote::doctor::far_end(host) {
-        Some((os, addr)) if os == "Darwin" => (Some(os), format!("ssh {addr} {burner} {words}")),
-        Some((os, addr)) => (Some(os), format!("ssh -t {addr} sudo {burner} {words}")),
+        Some((os, addr)) if os == "Darwin" => (
+            Some(os),
+            format!(
+                "ssh {port}{} {burner} {words}",
+                remote::frame::printable(&addr, 200)
+            ),
+        ),
+        Some((os, addr)) => (
+            Some(os),
+            format!(
+                "ssh -t {port}{} sudo {burner} {words}",
+                remote::frame::printable(&addr, 200)
+            ),
+        ),
         None => (
             None,
-            format!(
-                "ssh -t {} sudo {burner} {words}, without the sudo on a mac",
-                host.name
-            ),
+            format!("ssh -t {port}{first} sudo {burner} {words}, without the sudo on a mac"),
         ),
     }
 }

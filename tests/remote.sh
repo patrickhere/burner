@@ -564,7 +564,7 @@ else
 fi
 [ "$rs" = 2 ] && grep -qF "burner setup runs on the machine itself, not over -H $want_setup" "$T/e.setup" \
   && [ "$rp" = 2 ] && grep -qF "$want_probe" "$T/e.probe" \
-  && [ "$rd" = 2 ] && grep -qF "(ssh -t down sudo burner setup debian, without the sudo on a mac, or -H local here)" "$T/e.down" \
+  && [ "$rd" = 2 ] && grep -qF "(ssh -t 192.0.2.1 sudo burner setup debian, without the sudo on a mac, or -H local here)" "$T/e.down" \
   && [ "$rj" = 2 ] && json_is 'd["errors"][0]["kind"] == "usage" and "fake-burner setup debian" in d["errors"][0]["message"]' < "$T/setup.json" \
   && ok "the run-it-there hints follow the far end's OS, and say both when it doesn't answer" \
   || bad "run-it-there hints" "setup=$rs probe=$rp down=$rd json=$rj $(short "$T/e.setup") / $(short "$T/e.probe") / $(short "$T/e.down")"
