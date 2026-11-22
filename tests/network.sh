@@ -141,7 +141,7 @@ p https-npm          "curl -sfS -m 10 -o /dev/null https://registry.npmjs.org/"
 p https-crates       "curl -sfS -m 10 -o /dev/null https://index.crates.io/config.json"
 p ipv6-global        "ip -6 addr show scope global | grep -q inet6"
 p ipv6-route         "ip -6 route show | grep -v ^fe80 | grep -q ."
-p ipv6-link          "ping -6 -c 2 -W 2 -I eth0 ff02::1 2>&1 | grep \"bytes from\" | grep -v \"from \$(ip -6 addr show dev eth0 scope link | grep -oE fe80[0-9a-f:]+):\" | grep -q ."
+p ipv6-link          "ping -6 -c 2 -W 2 -I eth0 ff02::1 2>&1 | grep \"bytes from\" | grep -vE \"from \$(ip -6 addr show dev eth0 scope link | grep -oE fe80[0-9a-f:]+)(%eth0)?:\" | grep -q ."
 p name-capture       "nslookup '"$capture"'"
 wait
 cat /tmp/probe.*
