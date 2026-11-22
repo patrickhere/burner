@@ -998,6 +998,18 @@ pub fn check(cfg: &Config) {
         }
         return;
     }
+    // the default route moved to another interface since the table was
+    // loaded (a vpn that took it): the forward and nat rules still name the
+    // old one and drop every VM packet. reload, the same as net up now would
+    if let Some((was, now)) = uplink_moved(cfg) {
+        sys::syslog(&format!(
+            "burner net: the uplink is {now} now, not {was}: reloading the filter"
+        ));
+        if let Err(e) = up(cfg) {
+            fail_closed(cfg, &format!("reloading for uplink {now}: {e:#}"));
+        }
+        return;
+    }
     let Ok(_lock) = net_lock(cfg) else {
         sys::syslog("burner net: net.lock stayed busy, filter refresh skipped this pass");
         return;
@@ -1016,6 +1028,31 @@ pub fn check(cfg: &Config) {
     if let Err(e) = res {
         fail_closed(cfg, &format!("{e:#}"));
     }
+}
+
+/// the uplink the loaded table sends VM traffic out of, and the one the
+/// config gives now, when they differ
+pub fn uplink_moved(cfg: &Config) -> Option<(String, String)> {
+    let now = cfg.uplink().ok()?;
+    let out = helper(
+        "nft",
+        &["list", "chain", "ip", NAT_TABLE, "postrouting"],
+        None,
+    )
+    .ok()?;
+    let was = nat_uplink(&String::from_utf8_lossy(&out.stdout))?;
+    (was != now).then_some((was, now))
+}
+
+/// the interface in the nat table's masquerade rule
+fn nat_uplink(chain: &str) -> Option<String> {
+    chain.lines().find_map(|l| {
+        let rest = l.trim().split("oifname \"").nth(1)?;
+        let (dev, tail) = rest.split_once('"')?;
+        tail.trim()
+            .starts_with("masquerade")
+            .then(|| dev.to_string())
+    })
 }
 
 /// the ufw command still needed, if ufw is active and lacks it
@@ -2103,5 +2140,16 @@ pub(crate) mod tests {
         // nothing on a loopback port that never answers
         let e = ask_resolver(Ipv4Addr::new(127, 0, 0, 1), Duration::from_millis(300));
         assert!(e.is_err(), "{e:?}");
+    }
+
+    #[test]
+    fn the_loaded_uplink() {
+        let chain = "table ip burner_nat {\n\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t\tip saddr 172.29.217.0/24 oifname \"eth0\" masquerade\n\t}\n}\n";
+        assert_eq!(nat_uplink(chain), Some("eth0".into()));
+        // what ruleset_for writes reads back the same
+        let r = ruleset_for(&Config::default(), "tun0", &["10.0.0.0/8".into()]);
+        assert_eq!(nat_uplink(&r), Some("tun0".into()));
+        assert_eq!(nat_uplink("table ip burner_nat {\n}\n"), None);
+        assert_eq!(nat_uplink("oifname \"eth0\" accept\n"), None);
     }
 }

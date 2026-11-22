@@ -642,6 +642,12 @@ mod linux {
                     None => rules.stale = Some(true),
                 }
                 rules.refreshed_secs = crate::run::reaper_age(cfg).map(|d| d.as_secs());
+                if let Some((was, now)) = net::uplink_moved(cfg) {
+                    rules.stale = Some(true);
+                    notes.push(format!(
+                        "the loaded filter sends VM traffic out {was}, and the default route is on {now} now:\nVMs have no way out until the reaper reloads it (within 30s) or burner net up does"
+                    ));
+                }
             }
             if a.rules && loaded {
                 let mut t = String::new();
