@@ -67,6 +67,23 @@ vms_running() {
     return 0
 }
 
+# burner registers every VM in the ledger with this lock held, before it
+# starts. held, with the ledger empty, no VM can start until it's let go.
+# burner itself (reap, doctor, net) takes it too, so it's let go before those
+lock_vms() {
+    [ -d /run/burner ] || return 0
+    command -v flock >/dev/null 2>&1 || die "needs flock (util-linux)"
+    (umask 077 && : >> /run/burner/ledger.lock)
+    exec 9<> /run/burner/ledger.lock
+    flock -w 60 9 || die "couldn't lock the VM ledger, a burner command seems stuck"
+    if [ -z "$force" ] && [ -n "$(ls -A /run/burner/vms 2>/dev/null)" ]; then
+        die "VMs are running (sudo burner ls). stop them first, or --force to go on anyway"
+    fi
+}
+unlock_vms() {
+    exec 9>&-
+}
+
 # sudo ./install.sh --uninstall: everything this script put on the machine, except
 # /etc/burner (your config), the sudo rule and the docker images tools/build-image
 # left behind. --purge takes /etc/burner and the rule too
@@ -80,6 +97,8 @@ uninstall() {
     rm -f /etc/systemd/system/burner-net.service /etc/systemd/system/burner-reap.service \
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
+    # checked again with the ledger locked: nothing may start from here on
+    lock_vms
     rm -rf "$ROOT" /run/burner
     rm -f "$BIN" "$TUI" "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
     for u in burner-parse burner; do
@@ -151,8 +170,14 @@ account() { # name
 # dirs root writes into must not be writable by anyone else: every dir above
 # the real path, so a symlink can't lead past a dir someone else can write
 root_only() { # path
-    p=$(readlink -f "$1" 2>/dev/null) || p=$1
-    while [ -n "$p" ] && [ "$p" != / ]; do
+    above "$1"
+    real=$(readlink -f "$1" 2>/dev/null) || return 0
+    above "$real"
+}
+# the path and every dir above it, as written: a symlink's own dir included
+above() { # path
+    p=$1
+    while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
         if [ -e "$p" ]; then
             [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
             case "$(stat -c %A "$p")" in
@@ -273,7 +298,9 @@ if [ -n "$rule_users" ]; then
     fi
 fi
 
-# 2. install: each file goes in under a temp name and is renamed into place
+# 2. install: each file goes in under a temp name and is renamed into place,
+# with no VM able to start until the units are in
+lock_vms
 install -d -m 0755 "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images"
 for d in "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images" /etc/burner "$(dirname "$BIN")"; do
     root_only "$d"
@@ -353,6 +380,7 @@ if [ -n "$rule_users" ]; then
     mv -f "$RULE.new" "$RULE"
     echo "sudo rule: $rule_users can run burner VMs, $RULE"
 fi
+unlock_vms
 systemctl daemon-reload
 systemctl enable burner-net.service burner-reap.timer >/dev/null
 # reload, not restart: a restart runs net down first, which stops networked VMs
