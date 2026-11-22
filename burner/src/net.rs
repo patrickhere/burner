@@ -653,15 +653,15 @@ fn slot_script(s: &Slot, i: u32, mode: Mode) -> String {
     let tap = &s.tap;
     let g = log_group(i);
     let mut o = String::new();
-    for c in ["n", "over"] {
-        o += &format!("add counter inet {TABLE} lt_{tap}_{c}\n");
+    for c in COUNTERS {
+        o += &format!("add counter inet {TABLE} {c}_{tap}\n");
     }
     for (c, rules) in [
         (
             "lt",
             vec![
-                format!("counter name lt_{tap}_n"),
-                format!("limit rate over {LOG_TRY_LIMIT} counter name lt_{tap}_over return"),
+                format!("counter name n_{tap}"),
+                format!("limit rate over {LOG_TRY_LIMIT} counter name over_{tap} return"),
                 format!("udp dport 53 log prefix \"t\" group {g} snaplen 320 return"),
                 format!("log prefix \"t\" group {g} snaplen 80"),
             ],
@@ -669,6 +669,9 @@ fn slot_script(s: &Slot, i: u32, mode: Mode) -> String {
         (
             "lu",
             vec![
+                // every packet here gets one message: the count of them says
+                // whether any went missing, the last one included
+                format!("counter name up_{tap}"),
                 format!("udp dport 53 log prefix \"q\" group {g} snaplen 320 return"),
                 format!("log prefix \"o\" group {g} snaplen 80"),
             ],
@@ -677,6 +680,7 @@ fn slot_script(s: &Slot, i: u32, mode: Mode) -> String {
             "ld",
             vec![
                 format!("limit rate over {LOG_DOWN_LIMIT} return"),
+                format!("counter name down_{tap}"),
                 format!("udp sport 53 log prefix \"r\" group {g} snaplen 600 return"),
                 format!("log prefix \"a\" group {g} snaplen 80"),
             ],
@@ -708,26 +712,20 @@ fn slot_teardown(tap: &str) -> Vec<String> {
     for c in ["lt", "lu", "ld"] {
         o.push(format!("delete chain inet {TABLE} {c}_{tap}"));
     }
-    for c in ["n", "over"] {
-        o.push(format!("delete counter inet {TABLE} lt_{tap}_{c}"));
+    for c in COUNTERS {
+        o.push(format!("delete counter inet {TABLE} {c}_{tap}"));
     }
     o
 }
 
-/// a slot's log counters: every new attempt, and those past the
-/// itemization limit. None when they can't be read
-pub fn log_counts(tap: &str) -> Option<(u64, u64)> {
+/// a slot's log counters: every new attempt, those past the itemization
+/// limit, what was let out and the replies logged. None if any can't be read
+pub fn log_counts(tap: &str) -> Option<crate::netlog::NetCounts> {
     let get = |c: &str| -> Option<u64> {
+        let name = format!("{c}_{tap}");
         let out = helper(
             "nft",
-            &[
-                "-j",
-                "list",
-                "counter",
-                "inet",
-                TABLE,
-                &format!("lt_{tap}_{c}"),
-            ],
+            &["-j", "list", "counter", "inet", TABLE, &name],
             None,
         )
         .ok()?;
@@ -736,8 +734,16 @@ pub fn log_counts(tap: &str) -> Option<(u64, u64)> {
         }
         parse_counter(&out.stdout)
     };
-    Some((get("n")?, get("over")?))
+    Some(crate::netlog::NetCounts {
+        tries: get("n")?,
+        over: get("over")?,
+        up: get("up")?,
+        down: get("down")?,
+    })
 }
+
+/// the log's named counters per slot, as prefixes of their names
+const COUNTERS: [&str; 4] = ["n", "over", "up", "down"];
 
 fn parse_counter(json: &[u8]) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
@@ -1105,13 +1111,14 @@ pub fn tap_down_for(cfg: &Config, i: u32, id: &str) -> bool {
         return false;
     };
     if let Ok(s) = slot(cfg, i)
-        && let Some((n, over)) = log_counts(&s.tap)
+        && let Some(c) = log_counts(&s.tap)
     {
         let dir = cfg.paths.state.join("netcount");
         if sys::private_dir(&dir).is_ok() {
             let _ = std::fs::write(
                 dir.join(id),
-                serde_json::json!({"tries": n, "over": over}).to_string(),
+                serde_json::json!({"tries": c.tries, "over": c.over, "up": c.up, "down": c.down})
+                    .to_string(),
             );
         }
     }
@@ -1292,7 +1299,22 @@ pub(crate) mod tests {
         let down = slot_teardown("bn3").join("\n");
         let e = down.find("delete element inet burner log_try").unwrap();
         let c = down.find("delete chain inet burner lt_bn3").unwrap();
-        let n = down.find("delete counter inet burner lt_bn3_n").unwrap();
+        let n = down.find("delete counter inet burner n_bn3").unwrap();
+        for c in ["n_bn3", "over_bn3", "up_bn3", "down_bn3"] {
+            assert!(
+                script.contains(&format!("add counter inet burner {c}\n")),
+                "{c}"
+            );
+            assert!(
+                down.contains(&format!("delete counter inet burner {c}")),
+                "{c}"
+            );
+        }
+        // up counts every packet the up chain sees, before its log rules
+        let up = script
+            .find("add rule inet burner lu_bn3 counter name up_bn3")
+            .unwrap();
+        assert!(up < script.find("prefix \"o\"").unwrap());
         assert!(e < c && c < n);
         assert_eq!(log_group(1023), 30240);
     }

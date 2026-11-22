@@ -326,7 +326,7 @@ awk -v d="$down" -v u="$up" 'BEGIN{exit !(d > 500000 && d < 3300000 && u > 30000
 sleep 1
 taps=$(ip -br link | grep -c '^bn')
 elems=$(sudo nft -j list set inet burner tap_ip | grep -c '"elem"')
-logs=$(sudo nft list table inet burner | grep -cE 'chain l[tud]_bn|: jump l[tud]_bn|counter lt_bn')
+logs=$(sudo nft list table inet burner | grep -cE 'chain l[tud]_bn|: jump l[tud]_bn|counter (n|over|up|down)_bn')
 readers=$(pgrep -f -- '__read-netlog' | wc -l)
 [ "$taps" = 0 ] && [ "$elems" = 0 ] && [ "$logs" = 0 ] && [ "$readers" = 0 ] && [ -z "$(sudo ls /run/burner/vms/)" ] \
   && [ -z "$(sudo ls /run/burner/netcount/ 2>/dev/null)" ] && ok "no leftover taps, nft elements, log chains, readers or state" \

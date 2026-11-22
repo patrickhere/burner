@@ -26,9 +26,9 @@ const SUMMARY_LINES: usize = 5;
 /// names kept per address, and addresses kept with names
 const NAMES_PER_IP: usize = 3;
 const NAMED_IPS: usize = 4096;
-/// how long a new attempt waits for the filter's "let through" before it
-/// counts as blocked. both come from the same packet, microseconds apart
-const VERDICT_WAIT: Duration = Duration::from_millis(500);
+/// attempts kept waiting for their verdict. past this the oldest become
+/// unknown, and the log isn't complete
+const PENDING_CAP: usize = 20_000;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +98,9 @@ pub struct Summary {
     pub blocked_attempts: u64,
     /// dns questions asked
     pub dns: u64,
+    /// attempts whose verdict the log lost (a message that never came)
+    #[serde(default)]
+    pub unknown: u64,
 }
 
 /// one run's log: what burner log prints and the run's result.network
@@ -297,6 +300,25 @@ struct Try {
     dns: Option<DnsInfo>,
 }
 
+/// linux: the slot's counters, read at teardown. every message the log
+/// chains sent: new attempts (`tries`, of which `over` past the limit
+/// weren't sent), what went out (`up`) and replies (`down`)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct NetCounts {
+    pub tries: u64,
+    pub over: u64,
+    pub up: u64,
+    pub down: u64,
+}
+
+/// what says the log is whole, per platform
+pub enum Check {
+    /// linux: the counters, None when they couldn't be read
+    Linux(Option<NetCounts>),
+    /// macOS: whether macnet sent its final counts
+    Mac(bool),
+}
+
 /// folds producer lines into rows. one per run
 pub struct Collector {
     start: Instant,
@@ -321,6 +343,11 @@ pub struct Collector {
     pub allowed_not_itemized: u64,
     /// linux: new attempts the reader sent, to check against the try chain's counter
     pub tries_seen: u64,
+    /// linux: let-out (o, q) and reply (a, r) messages, against their counters
+    pub up_seen: u64,
+    pub down_seen: u64,
+    /// attempts dropped from the waiting list for room
+    pub evicted: u64,
     /// linux: connections let out with no attempt line before them, which
     /// the try chain's limit cut (they're itemized all the same)
     pub allowed_without_try: u64,
@@ -353,6 +380,9 @@ impl Collector {
             not_itemized: 0,
             allowed_not_itemized: 0,
             tries_seen: 0,
+            up_seen: 0,
+            down_seen: 0,
+            evicted: 0,
             allowed_without_try: 0,
             saw_counts: false,
             seq: None,
@@ -369,7 +399,6 @@ impl Collector {
     }
 
     pub fn line(&mut self, l: Line, now: Instant) {
-        self.settle(now);
         match l {
             Line::Pkt {
                 p,
@@ -522,20 +551,22 @@ impl Collector {
             "a" | "r" if dst != self.guest => self.invalid += 1,
             "t" => {
                 self.tries_seen += 1;
+                // its verdict waits for the end of the run: only then can
+                // the counters say no "let out" message went missing
                 self.pending.push_back(Try {
                     at: now,
                     flow: (proto, sport, dst, dport),
                     hook,
                     dns,
                 });
-                // a flood of attempts is cut by the try chain's own limit,
-                // this only keeps memory flat if the reader runs ahead
-                while self.pending.len() > 4096 {
+                while self.pending.len() > PENDING_CAP {
                     let t = self.pending.pop_front().expect("not empty");
-                    self.blocked(t, now);
+                    self.evicted += 1;
+                    self.unknown(t);
                 }
             }
             "o" | "q" => {
+                self.up_seen += 1;
                 let flow = (proto, sport, dst, dport);
                 let pos = self.pending.iter().position(|t| t.flow == flow);
                 let tried = pos.and_then(|i| self.pending.remove(i));
@@ -569,6 +600,7 @@ impl Collector {
                 }
             }
             "a" => {
+                self.down_seen += 1;
                 let outcome = match proto {
                     // rst
                     Proto::Tcp if flags & 0x04 != 0 => Outcome::Refused,
@@ -577,6 +609,7 @@ impl Collector {
                 self.outcome((proto, dport, src, sport), outcome);
             }
             "r" => {
+                self.down_seen += 1;
                 if let Some(d) = dns {
                     self.answer(src, dport, d);
                 }
@@ -684,6 +717,7 @@ impl Collector {
         match (kind, verdict) {
             (Kind::Conn, Verdict::Allowed) => self.summary.allowed += 1,
             (_, Verdict::Blocked) => self.summary.blocked_attempts += 1,
+            (_, Verdict::Unknown) => self.summary.unknown += 1,
             _ => {}
         }
         let key = RowKey {
@@ -713,11 +747,11 @@ impl Collector {
         }
         let full = match verdict {
             Verdict::Allowed => self.allowed_rows >= ROW_CAP,
-            Verdict::Blocked => self.blocked_rows >= ROW_CAP,
+            Verdict::Blocked | Verdict::Unknown => self.blocked_rows >= ROW_CAP,
         };
         if full {
             match verdict {
-                Verdict::Allowed => self.allowed_not_itemized += 1,
+                Verdict::Allowed | Verdict::Unknown => self.allowed_not_itemized += 1,
                 Verdict::Blocked => self.not_itemized += 1,
             }
             return None;
@@ -728,6 +762,7 @@ impl Collector {
                 self.blocked_rows += 1;
                 self.summary.blocked += 1;
             }
+            Verdict::Unknown => self.blocked_rows += 1,
         }
         let names = match kind {
             Kind::Conn => self.names.get(&dst).cloned().unwrap_or_default(),
@@ -759,19 +794,44 @@ impl Collector {
         Some(self.rows.len() - 1)
     }
 
-    /// attempts the filter never let out within the wait are blocked
-    fn settle(&mut self, now: Instant) {
-        while let Some(t) = self.pending.front() {
-            if now.saturating_duration_since(t.at) < VERDICT_WAIT {
-                break;
+    /// an attempt with no "let out" after it, when that message may be the one
+    /// that went missing: the log can't say what the filter did. the model's
+    /// guess is in the words, never in the verdict
+    fn unknown(&mut self, t: Try) {
+        let (proto, sport, dst, dport) = t.flow;
+        let port = has_ports(proto).then_some(dport);
+        let e = self.model.expect(dst, proto, dport);
+        let guess = match (e.verdict, e.detail) {
+            (Verdict::Blocked, Some(d)) => format!("the model says blocked: {d}"),
+            (Verdict::Allowed, _) => "the model says allowed".to_string(),
+            _ => "the model says blocked".to_string(),
+        };
+        let detail = Some(format!(
+            "the filter's verdict didn't reach the log, {guess}"
+        ));
+        match t.dns {
+            Some(d) if proto == Proto::Udp && dport == 53 => {
+                self.dns_row(dst, sport, Verdict::Unknown, None, detail, d, t.at)
             }
-            let t = self.pending.pop_front().expect("not empty");
-            self.blocked(t, now);
+            _ => {
+                self.row(
+                    Kind::Conn,
+                    Verdict::Unknown,
+                    proto,
+                    dst,
+                    port,
+                    None,
+                    None,
+                    None,
+                    detail,
+                    t.at,
+                );
+            }
         }
     }
 
     /// the kernel's verdict was no. the reason is the model's
-    fn blocked(&mut self, t: Try, _now: Instant) {
+    fn blocked(&mut self, t: Try) {
         let (proto, sport, dst, dport) = t.flow;
         let port = has_ports(proto).then_some(dport);
         let e = self.model.expect(dst, proto, dport);
@@ -814,9 +874,7 @@ impl Collector {
         }
     }
 
-    /// the log as it stands once the VM is gone. `extra_lost`: what the
-    /// producer side knows it missed, `complete_counts`: the exact counters
-    /// were read (linux) or macnet said its counts (mac)
+    /// the log as it stands once the VM is gone and every message is in
     #[allow(clippy::too_many_arguments)]
     pub fn finish(
         mut self,
@@ -826,18 +884,47 @@ impl Collector {
         owner: Option<u32>,
         started_unix: u64,
         now: Instant,
-        counts_ok: bool,
+        check: Check,
     ) -> NetLog {
-        // nothing more is coming: every attempt still waiting was blocked
+        // an attempt with no "let out" message was blocked only if the
+        // counters show every let-out message the kernel sent arrived: then
+        // the one it would have had was never sent. to the host itself (the
+        // input hook) it's blocked either way: burner's input chain drops
+        // every packet from a tap, right after the log's jump
+        let (counts_ok, established) = match check {
+            Check::Mac(said) => (said, true),
+            Check::Linux(Some(c))
+                if self.tries_seen <= c.tries
+                    && self.up_seen <= c.up
+                    && self.down_seen <= c.down =>
+            {
+                let sent = (c.tries - c.over) + c.up + c.down;
+                let got = self.tries_seen + self.up_seen + self.down_seen;
+                // the counters also catch a gap at the very end, which no
+                // sequence number shows
+                self.lost = self.lost.max(sent - got);
+                self.unlisted(c.over - self.allowed_without_try.min(c.over));
+                (true, self.up_seen == c.up)
+            }
+            Check::Linux(_) => (false, false),
+        };
         while let Some(t) = self.pending.pop_front() {
-            self.blocked(t, now);
+            if established || t.hook == 1 {
+                self.blocked(t);
+            } else {
+                self.unknown(t);
+            }
         }
         for (i, seen) in self.flows.values() {
             if seen.is_none() && self.rows[*i].outcome.is_none() {
                 self.rows[*i].outcome = Some(Outcome::NoAnswer);
             }
         }
-        let complete = counts_ok && self.lost == 0 && self.allowed_not_itemized == 0;
+        let complete = counts_ok
+            && self.lost == 0
+            && self.allowed_not_itemized == 0
+            && self.evicted == 0
+            && self.summary.unknown == 0;
         let mut log = NetLog {
             id: id.into(),
             net: net.into(),
@@ -880,7 +967,7 @@ pub fn cut_to(log: &mut NetLog, cap: usize) {
             let i = log
                 .events
                 .iter()
-                .rposition(|e| e.verdict == Verdict::Blocked)
+                .rposition(|e| e.verdict != Verdict::Allowed)
                 .or_else(|| {
                     log.complete = false;
                     log.events.len().checked_sub(1)
@@ -1034,6 +1121,9 @@ pub fn summary_lines(log: &NetLog) -> Vec<String> {
         plural(s.allowed, "connection", "connections"),
         plural(s.dns, "dns lookup", "dns lookups"),
     );
+    if s.unknown > 0 {
+        head += &format!(", {} unknown", s.unknown);
+    }
     if !log.complete {
         head += ", log incomplete";
         if log.lost > 0 {
@@ -1071,6 +1161,12 @@ pub fn summary_lines(log: &NetLog) -> Vec<String> {
     let more = blocked.len().saturating_sub(SUMMARY_LINES) as u64 + log.not_itemized;
     if more > 0 {
         out.push(format!("  and {more} more blocked, not listed here"));
+    }
+    if s.unknown > 0 {
+        out.push(format!(
+            "  {} attempts with no verdict: the log lost what the filter did with them",
+            s.unknown
+        ));
     }
     out.into_iter().map(|l| sanitize(&l)).collect()
 }
@@ -1119,7 +1215,7 @@ pub fn table(log: &NetLog) -> String {
             Kind::Conn => e.names.join(","),
         };
         let mut note = match (e.verdict, e.kind) {
-            (Verdict::Blocked, _) => e
+            (Verdict::Blocked | Verdict::Unknown, _) => e
                 .detail
                 .clone()
                 .unwrap_or_else(|| e.reason.map_or("", |r| r.name()).into()),
@@ -1145,6 +1241,7 @@ pub fn table(log: &NetLog) -> String {
             match e.verdict {
                 Verdict::Allowed => "allowed".into(),
                 Verdict::Blocked => "blocked".into(),
+                Verdict::Unknown => "unknown".into(),
             },
             proto.into(),
             e.dst.to_string(),
@@ -1229,7 +1326,17 @@ mod tests {
         l
     }
 
-    fn finish(c: Collector, t0: Instant) -> NetLog {
+    /// counters that say every message the kernel sent came through
+    fn whole(c: &Collector) -> NetCounts {
+        NetCounts {
+            tries: c.tries_seen,
+            over: 0,
+            up: c.up_seen,
+            down: c.down_seen,
+        }
+    }
+
+    fn finish_with(c: Collector, t0: Instant, check: Check) -> NetLog {
         c.finish(
             "burner-3fa1c2",
             "web",
@@ -1237,8 +1344,13 @@ mod tests {
             Some(1000),
             0,
             t0 + Duration::from_secs(14),
-            true,
+            check,
         )
+    }
+
+    fn finish(c: Collector, t0: Instant) -> NetLog {
+        let w = whole(&c);
+        finish_with(c, t0, Check::Linux(Some(w)))
     }
 
     /// a run like the one in the design doc: two dns lookups, two https
@@ -1357,7 +1469,8 @@ mod tests {
                 allowed: 3,
                 blocked: 3,
                 blocked_attempts: 5,
-                dns: 2
+                dns: 2,
+                unknown: 0,
             }
         );
         assert!(log.complete);
@@ -1426,6 +1539,58 @@ mod tests {
         assert!(l.last().unwrap().contains("more blocked, not listed here"));
     }
 
+    /// an attempt and no "let out" after it is blocked only when the counters
+    /// show no let-out message went missing, a trailing one included
+    #[test]
+    fn a_lost_message_makes_unknown_not_blocked() {
+        let g = "172.29.217.2";
+        let run = |lost_up: u64, readable: bool| {
+            let t0 = Instant::now();
+            let mut c = Collector::new(model(Mode::Web), GUEST, t0);
+            // allowed in fact, but its "o" never arrives: the last message lost
+            c.line(pkt("t", 6, g, "140.82.112.3", 5000, 443, 2), t0);
+            let mut host = pkt("t", 6, g, "172.29.217.1", 5001, 22, 2);
+            if let Line::Pkt { hook, .. } = &mut host {
+                *hook = 1;
+            }
+            c.line(host, t0);
+            let mut w = whole(&c);
+            w.up += lost_up;
+            finish_with(c, t0, Check::Linux(readable.then_some(w)))
+        };
+        let row = |log: &NetLog, dst: &str| {
+            log.events
+                .iter()
+                .find(|e| e.dst.to_string() == dst)
+                .unwrap()
+                .clone()
+        };
+        // every message came: the filter really dropped it
+        let log = run(0, true);
+        assert_eq!(row(&log, "140.82.112.3").verdict, Verdict::Blocked);
+        assert!(log.complete);
+        // one let-out message missing at the very end: no gap shows it, the
+        // counter does
+        for log in [run(1, true), run(0, false)] {
+            let e = row(&log, "140.82.112.3");
+            assert_eq!(e.verdict, Verdict::Unknown, "{log:#?}");
+            assert!(e.detail.unwrap().contains("the model says allowed"));
+            assert!(!log.complete);
+            assert_eq!(log.summary.unknown, 1);
+            assert_eq!(log.summary.blocked, 1, "the host one only");
+            // into the host itself, burner's input chain drops it right after
+            assert_eq!(row(&log, "172.29.217.1").verdict, Verdict::Blocked);
+            let l = summary_lines(&log);
+            assert!(l[0].contains("1 unknown, log incomplete"), "{l:?}");
+            assert!(
+                l.iter()
+                    .any(|x| x.contains("the log lost what the filter did"))
+            );
+            assert!(table(&log).contains("unknown"));
+        }
+        assert_eq!(run(1, true).lost, 1);
+    }
+
     #[test]
     fn hostile_lines() {
         let t0 = Instant::now();
@@ -1488,7 +1653,7 @@ mod tests {
             c.take(l, t0);
         }
         assert_eq!(c.invalid, 0);
-        let log = c.finish("burner-1", "web", "macos", None, 0, t0, true);
+        let log = c.finish("burner-1", "web", "macos", None, 0, t0, Check::Mac(true));
         let gh = &log.events[0];
         assert_eq!(
             (gh.outcome, gh.bytes_up, gh.bytes_down),

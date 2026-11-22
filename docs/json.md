@@ -100,11 +100,11 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 |---|---|
 | `platform` | `linux` (the nft table's log) or `macos` (macnet's) |
 | `owner` | the uid that ran it, the sudo caller on linux |
-| `complete` | false when something may be missing: messages the kernel dropped, counters that couldn't be read, lines macnet couldn't write |
+| `complete` | false when something may be missing: messages the kernel dropped (counted against the slot's counters, so a last message lost counts too), counters that couldn't be read, lines macnet couldn't write, any `unknown` row |
 | `lost` | the gaps known of |
 | `not_itemized` | blocked attempts counted but not listed (past 100 a second, or past 10,000 rows) |
 | `invalid` | lines from the log's producer that weren't valid and were dropped |
-| `summary` | `allowed` connection attempts, `blocked` destinations, `blocked_attempts` in all, `dns` questions |
+| `summary` | `allowed` connection attempts, `blocked` destinations, `blocked_attempts` in all, `dns` questions, `unknown` attempts with no verdict |
 | `events` | one row per destination and verdict, attempts folded together |
 
 an event:
@@ -117,7 +117,7 @@ an event:
 | `kind` | `conn` or `dns`. skip kinds you don't know, later ones (`http`, `tls`) will come |
 | `proto` | `tcp`, `udp`, `icmp` or `other` |
 | `port` | null for icmp and protocols without ports |
-| `verdict` | `allowed` or `blocked`. treat a value you don't know as blocked |
+| `verdict` | `allowed`, `blocked`, or `unknown`: the filter decided but what it decided never reached the log (a lost message), and nothing else on the host says. then `detail` has the model's guess and the log isn't complete. treat a value you don't know as unknown |
 | `reason` | for blocked: `host`, `route`, `special`, `config`, `public_ip`, `vm_subnet`, `port`, `mail`, `not_resolver`, `rate`, `flows` (macOS: too many open), `proto`, `unknown` |
 | `detail` | which range, interface or rule, in burner's words |
 | `outcome` | allowed connections: `answered`, `refused`, `no_answer`, and on macOS `timeout` |
@@ -147,7 +147,8 @@ on linux the verdict is the kernel's and the reason is burner's explanation of i
 {"root":true,"worst":"warn","checks":[{"name":"kvm","level":"ok","detail":"/dev/kvm usable"}, ...]}
 
 // doctor --probe: exit 1 (doctor_failed) when a row isn't as expected, 125 (sandbox) when no VM ran.
-// host_saw: blocked, answered, allowed_no_answer, leaked, not_tried
+// host_saw: blocked, answered, allowed_no_answer, leaked, not_tried, inconclusive (evidence missing: a lost
+// log message, an unreadable witness counter; that's exit 1 too)
 {"platform":"linux","internet":"burnervm.dev","ok":true,"runs":[{"mode":"web","id":"burner-9c01ee3a77b2","secs":11.8,
   "rows":[{"target":"gateway 10.1.0.1 tcp/53","kind":"gateway","dst":"10.1.0.1","port":53,"proto":"tcp","expect":"blocked",
            "host_saw":"blocked","guest_said":"blocked","leaked_packets":0,"ok":true}, ...],"warnings":[]}]}

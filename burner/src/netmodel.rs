@@ -45,6 +45,9 @@ impl Proto {
 pub enum Verdict {
     Allowed,
     Blocked,
+    /// the connection log only: the filter decided, but what it decided never
+    /// reached the log and nothing else on the host says
+    Unknown,
 }
 
 /// why something was blocked. an open list: readers skip values they don't know

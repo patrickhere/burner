@@ -275,13 +275,18 @@ pub(super) fn words(log: &NetLog, mode: super::plan::LogMode) -> Vec<String> {
     }
 }
 
-/// the netcount file teardown wrote: (every attempt, those past the limit)
-fn counts(cfg: &Config, id: &str) -> Option<(u64, u64)> {
+/// the netcount file teardown wrote
+fn counts(cfg: &Config, id: &str) -> Option<crate::netlog::NetCounts> {
     let path = cfg.paths.state.join("netcount").join(id);
     let text = std::fs::read_to_string(&path).ok();
     let _ = std::fs::remove_file(&path);
     let v: serde_json::Value = serde_json::from_str(&text?).ok()?;
-    Some((v["tries"].as_u64()?, v["over"].as_u64()?))
+    Some(crate::netlog::NetCounts {
+        tries: v["tries"].as_u64()?,
+        over: v["over"].as_u64()?,
+        up: v["up"].as_u64()?,
+        down: v["down"].as_u64()?,
+    })
 }
 
 /// after teardown: the run's log, whole. None for a run without a network
@@ -291,20 +296,10 @@ pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
     if let Some(t) = l.thread.take() {
         let _ = t.join();
     }
-    let mut c = l.coll.lock().unwrap_or_else(|e| e.into_inner()).take()?;
-    let counts_ok = match l.platform {
-        Platform::Linux => match counts(cfg, &l.id) {
-            // every attempt went through the try chain's counter: those not
-            // past its limit should all have come through as lines
-            Some((tries, over)) if c.tries_seen <= tries => {
-                let listed = tries - over;
-                c.lost += listed.saturating_sub(c.tries_seen);
-                c.unlisted(over.saturating_sub(c.allowed_without_try.min(over)));
-                true
-            }
-            _ => false,
-        },
-        Platform::Mac => c.saw_counts,
+    let c = l.coll.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    let check = match l.platform {
+        Platform::Linux => crate::netlog::Check::Linux(counts(cfg, &l.id)),
+        Platform::Mac => crate::netlog::Check::Mac(c.saw_counts),
     };
     let owner = super::admin::caller_uid().parse().ok();
     let platform = match l.platform {
@@ -318,7 +313,7 @@ pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
         owner,
         l.started_unix,
         Instant::now(),
-        counts_ok,
+        check,
     ))
 }
 

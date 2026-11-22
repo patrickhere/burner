@@ -81,7 +81,7 @@ pub struct Row {
     pub port: Option<u16>,
     pub proto: &'static str,
     pub expect: Verdict,
-    /// blocked, answered, allowed_no_answer, leaked, not_tried
+    /// blocked, answered, allowed_no_answer, leaked, not_tried, inconclusive
     pub host_saw: &'static str,
     /// what the guest said, open or blocked, null if it said nothing
     pub guest_said: Option<&'static str>,
@@ -511,14 +511,24 @@ fn host_saw(t: &Target, log: &NetLog, m: &Model) -> &'static str {
         How::V6 => Vec::new(),
     };
     if rows.is_empty() {
-        return "not_tried";
+        // with messages lost, nothing seen proves nothing was sent
+        return if log.complete {
+            "not_tried"
+        } else {
+            "inconclusive"
+        };
     }
     let allowed: Vec<&&Event> = rows
         .iter()
         .filter(|e| e.verdict == Verdict::Allowed)
         .collect();
     if allowed.is_empty() {
-        return "blocked";
+        // blocked only when the host's record says so for every attempt
+        return if rows.iter().all(|e| e.verdict == Verdict::Blocked) {
+            "blocked"
+        } else {
+            "inconclusive"
+        };
     }
     let answered = allowed.iter().any(|e| match e.kind {
         Kind::Dns => e.rcode.is_some(),
@@ -575,6 +585,7 @@ fn shown(saw: &str) -> &str {
         "allowed_no_answer" => "allowed, no answer",
         "not_tried" => "not tried",
         "leaked" => "LEAKED",
+        "inconclusive" => "INCONCLUSIVE",
         s => s,
     }
 }
@@ -600,6 +611,7 @@ pub fn render(p: &Probe) -> String {
             let e = match x.expect {
                 Verdict::Allowed => "allowed",
                 Verdict::Blocked => "blocked",
+                Verdict::Unknown => "unknown",
             };
             let mut line = format!("  {:<w$}  {e:<8}  {}", x.target, shown(x.host_saw));
             if !x.ok {
@@ -656,6 +668,12 @@ fn rows(
             _ => host_saw(t, log, m),
         };
         let r = judge(t, saw, leaked(i), guest);
+        if r.host_saw == "inconclusive" {
+            warns.push(format!(
+                "{}: the host's evidence for it is missing (a lost log message or an unreadable counter)",
+                r.target
+            ));
+        }
         if r.host_saw == "not_tried" {
             warns.push(format!(
                 "{}: the host saw nothing from the VM for it",
