@@ -323,14 +323,17 @@ pub fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
 }
 
 fn default_route_iface() -> Option<String> {
-    // /proc/net/route: iface, destination (hex, 0 = default), ..., mask. a
-    // full-tunnel vpn's 0.0.0.0/1 has destination 0 too, its mask isn't
+    // /proc/net/route: iface, destination (hex, 0 = default), ..., metric,
+    // mask. a full-tunnel vpn's 0.0.0.0/1 has destination 0 too, its mask
+    // isn't. of two defaults the kernel takes the lower metric, the first
+    // one listed on a tie
     let routes = fs::read_to_string("/proc/net/route").ok()?;
     routes
         .lines()
         .skip(1)
         .map(|l| l.split_whitespace().collect::<Vec<_>>())
-        .find(|f| f.len() > 7 && f[1] == "00000000" && f[7] == "00000000")
+        .filter(|f| f.len() > 7 && f[1] == "00000000" && f[7] == "00000000")
+        .min_by_key(|f| f[6].parse::<u32>().unwrap_or(u32::MAX))
         .map(|f| f[0].to_string())
 }
 
