@@ -435,6 +435,14 @@ mod sock {
         let mut buf = vec![0u8; 256 << 10];
         let mut lines = Vec::new();
         let mut out = io::stdout().lock();
+        // the run waits for this before the VM gets a tap
+        if out
+            .write_all(crate::run::netlog_ready().as_bytes())
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            return ExitCode::SUCCESS;
+        }
         loop {
             // SAFETY: recv into a buffer we own
             let n = unsafe { libc::recv(0, buf.as_mut_ptr().cast(), buf.len(), 0) };

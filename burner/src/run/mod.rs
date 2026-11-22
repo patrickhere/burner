@@ -30,6 +30,11 @@ pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
 pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, main};
+
+/// the line the network log's reader writes first
+pub fn netlog_ready() -> &'static str {
+    netwire::READY
+}
 pub use plan::{RunArgs, ShellArgs, images, images_result, shell_main, shell_run_args};
 
 pub use crate::exit::{EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE};

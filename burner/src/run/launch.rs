@@ -888,6 +888,8 @@ fn launch(
 
     let deadline = Deadline::in_secs(p.ttl);
     let procs = cgroup::prepare(id).context("creating the VM's cgroup")?;
+    // the reader has to be there still: a VM never starts without its log
+    super::netwire::alive()?;
     go_live(cfg, id, deadline)?;
     let fclog = OpenOptions::new()
         .write(true)
@@ -958,6 +960,14 @@ fn launch(
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .spawn()
         .context("starting the jailer")?;
+    // the VMM is in its cgroup now, where a reader's death would kill it;
+    // one that died before it got there cancels it here
+    let mut child = child;
+    if let Err(e) = super::netwire::alive() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
+    }
     Ok(Vmm {
         child,
         log: jail.join("firecracker.log"),

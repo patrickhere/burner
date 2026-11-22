@@ -18,6 +18,13 @@ use crate::net::Mode;
 use crate::netlog::{Collector, LINE_CAP, NetLog};
 use crate::netmodel::{Model, Platform};
 
+/// the reader's first line, once its limits are on and it's reading
+pub const READY: &str = "{\"k\":\"ready\"}\n";
+
+/// how long a reader gets to say it's ready
+#[cfg(target_os = "linux")]
+const READY_WAIT: Duration = Duration::from_secs(10);
+
 /// what the run says when the reader went away under a running VM
 pub const READER_DIED: &str =
     "the network log reader stopped, VM stopped so nothing goes unrecorded";
@@ -48,6 +55,7 @@ fn pump(
     src: impl Read,
     coll: Arc<Mutex<Option<Collector>>>,
     last: Arc<Mutex<Instant>>,
+    ready: Arc<AtomicBool>,
     on_eof: impl FnOnce(),
 ) {
     let mut r = BufReader::with_capacity(64 << 10, src);
@@ -63,6 +71,10 @@ fn pump(
         }
         let now = Instant::now();
         *last.lock().unwrap_or_else(|e| e.into_inner()) = now;
+        // the reader says it's in its sandbox and reading, once, first
+        if buf == READY.as_bytes() && !ready.swap(true, Ordering::SeqCst) {
+            continue;
+        }
         let mut g = coll.lock().unwrap_or_else(|e| e.into_inner());
         let Some(c) = g.as_mut() else { continue };
         if buf.last() != Some(&b'\n') {
@@ -152,16 +164,18 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
     let last = Arc::new(Mutex::new(Instant::now()));
     let stopping = Arc::new(AtomicBool::new(false));
     let died = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
     let thread = {
-        let (coll, last, stopping, died, id) = (
+        let (coll, last, stopping, died, ready, id) = (
             coll.clone(),
             last.clone(),
             stopping.clone(),
             died.clone(),
+            ready.clone(),
             id.to_string(),
         );
         std::thread::spawn(move || {
-            pump(out, coll, last, || {
+            pump(out, coll, last, ready, || {
                 if !stopping.load(Ordering::SeqCst) {
                     died.store(true, Ordering::SeqCst);
                     crate::cgroup::kill(&id);
@@ -170,6 +184,23 @@ pub(super) fn start_linux(cfg: &Config, id: &str, i: u32, mode: Mode) -> anyhow:
             })
         })
     };
+    // no tap until the reader is in its sandbox and reading. one that dies
+    // or never says so ends the run here
+    let until = Instant::now() + READY_WAIT;
+    while !ready.load(Ordering::SeqCst) && !died.load(Ordering::SeqCst) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !ready.load(Ordering::SeqCst) || died.load(Ordering::SeqCst) {
+        stopping.store(true, Ordering::SeqCst);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = thread.join();
+        return Err(super::exit(
+            crate::exit::EXIT_SANDBOX,
+            crate::json::Kind::Net,
+            "the network log reader didn't start, no network without it",
+        ));
+    }
     live(|l| {
         *l = Some(Live {
             id: id.into(),
@@ -208,7 +239,8 @@ pub(super) fn start_mac(
     let thread = {
         let (coll, last) = (coll.clone(), last.clone());
         let f = std::fs::File::from(events);
-        std::thread::spawn(move || pump(f, coll, last, || {}))
+        let ready = Arc::new(AtomicBool::new(false));
+        std::thread::spawn(move || pump(f, coll, last, ready, || {}))
     };
     live(|l| {
         *l = Some(Live {
@@ -251,6 +283,20 @@ pub(super) fn stop() {
             let _ = c.wait();
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+/// linux, at each step of starting the VM: a reader that's gone by now
+/// cancels the launch. after the VMM is in its cgroup, a death kills it there
+pub(super) fn alive() -> anyhow::Result<()> {
+    if died() {
+        return Err(super::exit(
+            crate::exit::EXIT_SANDBOX,
+            crate::json::Kind::Net,
+            READER_DIED,
+        ));
+    }
+    Ok(())
 }
 
 /// whether the reader died under a running VM
@@ -331,21 +377,25 @@ mod tests {
             Ipv4Addr::new(172, 29, 217, 2),
             Instant::now(),
         ))));
-        let mut input = format!("{}\n", "x".repeat(LINE_CAP * 3)).into_bytes();
+        // the ready line counts once, a second one is just an invalid line
+        let mut input = format!("{READY}{READY}{}\n", "x".repeat(LINE_CAP * 3)).into_bytes();
         input.extend(b"{\"k\":\"lost\",\"n\":4}\n\xff\xfe\n{\"k\":\"lost\",\"n\":1}");
         let eof = Arc::new(AtomicBool::new(false));
         let e = eof.clone();
+        let ready = Arc::new(AtomicBool::new(false));
         pump(
             &input[..],
             coll.clone(),
             Arc::new(Mutex::new(Instant::now())),
+            ready.clone(),
             move || e.store(true, Ordering::SeqCst),
         );
+        assert!(ready.load(Ordering::SeqCst));
         assert!(eof.load(Ordering::SeqCst));
         let c = coll.lock().unwrap().take().unwrap();
         // the long one and the bad utf-8; the last line had no newline but
         // the producer closed, so it's cut off too
-        assert_eq!(c.invalid, 3);
+        assert_eq!(c.invalid, 4);
         assert_eq!(c.lost, 4);
     }
 }

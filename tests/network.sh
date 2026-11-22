@@ -232,6 +232,16 @@ wait "$dp"
 grep -qx 'rc=125' "$T/death.txt" && grep -q 'network log reader stopped, VM stopped' "$T/death.txt" && [ -z "$(sudo burner ls | grep -v '^no VMs')" ]
 check $? "log: a dead reader stops its VM (125)" "$(tr '\n' ' ' < "$T/death.txt")"
 
+# the same while the VM is still starting: the reader killed as soon as it
+# shows up, before or after it said it's ready. the run never goes on
+# without it, it ends 125 either way
+( sudo burner run --net web --ttl 2m -- 'echo RAN; sleep 30' </dev/null > "$T/early.txt" 2>&1; echo "rc=$?" >> "$T/early.txt" ) &
+ep=$!
+for _ in $(seq 600); do sudo pkill -u burner-parse -f -- __read-netlog && break; sleep 0.05; done
+wait "$ep"
+grep -qx 'rc=125' "$T/early.txt" && grep -qE "network log reader (stopped|didn't start)" "$T/early.txt" && [ -z "$(sudo burner ls | grep -v '^no VMs')" ]
+check $? "log: a reader killed while its VM starts ends the run (125)" "$(tr '\n' ' ' < "$T/early.txt")"
+
 # the summary leaves stdout alone, and --log none says nothing
 sudo burner run --net web --result tar -- 'echo hi > /out/a; nslookup github.com >/dev/null' </dev/null > "$T/res.tar" 2> "$T/res.err"
 tar -tf "$T/res.tar" | grep -qx out/a && grep -q '^burner: net web: ' "$T/res.err"
