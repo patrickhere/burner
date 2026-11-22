@@ -87,7 +87,6 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
     }
     config::trusted_file(root)?;
     let base = own_release();
-    let kept = kept_sums(root)?;
     // checked again before the swap, this only saves a pointless download
     drop(idle(cfg, "swap their image")?);
     go_on()?;
@@ -100,6 +99,9 @@ pub(super) fn setup(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
         let _no_vms = idle(cfg, "swap their image")?;
         recover_all(root)?;
     }
+    // after the recovery, so a kept SHA256SUMS that fails its checks doesn't
+    // keep a set-aside image from coming back
+    let kept = kept_sums(root)?;
     let stage = Stage::new(root)?;
     let sums = match &kept {
         Some((path, text)) => {
