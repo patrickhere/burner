@@ -77,7 +77,9 @@ lock_vms() {
         state=$("$BIN" config 2>/dev/null | sed -n '/^\[paths\]/,/^\[/s/^state = "\(.*\)"$/\1/p')
     fi
     state=${state:-/run/burner}
-    [ -d "$state" ] || return 0
+    # made when it isn't there yet (after a reboot), so a VM that starts now
+    # meets the same lock. root's alone, as burner makes it
+    install -d -m 0700 "$state"
     command -v flock >/dev/null 2>&1 || die "needs flock (util-linux)"
     (umask 077 && : >> "$state/ledger.lock")
     exec 9<> "$state/ledger.lock"
@@ -103,10 +105,12 @@ uninstall() {
     rm -f /etc/systemd/system/burner-net.service /etc/systemd/system/burner-reap.service \
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
-    # checked again with the ledger locked: nothing may start from here on
+    # checked again with the ledger locked: nothing may start from here on.
+    # burner goes first, so nothing can start a VM once the lock file goes
     lock_vms
+    rm -f "$BIN" "$TUI"
     rm -rf "$ROOT" /run/burner
-    rm -f "$BIN" "$TUI" "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
+    rm -f "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
     for u in burner-parse burner; do
         if id "$u" >/dev/null 2>&1; then userdel "$u"; fi
     done
