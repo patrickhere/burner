@@ -73,6 +73,34 @@ struct Target {
     expect: Verdict,
 }
 
+/// what a witness counter says about one target
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Witnessed {
+    /// the target has no counter (macOS, or not blocked in every mode)
+    NoRule,
+    Count(u64),
+    /// it should have one and it couldn't be read: no evidence either way
+    Unreadable,
+}
+
+/// the witness table's counters per target, from what it put up and what
+/// came back. every counter it put up must come back. linux only, there's
+/// no witness table on a mac
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn witnessed(
+    rules: &[usize],
+    counts: Option<&std::collections::HashMap<String, u64>>,
+    i: usize,
+) -> Witnessed {
+    if !rules.contains(&i) {
+        return Witnessed::NoRule;
+    }
+    match counts.and_then(|c| c.get(&format!("w{i}"))) {
+        Some(&n) => Witnessed::Count(n),
+        None => Witnessed::Unreadable,
+    }
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Row {
     pub target: String,
@@ -542,11 +570,16 @@ fn host_saw(t: &Target, log: &NetLog, m: &Model) -> &'static str {
 }
 
 /// one row's verdict, all sources together
-fn judge(t: &Target, saw: &'static str, leaked: Option<u64>, guest: Option<&'static str>) -> Row {
-    let saw = if leaked.is_some_and(|n| n > 0) {
-        "leaked"
-    } else {
-        saw
+fn judge(t: &Target, saw: &'static str, w: Witnessed, guest: Option<&'static str>) -> Row {
+    let saw = match w {
+        Witnessed::Count(n) if n > 0 => "leaked",
+        // a blocked row needs the counter that would have caught a leak
+        Witnessed::Unreadable if saw != "leaked" => "inconclusive",
+        _ => saw,
+    };
+    let leaked = match w {
+        Witnessed::Count(n) => Some(n),
+        _ => None,
     };
     let ok = match (t.expect, saw) {
         (_, "leaked") => false,
@@ -646,7 +679,7 @@ fn rows(
     log: &NetLog,
     m: &Model,
     out: &str,
-    leaked: &dyn Fn(usize) -> Option<u64>,
+    leaked: &dyn Fn(usize) -> Witnessed,
     v6: Option<&'static str>,
 ) -> (Vec<Row>, Vec<String>) {
     let said = guest_said(out, ts);
@@ -758,7 +791,7 @@ fn probe_mode(
         linux::Witness::up(cfg, &ts).map_err(|e| (125, format!("the witness table: {e}")))?;
     let res = run_vm(config, mode, &script(&ts));
     #[cfg(target_os = "linux")]
-    let counts = witness.read();
+    let (counts, witness_rules) = (witness.read(), witness.rules.clone());
     #[cfg(target_os = "linux")]
     drop(witness);
     let (code, env, err) = res.map_err(|e| (125, e))?;
@@ -781,52 +814,49 @@ fn probe_mode(
     }
     #[cfg(target_os = "linux")]
     let (leaked, v6) = {
-        let c = counts.clone();
-        let v6 = linux::v6_saw(&c);
-        let f = move |i: usize| {
-            c.as_ref()
-                .map(|c| c.get(&format!("w{i}")).copied().unwrap_or(0))
-                .filter(|_| ts_has_witness(i))
-        };
+        let (c, rules) = (counts.clone(), witness_rules.clone());
+        let v6 = Some(linux::v6_saw(c.as_ref()));
+        let f = move |i: usize| witnessed(&rules, c.as_ref(), i);
         (f, v6)
     };
     #[cfg(target_os = "macos")]
-    let (leaked, v6) = (|_: usize| None::<u64>, None::<&'static str>);
-    // a closure can't see ts while ts is borrowed for rows: which rows have
-    // a witness rule is fixed by the order, all of the ip ones expected blocked
-    #[cfg(target_os = "linux")]
-    fn ts_has_witness(_: usize) -> bool {
-        true
-    }
+    let (leaked, v6) = (|_: usize| Witnessed::NoRule, None::<&'static str>);
     let (mut rows, mut warnings) = rows(&ts, &log, &m, &err, &leaked, v6);
     // two rows that are the witness alone: anything from a VM into this
     // host past burner's input chain, or out an interface that isn't the uplink
     #[cfg(target_os = "linux")]
-    match &counts {
-        Some(c) => {
-            for (target, key) in [
-                ("anything from a VM into this host (witness)", "in"),
-                (
-                    "anything from a VM out a way that isn't the uplink (witness)",
-                    "post",
-                ),
-            ] {
-                let n = c.get(key).copied().unwrap_or(0);
-                rows.push(Row {
-                    target: target.into(),
-                    kind: "witness",
-                    dst: None,
-                    port: None,
-                    proto: "any",
-                    expect: Verdict::Blocked,
-                    host_saw: if n > 0 { "leaked" } else { "blocked" },
-                    guest_said: None,
-                    leaked_packets: Some(n),
-                    ok: n == 0,
-                });
-            }
+    {
+        if counts.is_none() {
+            warnings.push(
+                "the witness counters couldn't be read back: nothing it covers is confirmed".into(),
+            );
         }
-        None => warnings.push("the witness counters couldn't be read back".into()),
+        for (target, key) in [
+            ("anything from a VM into this host (witness)", "in"),
+            (
+                "anything from a VM out a way that isn't the uplink (witness)",
+                "post",
+            ),
+        ] {
+            let n = counts.as_ref().and_then(|c| c.get(key).copied());
+            let saw = match n {
+                Some(0) => "blocked",
+                Some(_) => "leaked",
+                None => "inconclusive",
+            };
+            rows.push(Row {
+                target: target.into(),
+                kind: "witness",
+                dst: None,
+                port: None,
+                proto: "any",
+                expect: Verdict::Blocked,
+                host_saw: saw,
+                guest_said: None,
+                leaked_packets: n,
+                ok: n == Some(0),
+            });
+        }
     }
     #[cfg(target_os = "macos")]
     {
@@ -959,6 +989,8 @@ mod linux {
     /// counters only, so it can't change what happens to a packet
     pub struct Witness {
         name: String,
+        /// the targets with a counter of their own
+        pub rules: Vec<usize>,
     }
 
     fn nft(args: &[&str], input: Option<&[u8]>) -> std::io::Result<std::process::Output> {
@@ -969,22 +1001,29 @@ mod linux {
         )
     }
 
+    /// which targets get a counter: only what every mode blocks. a leak there
+    /// is a leak whichever VM sent it, so other VMs running now can't make it
+    /// look like one
+    pub fn rule(t: &Target) -> Option<String> {
+        match &t.how {
+            How::Tcp(Dst::Ip(ip), port) if t.expect == Verdict::Blocked && t.kind != "extra" => {
+                Some(format!("ip daddr {ip} tcp dport {port}"))
+            }
+            How::Ping(ip) if t.expect == Verdict::Blocked => {
+                Some(format!("ip daddr {ip} icmp type echo-request"))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn rule_targets(ts: &[Target]) -> Vec<usize> {
+        (0..ts.len()).filter(|&i| rule(&ts[i]).is_some()).collect()
+    }
+
     pub fn table_text(name: &str, subnet: &str, uplink: &str, ts: &[Target]) -> String {
         let mut fwd = String::new();
         for (i, t) in ts.iter().enumerate() {
-            // only what every mode blocks: a leak there is a leak whichever
-            // VM sent it, so other VMs running now can't make it look like one
-            let rule = match &t.how {
-                How::Tcp(Dst::Ip(ip), port)
-                    if t.expect == Verdict::Blocked && t.kind != "extra" =>
-                {
-                    format!("ip daddr {ip} tcp dport {port}")
-                }
-                How::Ping(ip) if t.expect == Verdict::Blocked => {
-                    format!("ip daddr {ip} icmp type echo-request")
-                }
-                _ => continue,
-            };
+            let Some(rule) = rule(t) else { continue };
             fwd += &format!("        ip saddr {subnet} {rule} counter comment \"w{i}\"\n");
         }
         format!(
@@ -1007,7 +1046,10 @@ mod linux {
             if !out.status.success() {
                 return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
             }
-            Ok(Witness { name })
+            Ok(Witness {
+                name,
+                rules: rule_targets(ts),
+            })
         }
 
         /// comment -> packets, None if it can't be read
@@ -1042,16 +1084,16 @@ mod linux {
         Some(out)
     }
 
-    /// what the witness says about ipv6: sent and stopped, never sent, or past
-    pub fn v6_saw(c: &Option<HashMap<String, u64>>) -> Option<&'static str> {
-        let c = c.as_ref()?;
-        let sent = c.get("v6sent").copied().unwrap_or(0);
-        let past = c.get("v6past").copied().unwrap_or(0);
-        Some(match (sent, past) {
-            (_, p) if p > 0 => "leaked",
-            (0, _) => "not_tried",
+    /// what the witness says about ipv6: sent and stopped, never sent, past
+    /// the drop, or no evidence when either counter didn't come back
+    pub fn v6_saw(c: Option<&HashMap<String, u64>>) -> &'static str {
+        let get = |k: &str| c.and_then(|c| c.get(k).copied());
+        match (get("v6sent"), get("v6past")) {
+            (_, Some(p)) if p > 0 => "leaked",
+            (Some(_), None) | (None, _) => "inconclusive",
+            (Some(0), Some(_)) => "not_tried",
             _ => "blocked",
-        })
+        }
     }
 
     pub const PROBE_TABLE: &str = "burner_probe_";
@@ -1379,13 +1421,29 @@ mod tests {
         assert_eq!(host_saw(get("tap-22"), &log, &m), "blocked");
         assert_eq!(host_saw(get("other-vm-22"), &log, &m), "blocked");
         assert_eq!(host_saw(get("metadata-80"), &log, &m), "not_tried");
-        assert!(!judge(get("gateway-443"), "allowed_no_answer", None, None).ok);
-        assert!(judge(get("gateway-80"), "blocked", Some(0), Some("blocked")).ok);
+        assert!(
+            !judge(
+                get("gateway-443"),
+                "allowed_no_answer",
+                Witnessed::NoRule,
+                None
+            )
+            .ok
+        );
+        assert!(
+            judge(
+                get("gateway-80"),
+                "blocked",
+                Witnessed::Count(0),
+                Some("blocked")
+            )
+            .ok
+        );
         // a witness count beats what the log says
-        let r = judge(get("gateway-80"), "blocked", Some(3), None);
+        let r = judge(get("gateway-80"), "blocked", Witnessed::Count(3), None);
         assert_eq!((r.host_saw, r.ok), ("leaked", false));
         assert!(
-            judge(get("metadata-80"), "not_tried", None, None).ok,
+            judge(get("metadata-80"), "not_tried", Witnessed::NoRule, None).ok,
             "inconclusive, a warning"
         );
         let out = "OPEN gateway-80\nBLOCKED tap-22\nOPEN made-up\nGARBAGE x\n";
@@ -1397,7 +1455,7 @@ mod tests {
                 ("tap-22".to_string(), "blocked")
             ]
         );
-        let (rows, warns) = rows(&ts, &log, &m, out, &|_| None, Some("blocked"));
+        let (rows, warns) = rows(&ts, &log, &m, out, &|_| Witnessed::NoRule, Some("blocked"));
         assert!(warns.iter().any(|w| w.contains("the guest says open")));
         assert!(rows.iter().any(|r| !r.ok));
         let text = render(&Probe {
@@ -1415,6 +1473,54 @@ mod tests {
         assert!(text.contains("not as expected"), "{text}");
     }
 
+    /// evidence that's missing never reads as blocked: an unreadable or
+    /// absent witness counter, an attempt whose verdict the log lost, a row
+    /// the guest never seemed to send in a log that's incomplete
+    #[test]
+    fn missing_evidence_is_inconclusive() {
+        let (m, cfg) = model(Mode::Web);
+        let ts = targets(&m, &cfg, Some(Ipv4Addr::new(192, 168, 1, 1)), &args()).unwrap();
+        let get = |n: &str| ts.iter().find(|t| t.name == n).unwrap();
+        let mut c = std::collections::HashMap::new();
+        c.insert("w0".to_string(), 0u64);
+        assert_eq!(witnessed(&[0, 1], Some(&c), 0), Witnessed::Count(0));
+        assert_eq!(witnessed(&[0, 1], Some(&c), 1), Witnessed::Unreadable);
+        assert_eq!(witnessed(&[0, 1], None, 0), Witnessed::Unreadable);
+        assert_eq!(witnessed(&[0, 1], Some(&c), 2), Witnessed::NoRule);
+        let r = judge(get("gateway-80"), "blocked", Witnessed::Unreadable, None);
+        assert_eq!((r.host_saw, r.ok), ("inconclusive", false));
+        // a leak still shows as one
+        let r = judge(get("gateway-80"), "leaked", Witnessed::Unreadable, None);
+        assert_eq!(r.host_saw, "leaked");
+        let mut log = NetLog {
+            id: "burner-000000000001".into(),
+            net: "web".into(),
+            platform: "linux".into(),
+            owner: None,
+            started_unix: 0,
+            secs: 1.0,
+            complete: false,
+            lost: 1,
+            not_itemized: 0,
+            invalid: 0,
+            summary: Default::default(),
+            events: vec![ev(
+                Kind::Conn,
+                Proto::Tcp,
+                "192.168.1.1",
+                Some(80),
+                Verdict::Unknown,
+            )],
+        };
+        assert_eq!(host_saw(get("gateway-80"), &log, &m), "inconclusive");
+        assert_eq!(host_saw(get("gateway-443"), &log, &m), "inconclusive");
+        log.complete = true;
+        log.events.clear();
+        assert_eq!(host_saw(get("gateway-443"), &log, &m), "not_tried");
+        let r = judge(get("gateway-443"), "inconclusive", Witnessed::NoRule, None);
+        assert!(!r.ok);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn witness_table() {
@@ -1429,6 +1535,18 @@ mod tests {
             "ip saddr 172.29.217.0/24 ip daddr 192.168.1.1 tcp dport 80 counter comment"
         ));
         assert!(!t.contains("198.51"), "names aren't witnessed");
+        let mut c = std::collections::HashMap::new();
+        assert_eq!(linux::v6_saw(None), "inconclusive");
+        c.insert("v6sent".to_string(), 4u64);
+        assert_eq!(linux::v6_saw(Some(&c)), "inconclusive", "no v6past");
+        c.insert("v6past".to_string(), 0);
+        assert_eq!(linux::v6_saw(Some(&c)), "blocked");
+        c.insert("v6past".to_string(), 1);
+        assert_eq!(linux::v6_saw(Some(&c)), "leaked");
+        assert_eq!(
+            linux::rule_targets(&ts).len(),
+            t.matches("comment \"w").count()
+        );
         let j = br#"{"nftables":[{"rule":{"family":"inet","table":"t","chain":"fwd","handle":3,"comment":"w0","expr":[{"match":{}},{"counter":{"packets":2,"bytes":120}}]}}]}"#;
         assert_eq!(linux::parse_counts(j).unwrap().get("w0"), Some(&2));
     }
