@@ -118,6 +118,8 @@ printf '#!/bin/sh\n[ "$1" = -G ] || sleep 20 &\nexec ssh -F %s "$@"\n' "$T/ssh_c
 chmod 755 "$T/ssh" "$T/ssh-linger"
 export BURNER_SSH=$T/ssh XDG_CONFIG_HOME=$T/xdg
 unset BURNER_HOST BURNER_BATCH
+# the client's copies of -H runs, on linux. a mac keeps them in burner's own store
+export XDG_STATE_HOME=$T/state
 
 # ---- the stand-in burner: does what the command after -- asks
 VERSION=$("$B" --version | head -n 1)
@@ -552,6 +554,93 @@ chmod 666 "$T/xdg/burner/hosts.toml"
 chmod 600 "$T/xdg/burner/hosts.toml"
 [ "$rc" = 2 ] && grep -q "someone other than you" "$T/e" && ok "a hosts.toml others can write is refused" \
   || bad "hosts.toml trust" "rc=$rc $(short "$T/e")"
+
+# F22 the client keeps its own copy of every -H run and shell, with the host
+# in it: here the ~. from F19 is the newest. what the far end said is cleaned,
+# read leniently, and shown escaped
+case $(uname -s) in
+    Darwin) copies="$HOME/Library/Application Support/burner/logs/$(id -u)" ;;
+    *) copies=$T/state/burner/logs ;;
+esac
+"$B" log --list --json >"$T/cl.json" 2>"$T/e"; rc=$?
+[ "$rc" = 0 ] && json_is '[(r["host"], r["shell"], r["outcome"], r["exit"]) for r in d["result"]["runs"] if r["id"] == "burner-0123456789ab"][:1] == [("fake", True, "detached", 0)]' < "$T/cl.json" \
+  && ok "copy: a shell left with ~. over -H is kept here" || bad "copy of ~." "rc=$rc $(short "$T/cl.json")"
+python3 -I - "$T" <<'PY'
+import json, sys
+t = sys.argv[1]
+ev = {"t": 0.5, "last": 0.5, "count": 1, "dir": "out", "kind": "conn", "proto": "tcp", "dst": "140.82.112.3", "port": 443,
+      "verdict": "allowed", "reason": None, "detail": None, "outcome": "answered", "names": ["github.com\u009b31m"],
+      "bytes_up": None, "bytes_down": None, "name": None, "qtype": None, "rcode": None, "answers": [], "malformed": False}
+blocked = dict(ev, verdict="blocked", reason="geo", detail="a reason from later\u0085", outcome=None, dst="10.0.0.1", names=[])
+http = dict(ev, kind="http", path="/x")
+net = {"id": "burner-feedfacecafe", "net": "web", "platform": "linux", "owner": 1000, "started_unix": 1795000000, "secs": 1.0,
+       "complete": True, "lost": 0, "not_itemized": 0, "invalid": 0, "newer": 1,
+       "summary": {"allowed": 2, "blocked": 1, "blocked_attempts": 1, "dns": 0, "unknown": 0, "http": 1},
+       "events": [ev, blocked, http]}
+res = {"id": "burner-feedfacecafe", "outcome": "exited", "rc": 0, "secs": 1.0, "guest_error": "g\u0085",
+       "vm": {"img": "evil\u009b31m", "net": "web", "tag": "t\u001b]0;x", "backend": "firecracker"}, "report": {"x": 1}, "network": net}
+env = {"schema": 1, "burner": "9.9.9", "command": "run", "host": None, "exit": 0, "ok": True, "result": res, "errors": [], "warnings": []}
+open(t + "/fake2.json", "w").write(json.dumps(env))
+PY
+cat > "$T/fake2-burner" <<EOF
+#!/bin/sh
+if [ "\$1" = --version ]; then echo "$VERSION"; exit 0; fi
+T=$T
+EOF
+cat >> "$T/fake2-burner" <<'EOF'
+n=
+while [ $# -gt 0 ]; do case $1 in --remote) n=${2#1:}; shift 2 ;; --) break ;; *) shift ;; esac; done
+printf 'burner: net web: 2 connections out, 1 blocked, 0 dns lookups (burner log burner-feedfacecafe for all of it)\n' >&2
+printf 'burner-%s status %s\n' "$n" "$(cat "$T/fake2.json")" >&2
+exit 0
+EOF
+chmod 755 "$T/fake2-burner"
+printf '\n[hosts.fake2]\naddrs = ["lo"]\nburner = "%s"\n' "$T/fake2-burner" >> "$T/xdg/burner/hosts.toml"
+"$B" -H fake2 run --net web -- 'echo hi' </dev/null >/dev/null 2>"$T/e.f2"; rc=$?
+"$B" -H fake2 run --net web --log none -- 'echo hi' </dev/null >/dev/null 2>"$T/e.f2n"; rcn=$?
+"$B" log --list --json >"$T/cl.json" 2>/dev/null
+"$B" log burner-feedfacecafe --json >"$T/f2.json" 2>/dev/null; rj=$?
+"$B" log burner-feedfacecafe >"$T/f2.txt" 2>/dev/null; rt=$?
+[ "$rc" = 0 ] && [ "$rcn" = 0 ] && grep -q '^burner: kept here too, burner log burner-feedfacecafe$' "$T/e.f2" && ! grep -q 'kept here too' "$T/e.f2n"
+s1=$?
+python3 -I - "$T" "$copies" "$rj" "$rt" <<'PY'
+import json, os, stat, sys
+t, copies, rj, rt = sys.argv[1:]
+runs = json.load(open(t + "/cl.json"))["result"]["runs"]
+r = [x for x in runs if x["id"] == "burner-feedfacecafe"][0]
+assert (r["host"], r["allowed"], r["blocked"], r["img"], r["tag"], r["net"], r["command"]) == \
+    ("fake2", 2, 1, "evil?31m", "t\\x1b]0;x", "web", "echo hi"), r
+raw = open(t + "/f2.json", "rb").read()
+assert rj == "0" and rt == "0"
+for b in [b"\x1b"] + [bytes([0xc2, c]) for c in range(0x80, 0xa0)]:
+    assert b not in raw, b
+l = json.loads(raw)["result"]
+assert [e["kind"] for e in l["events"]] == ["conn", "conn"] and not l["complete"], l["events"]
+assert l["events"][1]["reason"] is None and l["events"][0]["names"] == ["github.com?31m"]
+assert l["run"]["host"] == "fake2" and l["run"]["result"]["guest_error"] == "g?" and l["run"]["result"]["report"] == {"x": 1}
+txt = open(t + "/f2.txt", "rb").read()
+assert b"\x1b" not in txt and not any(bytes([0xc2, c]) in txt for c in range(0x80, 0xa0)), txt[:300]
+first = txt.split(b"\n")[0].decode()
+assert "  fake2  evil?31m  exit 0  echo hi" in first and b"burner-feedfacecafe: net web" in txt, first
+m = os.stat(copies + "/burner-feedfacecafe@fake2.json").st_mode
+assert stat.S_IMODE(m) == 0o600 and stat.S_IMODE(os.stat(copies).st_mode) == 0o700, oct(m)
+PY
+s2=$?
+[ "$s1" = 0 ] && [ "$s2" = 0 ] \
+  && ok "copy: a far end's json is cleaned, read leniently, shown escaped, kept 0600; the summary says it's kept here" \
+  || bad "copy of a -H run" "rc=$rc/$rcn hint=$s1 read=$s2 $(short "$T/e.f2")"
+# log --list still asks the far end with -H or BURNER_HOST, and -H local doesn't
+"$B" -H fake log --list --from x --limit 3 >"$T/lg" 2>&1; rl=$?
+BURNER_HOST=fake "$B" log --list >"$T/lg2" 2>&1; re=$?
+BURNER_HOST=fake "$B" -H local log --list --from fake2 >"$T/lg3" 2>&1; rlo=$?
+[ "$rl" = 0 ] && grep -qx "fake log --list --from=x --limit=3" "$T/lg" && [ "$re" = 0 ] && grep -qx "fake log --list" "$T/lg2" \
+  && [ "$rlo" = 0 ] && grep -q '^burner-feedfacecafe  .*  fake2  evil?31m  web' "$T/lg3" && ! grep -q 'fake log' "$T/lg3" \
+  && ok "copy: log --list goes over -H and BURNER_HOST, -H local lists the copies here" \
+  || bad "log --list over -H" "h=$rl env=$re local=$rlo $(short "$T/lg") $(short "$T/lg3")"
+# a mac keeps these in burner's own store: the test's copies go
+if [ "$(uname -s)" = Darwin ]; then
+    rm -f "$copies"/burner-0123456789ab@*.json "$copies"/burner-feedfacecafe@*.json
+fi
 
 if [ "$FAKE_ONLY" = 1 ]; then
     echo "---- $pass passed, $fail failed"
