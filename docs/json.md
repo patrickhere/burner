@@ -80,7 +80,7 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 
 ## the connection log
 
-`result.network` of a run or shell with a network, and `result` of `burner log --json`:
+`result.network` of a run or shell with a network, and `result` of `burner log ID --json` (with `run` added, see [the run log](#the-run-log)):
 
 ```json
 {"id":"burner-3fa1c2b7d10e","net":"web","platform":"linux","owner":1000,"started_unix":1795301209,"secs":13.622,
@@ -129,6 +129,38 @@ an event:
 | `malformed` | dns: the message didn't parse, so there's no name |
 
 on linux the verdict is the kernel's and the reason is burner's explanation of it, from the same model `explain` uses. on macOS both are macnet's own. `name`, `names` and `answers` come from dns the guest asked, and a server the guest runs can answer anything: every byte outside letters, digits, `-` and `_` is escaped as `\DDD`, but they're still the guest's words. the address and the verdict are the facts.
+
+## the run log
+
+`burner log ID --json` (or without an id, your newest run) has the connection log's fields above at the top of `result`, as 0.3.0 had them, and adds `run`, the run's record. a run without a log (`--net none`, or a `-H` run whose far end never said how it went) gets an empty one there: `events` empty, `complete` true for `--net none` and false otherwise, `platform` where it ran (`unknown` for a `-H` copy that doesn't say).
+
+```json
+"run":{"record":1,"burner":"0.3.1","id":"burner-3fa1c2b7d10e","host":null,"shell":false,"command":"curl -fsSL https://example.com | sh",
+       "img":"alpine","net":"web","tag":null,"owner":1000,"started_unix":1795301209,"secs":14.2,"exit":0,"outcome":"exited","rc":0,
+       "allowed":6,"blocked":2,"result":{"id":"burner-3fa1c2b7d10e","outcome":"exited","rc":0,...}}
+```
+
+| field | what |
+|---|---|
+| `record` | 1. it goes up when a field here changes or goes away |
+| `burner` | the version that kept it |
+| `host` | the `-H` host it ran on, as you named it, for the copy a client keeps. null for this machine's own runs |
+| `shell` | true for a shell |
+| `command` | the command as the VM's `sh` got it, control characters escaped (a newline is `\n`), cut to 300 characters. empty for a shell |
+| `img`, `net`, `tag` | from `result.vm`, or as asked when the run never got that far |
+| `owner` | the uid that ran it, the sudo caller on linux |
+| `started_unix`, `secs` | when it started and how long it took, this machine's clock |
+| `exit`, `outcome`, `rc` | what burner exited with, `result.outcome`, and the command's exit code when it exited |
+| `allowed`, `blocked` | the log's `summary.allowed` and `summary.blocked`, null without a log |
+| `result` | the run's `result` as its `--json` had it, without `network` (that's the top level here). null when a `-H` client decided how it ended. for a `-H` copy it's the far end's word, DEL and C1 controls made `?` |
+
+`burner log --list --json`, newest first, `--limit` of them (50 by default):
+
+```json
+{"runs":[{"record":1,"burner":"0.3.1","id":"burner-3fa1c2b7d10e","host":"mini",...,"allowed":6,"blocked":2}],"this_machine":true}
+```
+
+each of `runs` is a `run` above without `result`. `this_machine` is false when this machine's own runs aren't in the list: on linux without sudo, where only your `-H` copies are.
 
 ## the other commands
 
