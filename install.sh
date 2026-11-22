@@ -45,7 +45,8 @@ above() { # path
     while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
         if [ -e "$p" ]; then
             [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
-            case "$(stat -c %A "$p")" in
+            # a symlink's own mode means nothing, its owner and its dir do
+            [ -L "$p" ] || case "$(stat -c %A "$p")" in
                 ?????w????|????????w?) die "$p is writable by others than root" ;;
             esac
         fi
@@ -234,7 +235,7 @@ fetch "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$KERNEL_BUILD/$ARCH
 if [ -s /etc/burner/config.toml ]; then
     "$bin" config >/dev/null || die "the new burner doesn't take /etc/burner/config.toml (above), nothing was changed"
 else
-    "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
+    "$bin" --version >/dev/null 2>&1 || die "$bin doesn't run here"
 fi
 ver=$("$bin" --version | awk '{print $2}')
 
