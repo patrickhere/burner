@@ -280,8 +280,11 @@ impl Watch {
     /// on within milliseconds: owed with nothing at all passed on or said
     /// lost between two reads is a stall once it lasts STALL_AFTER.
     /// overflow notes don't come off what's owed, since they don't say how
-    /// many: its socket holds 4M, far more than the log rules' limits let
-    /// a VM send, so a reader that keeps up never overflows. a filter
+    /// many, and an overflow with the last messages gone and nothing after
+    /// looks just like a reader stuck right after one. that's stopped on
+    /// purpose: its socket holds 4M, and the log rules' limits let a VM
+    /// fill that in no less than tens of seconds, so a reader that overflows
+    /// wasn't reading, and messages did go unrecorded. a filter
     /// reload makes the counters again from zero: what they say then was
     /// all sent since the last read, and what was sent between the last
     /// read and the reload is only in the counters the reload threw away
@@ -831,6 +834,14 @@ mod tests {
         assert_eq!(w.tick(at(6), s(2, 1, 2), c(4), s(2, 1, 2)), Fine);
         assert_eq!(w.tick(at(9), s(2, 1, 2), c(4), s(2, 1, 2)), Fine);
         assert_eq!(w.tick(at(12), s(2, 1, 2), c(4), s(2, 1, 2)), Stalled);
+        // nflog dropped the last one, the reader said it overflowed, and
+        // nothing came after to show the gap: a reader that fell that far
+        // behind is stopped like a stuck one, on purpose
+        let mut w = new(0, 0);
+        assert_eq!(w.tick(at(3), p(0), c(2), s(1, 0, 1)), Fine);
+        assert_eq!(w.tick(at(6), s(1, 0, 1), c(2), s(1, 0, 1)), Fine);
+        assert_eq!(w.tick(at(9), s(1, 0, 1), c(2), s(1, 0, 1)), Fine);
+        assert_eq!(w.tick(at(12), s(1, 0, 1), c(2), s(1, 0, 1)), Stalled);
         // a loss shown after the counters' read, of a message they didn't
         // have yet: it comes off at the next read, which has both
         let mut w = new(0, 0);
