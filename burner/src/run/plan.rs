@@ -176,6 +176,27 @@ impl RunArgs {
         self.status_fd
     }
 
+    pub fn img(&self) -> &str {
+        &self.img
+    }
+
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
+    /// --net as given, before limits.net lowers a default
+    pub fn net(&self) -> &str {
+        &self.net
+    }
+
+    /// the command as the VM's sh gets it, empty for a shell
+    pub fn command(&self) -> String {
+        if self.shell {
+            return String::new();
+        }
+        command_string(&self.cmd)
+    }
+
     /// a flag that parses but isn't built yet
     pub(super) fn unbuilt(&self) -> Option<&'static str> {
         if self.json_mark.is_some() {

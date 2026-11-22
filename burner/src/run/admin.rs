@@ -578,7 +578,7 @@ pub fn reap(cfg: &Config) -> Result<ExitCode> {
     // nothing to check on macOS: macnet reads addresses and routes itself
     #[cfg(target_os = "macos")]
     net::refresh_public_ip(cfg);
-    crate::netlog::prune(&cfg.paths.state, crate::netlog::KEEP);
+    crate::runlog::prune(cfg);
     // counters teardown kept for a run that never came back for them
     for e in fs::read_dir(cfg.paths.state.join("netcount"))
         .into_iter()

@@ -46,6 +46,8 @@ pub mod result;
 #[doc(hidden)]
 pub mod run;
 #[doc(hidden)]
+pub mod runlog;
+#[doc(hidden)]
 #[cfg_attr(target_os = "linux", path = "setup_linux.rs")]
 pub mod setup;
 #[doc(hidden)]

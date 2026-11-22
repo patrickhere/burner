@@ -243,7 +243,13 @@ pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
             (code, Some(Problem { kind, message }))
         }
     };
-    finished(a, record::finish(t0, code, failed))
+    let f = record::finish(t0, code, failed);
+    crate::runlog::keep(crate::runlog::Ended::Here {
+        cfg,
+        args: a,
+        fin: &f,
+    });
+    finished(a, f)
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {

@@ -730,6 +730,14 @@ pub(super) fn finish_run_with_id(
     id: Option<&str>,
 ) -> ExitCode {
     let code = end.code;
+    crate::runlog::keep(crate::runlog::Ended::Remote {
+        host,
+        args: a,
+        t0,
+        code,
+        env: end.env.as_ref(),
+        raw: end.raw.as_deref(),
+    });
     match (end.failed, end.env, end.raw) {
         (Some((outcome, f)), _, _) => {
             if !json::on() {
