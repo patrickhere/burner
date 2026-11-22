@@ -168,6 +168,7 @@ case $scen in
         status 3 exited 3; exit 3 ;;
     broken) rec "status not json"; exit 0 ;;
     unknown) rec "teleport now"; status 0 exited 0; exit 0 ;;
+    liar) status 0 timeout null; exit 0 ;;
     huge) rec "status {\"x\":\"$(head -c 70000 /dev/zero | tr '\0' a)\"}"; exit 0 ;;
     skew) echo "error: unexpected argument '--remote' found" >&2; exit 2 ;;
     osc) printf 'a\033]52;c;cHduZWQ=\007b\033]0;title\007c\n'; status 0 exited 0; exit 0 ;;
@@ -328,12 +329,13 @@ fi
 
 # F2 no record, a broken one, one of a kind nobody knows, one over 64K: 125
 codes=
-for s in nostatus broken unknown huge; do
+for s in nostatus broken unknown huge liar; do
     "$B" -H fake run -- "$s" </dev/null >/dev/null 2>"$T/e.$s"
     codes="$codes $s=$?"
 done
-[ "$codes" = " nostatus=125 broken=125 unknown=125 huge=125" ] && grep -q "nothing it said counts" "$T/e.broken" \
-  && ok "no end record, a broken one, an unknown kind, an oversized one: 125" \
+[ "$codes" = " nostatus=125 broken=125 unknown=125 huge=125 liar=125" ] && grep -q "nothing it said counts" "$T/e.broken" \
+  && grep -q "doesn't add up (outcome timeout with exit 0)" "$T/e.liar" \
+  && ok "no end record, a broken one, an unknown kind, an oversized one, one that doesn't add up: 125" \
   || bad "broken records" "$codes $(short "$T/e.broken")"
 
 # F3 a lookalike record without the nonce is only text, and changes nothing

@@ -119,7 +119,7 @@ sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked be
 
 ## over -H
 
-`burner -H HOST CMD --json` asks the far end for its document and prints it again from what was parsed here, with `host` filled in, keys in sorted order and DEL and C1 control characters (which json doesn't escape) made `?`. run and shell get theirs back over ssh in a marked line instead, and `--json-fd` and `--status-fd` are written here. when the far end never answered, the document is the client's own: exit 125, `result` null (or just the id and outcome `lost` when the run had started), and the first error says why with kind `unreachable`, `remote_error` or `lost`.
+`burner -H HOST CMD --json` asks the far end for its document and prints it again from what was parsed here, with `host` filled in, keys in sorted order and DEL and C1 control characters (which json doesn't escape) made `?`. run and shell get theirs back over ssh in a marked line instead, and `--json-fd` and `--status-fd` are written here. that document is the far end's word: the host ran the VM, and a compromised one can say anything in it. burner here checks only that it's schema 1 and that `exit` goes with `result.outcome`, and makes it 125 `remote_error` when it doesn't. when the far end never answered, the document is the client's own: exit 125, `result` null (or just the id and outcome `lost` when the run had started), and the first error says why with kind `unreachable`, `remote_error` or `lost`.
 
 `ls --json` before 0.3 printed the ls object alone, with `mem`, `disk`, `age`, `ttl`, `ttl_left`, `total_mem` and `used_mem`. burner-tui reads both.
 

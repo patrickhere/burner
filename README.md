@@ -198,12 +198,13 @@ burner = "/usr/local/bin/burner"   # where it is there, if not the usual place
 - `burner -H HOST doctor` checks the way there (each address, ssh, burner's version on both ends, the sudo rule) and then shows that host's own doctor. `burner hosts` lists the file, `--check` tries every address
 - `burner -H` refuses to run as root or through sudo: root has other keys and another known_hosts. `net`, `reap` and `setup` don't go over -H, they're for the machine itself
 
-what comes back is checked here, so a compromised host can't do more than lie about its results:
+a result over `-H` is only as trustworthy as the host it ran on. that host runs the VM and the burner that reports on it, so a compromised one can make up the output, the exit code, the json and the result tar, and burner here has no way to check them against what really happened. what burner does guarantee is that a hostile host can't reach past its own results into your machine:
 
 - the far end's output is escaped on your terminal like a local run's, and a shell's goes through the same terminal filter: no title, clipboard or query escapes reach your terminal, and it's reset at the end from what was really written to it
 - `~.` in a shell is read here and ends the session without asking the far end, and ctrl-c in a run stops ssh here. either way burner there sees ssh go and stops the VM
 - a `--result tar` is parsed again here by the same limited parser a guest's tar gets, so only regular files and directories with clean names reach your `tar -x`
-- the exit code comes from a line only burner there can write. a host that doesn't answer, a burner there that doesn't start, and a connection that goes in the middle all end in 125, outcome `unreachable`, `remote_error` or `lost` in `--json-fd`. ssh's own 255 never comes out as burner's: a command that really exits 255 does
+- the exit code comes from a line marked with a nonce that only burner there knows, so the VM can't forge it (the host can). the line has to be schema 1 json whose exit code goes with its outcome, or the run is 125 `remote_error`. a host that doesn't answer, a burner there that doesn't start, and a connection that goes in the middle all end in 125, outcome `unreachable`, `remote_error` or `lost` in `--json-fd`. ssh's own 255 never comes out as burner's: a command that really exits 255 does
+- your flags and host keys: what goes over is rebuilt from parsed arguments so nothing becomes a flag there, forwarding is always off, and a host key is never accepted or written
 - a different burner version on the far end is fine as long as it takes the arguments, `doctor` warns. one that doesn't is refused with a message saying which one to update
 
 things to know:

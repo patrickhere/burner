@@ -574,6 +574,17 @@ pub(super) fn decide(c: &Conn, s: &Seen, ssh: Option<i32>, what: &str) -> End {
             .and_then(Value::as_u64)
             .filter(|c| *c <= 255);
         if let (Some(env), Some(code)) = (env, code) {
+            if let Err(why) = adds_up(&env, code as u8) {
+                return failed(
+                    RunOutcome::RemoteError,
+                    Failed::new(
+                        Kind::RemoteError,
+                        format!(
+                            "{name}: burner there ended with json that doesn't add up ({why}), so nothing it said counts"
+                        ),
+                    ),
+                );
+            }
             return End {
                 code: code as u8,
                 env: Some(env),
@@ -648,6 +659,64 @@ pub(super) fn decide(c: &Conn, s: &Seen, ssh: Option<i32>, what: &str) -> End {
             ),
         ),
     }
+}
+
+/// the far end's end of a run, checked against itself: schema 1, and an
+/// exit code that goes with the outcome the way exit.rs has it. this can't
+/// tell a true answer from a lie told well, the host ran the VM and holds
+/// the nonce, but a careless or garbled one doesn't pass
+pub(super) fn adds_up(env: &Value, code: u8) -> Result<(), String> {
+    if env.get("schema").and_then(Value::as_u64) != Some(u64::from(crate::json::SCHEMA)) {
+        return Err("not schema 1".into());
+    }
+    let result = env.get("result").unwrap_or(&Value::Null);
+    if result.is_null() {
+        // a usage error, a config that didn't load, a signal before the run had an id
+        return match code {
+            2 | 125 | 130 => Ok(()),
+            _ => Err(format!("exit {code} without a result")),
+        };
+    }
+    let Some(outcome) = result.get("outcome").and_then(Value::as_str) else {
+        return Err("a result without an outcome".into());
+    };
+    let rc = result.get("rc").and_then(Value::as_i64);
+    let fits = match serde_json::from_value::<RunOutcome>(Value::String(outcome.into())) {
+        Ok(RunOutcome::Exited) => match rc {
+            Some(rc) => rc == i64::from(code),
+            // a shell whose VM was powered off: no rc, exit 0
+            None => code == 0,
+        },
+        Ok(RunOutcome::Detached) => code == 0,
+        Ok(RunOutcome::Timeout) => code == crate::exit::EXIT_TIMEOUT,
+        Ok(RunOutcome::Killed | RunOutcome::Interrupted) => code == EXIT_INTERRUPTED,
+        Ok(
+            RunOutcome::Busy
+            | RunOutcome::SandboxError
+            | RunOutcome::InputError
+            | RunOutcome::Poweroff
+            | RunOutcome::Reboot,
+        ) => code == EXIT_SANDBOX,
+        // only a client says these
+        Ok(RunOutcome::Unreachable | RunOutcome::RemoteError | RunOutcome::Lost) => false,
+        // one from a newer burner: fine as long as it isn't a success
+        Err(_) => code != 0,
+    };
+    if !fits {
+        return Err(format!(
+            "outcome {} with exit {code}",
+            printable(outcome, 32)
+        ));
+    }
+    let ok = matches!(outcome, "exited" | "detached");
+    if env
+        .get("ok")
+        .and_then(Value::as_bool)
+        .is_some_and(|o| o != ok)
+    {
+        return Err(format!("ok doesn't match outcome {outcome}"));
+    }
+    Ok(())
 }
 
 /// the end of a run or shell over -H, here: the far end's own json with the
@@ -1062,6 +1131,43 @@ mod tests {
         // a hostile ssh config or banner can't put controls in burner's message
         let f = c.ssh_failed(b"x\x1b]0;pwned\x07\n", Some(255));
         assert_eq!(f.msg, "mini: ssh failed on 10.1.0.81: x?]0;pwned?");
+    }
+
+    #[test]
+    fn ends_that_add_up() {
+        let e = |s: &str| serde_json::from_str::<Value>(s).unwrap();
+        let run = |o: &str, rc: &str| {
+            e(&format!(
+                r#"{{"schema":1,"ok":{},"result":{{"outcome":"{o}","rc":{rc}}}}}"#,
+                o == "exited" || o == "detached"
+            ))
+        };
+        assert!(adds_up(&run("exited", "7"), 7).is_ok());
+        assert!(adds_up(&run("exited", "255"), 255).is_ok());
+        assert!(adds_up(&run("exited", "null"), 0).is_ok());
+        assert!(adds_up(&run("timeout", "null"), 124).is_ok());
+        assert!(adds_up(&run("killed", "null"), 130).is_ok());
+        assert!(adds_up(&run("busy", "null"), 125).is_ok());
+        assert!(adds_up(&run("detached", "null"), 0).is_ok());
+        assert!(adds_up(&run("teleported", "null"), 125).is_ok());
+        assert!(adds_up(&e(r#"{"schema":1,"result":null}"#), 2).is_ok());
+        // what doesn't
+        assert!(adds_up(&run("exited", "7"), 0).is_err());
+        assert!(adds_up(&run("timeout", "null"), 0).is_err());
+        assert!(adds_up(&run("sandbox_error", "null"), 0).is_err());
+        assert!(adds_up(&run("lost", "null"), 125).is_err());
+        assert!(adds_up(&run("teleported", "null"), 0).is_err());
+        assert!(adds_up(&e(r#"{"schema":2,"result":null}"#), 2).is_err());
+        assert!(adds_up(&e(r#"{"result":null}"#), 2).is_err());
+        assert!(adds_up(&e(r#"{"schema":1,"result":null}"#), 0).is_err());
+        assert!(
+            adds_up(
+                &e(r#"{"schema":1,"ok":false,"result":{"outcome":"exited","rc":0}}"#),
+                0
+            )
+            .is_err()
+        );
+        assert!(adds_up(&e(r#"{"schema":1,"result":{"rc":0}}"#), 0).is_err());
     }
 
     #[test]
