@@ -1027,7 +1027,12 @@ mod tests {
 
     #[test]
     fn image_dirs_swap_whole() {
-        let t = std::env::temp_dir().join(format!("burner-swap-{}", std::process::id()));
+        // not the temp dir: on linux that's /tmp, which anyone can write,
+        // and setup refuses image dirs under it
+        let t = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("target")
+            .join(format!("test-swap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&t);
         let (new, dest) = (t.join("stage-alpine"), t.join("alpine"));
         let put = |d: &Path, what: &str| {
