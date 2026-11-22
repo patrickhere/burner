@@ -32,6 +32,27 @@ MARK="# written by burner's install.sh"
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# dirs root writes into must not be writable by anyone else: every dir above
+# the real path, so a symlink can't lead past a dir someone else can write
+root_only() { # path
+    above "$1"
+    real=$(readlink -f "$1" 2>/dev/null) || return 0
+    above "$real"
+}
+# the path and every dir above it, as written: a symlink's own dir included
+above() { # path
+    p=$1
+    while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+        if [ -e "$p" ]; then
+            [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
+            case "$(stat -c %A "$p")" in
+                ?????w????|????????w?) die "$p is writable by others than root" ;;
+            esac
+        fi
+        p=$(dirname "$p")
+    done
+}
+
 force="" remove="" purge="" allow=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -80,6 +101,10 @@ lock_vms() { # [what to run first when it finds VMs]
     # made when it isn't there yet (after a reboot), so a VM that starts now
     # meets the same lock. root's alone, as burner makes it
     install -d -m 0700 "$state"
+    root_only "$state"
+    if [ -L "$state/ledger.lock" ] || { [ -e "$state/ledger.lock" ] && [ ! -f "$state/ledger.lock" ]; }; then
+        die "$state/ledger.lock isn't a plain file"
+    fi
     command -v flock >/dev/null 2>&1 || die "needs flock (util-linux)"
     (umask 077 && : >> "$state/ledger.lock")
     exec 9<> "$state/ledger.lock"
@@ -181,27 +206,6 @@ account() { # name
         */nologin|*/false) ;;
         *) die "user $1 has a login shell, burner wants an account nobody logs in as" ;;
     esac
-}
-
-# dirs root writes into must not be writable by anyone else: every dir above
-# the real path, so a symlink can't lead past a dir someone else can write
-root_only() { # path
-    above "$1"
-    real=$(readlink -f "$1" 2>/dev/null) || return 0
-    above "$real"
-}
-# the path and every dir above it, as written: a symlink's own dir included
-above() { # path
-    p=$1
-    while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
-        if [ -e "$p" ]; then
-            [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
-            case "$(stat -c %A "$p")" in
-                ?????w????|????????w?) die "$p is writable by others than root" ;;
-            esac
-        fi
-        p=$(dirname "$p")
-    done
 }
 
 fetch() { # url sha256 dest
