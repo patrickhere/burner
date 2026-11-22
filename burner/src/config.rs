@@ -85,6 +85,7 @@ pub struct Config {
     pub net: Net,
     pub limits: Limits,
     pub jail: Jail,
+    pub log: Log,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +138,29 @@ pub struct Jail {
     /// uid_base .. uid_base + 1023, with no account behind them
     pub uid_base: u32,
 }
+
+/// the run log: what's kept of each run and shell, per owner
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Log {
+    /// the newest this many of each owner's runs. 0 keeps none
+    pub keep_runs: u32,
+    /// and none older than this. 0 keeps none
+    pub keep_days: u32,
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Log {
+            keep_runs: 200,
+            keep_days: 30,
+        }
+    }
+}
+
+/// past these a typo is more likely than a wish
+pub const KEEP_RUNS_MAX: u32 = 100_000;
+pub const KEEP_DAYS_MAX: u32 = 36_500;
 
 impl Default for Jail {
     fn default() -> Self {
@@ -257,6 +281,11 @@ impl Config {
         }
         if l.max_vms > VM_UIDS {
             bail!("limits.max_vms is over {VM_UIDS}, the most VM uids there are");
+        }
+        if self.log.keep_runs > KEEP_RUNS_MAX || self.log.keep_days > KEEP_DAYS_MAX {
+            bail!(
+                "log.keep_runs goes up to {KEEP_RUNS_MAX} and log.keep_days up to {KEEP_DAYS_MAX}"
+            );
         }
         let base = self.jail.uid_base;
         if !(65536..=(1 << 31) - VM_UIDS).contains(&base) {
@@ -783,5 +812,19 @@ mod tests {
         let c: Config = toml::from_str("[jail]\nuid_base = 400000\n").unwrap();
         c.check().unwrap();
         assert!(c.vm_uids().contains(&401_023) && !c.vm_uids().contains(&401_024));
+    }
+
+    #[test]
+    fn log_keys() {
+        let c = Config::default();
+        assert_eq!((c.log.keep_runs, c.log.keep_days), (200, 30));
+        let c: Config = toml::from_str("[log]\nkeep_runs = 0\nkeep_days = 7\n").unwrap();
+        c.check().unwrap();
+        assert_eq!((c.log.keep_runs, c.log.keep_days), (0, 7));
+        assert!(toml::from_str::<Config>("[log]\nkeep = 3\n").is_err());
+        let c: Config = toml::from_str("[log]\nkeep_runs = 100001\n").unwrap();
+        assert!(c.check().is_err());
+        let c: Config = toml::from_str("[log]\nkeep_days = 40000\n").unwrap();
+        assert!(c.check().is_err());
     }
 }
