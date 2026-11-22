@@ -179,7 +179,25 @@ jobs:
       # build provenance for the tarballs: gh attestation verify
       id-token: write
       attestations: write
+      # the workflow runs for the tagged commit, below
+      actions: read
     steps:
+      # nothing is published for a commit that ci and the vm suites didn't
+      # both pass. an api error or no run found stops it too
+      - name: ci and the vm suites passed this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          for wf in ci.yml vm-suites.yml; do
+            n=$(gh api "repos/$GH_REPO/actions/workflows/$wf/runs?head_sha=$SHA&status=success&per_page=1" --jq .total_count) || n=0
+            if ! [[ "$n" =~ ^[0-9]+$ ]] || [ "$n" -lt 1 ]; then
+              echo "no successful $wf run for $SHA, not publishing" >&2
+              exit 1
+            fi
+            echo "$wf passed $SHA"
+          done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
