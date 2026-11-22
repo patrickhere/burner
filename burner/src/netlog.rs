@@ -1091,11 +1091,8 @@ impl NetLog {
         if let Some(s) = o.get("summary").and_then(|s| only_keys(s, &sum)) {
             o["summary"] = s;
         }
-        let rows = o
-            .get("events")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .unwrap_or_default();
+        // a log has its rows, even when there are none
+        let rows = o.get("events")?.as_array()?.clone();
         o["events"] = serde_json::Value::Array(Vec::new());
         let mut log: NetLog = serde_json::from_value(o).ok()?;
         let mut left_out = false;
@@ -1282,6 +1279,8 @@ pub fn table(log: &NetLog) -> String {
     if log.lost > 0 {
         s += &format!(", {} lost", log.lost);
     }
+    // net is the far end's word in a -H copy
+    let mut s = sanitize(&s);
     s.push('\n');
     let mut rows: Vec<[String; 6]> = vec![[
         "time".into(),
@@ -1807,7 +1806,20 @@ mod tests {
         assert_eq!(l.events.last().unwrap().reason, None);
         assert_eq!(l.summary, log.summary);
         assert!(!l.complete, "the http row was left out");
-        // not a log at all
+        // a header that would drive a terminal is shown escaped
+        let mut esc = v.clone();
+        esc["net"] = "web\u{1b}]0;x\u{7}".into();
+        let t = table(&NetLog::lenient(&esc).unwrap());
+        assert!(
+            t.starts_with("net web\\x1b]0;x\\x07, ") && !t.contains('\u{1b}'),
+            "{t}"
+        );
+        // not a log at all: no rows, or rows that aren't a list
+        let mut no_rows = v.clone();
+        no_rows.as_object_mut().unwrap().remove("events");
+        assert!(NetLog::lenient(&no_rows).is_none());
+        no_rows["events"] = "x".into();
+        assert!(NetLog::lenient(&no_rows).is_none());
         assert!(NetLog::lenient(&serde_json::json!({"pad": "aaaa"})).is_none());
         assert!(NetLog::lenient(&serde_json::json!("x")).is_none());
     }
