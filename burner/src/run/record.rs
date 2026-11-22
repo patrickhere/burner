@@ -70,7 +70,7 @@ impl RunOutcome {
 }
 
 /// how guest init said a shell ended
-#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShellEnd {
     Exit,
@@ -82,6 +82,8 @@ pub enum ShellEnd {
     Legacy,
 }
 
+// the run log reads a result back with these types, so its own record is
+// checked as strictly as burner writes it
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct VmInfo {
     pub img: String,
@@ -94,7 +96,52 @@ pub struct VmInfo {
     pub tag: Option<String>,
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+/// VmInfo as it's read back: its words are one of those burner writes
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmRead {
+    img: String,
+    backend: String,
+    vcpus: u32,
+    mem_mib: u32,
+    disk_gib: u32,
+    ttl_secs: u32,
+    net: String,
+    tag: Option<String>,
+}
+
+// by hand: a derive would want 'de: 'static for the &'static str fields
+impl<'de> Deserialize<'de> for VmInfo {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<VmInfo, D::Error> {
+        VmInfo::try_from(VmRead::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl TryFrom<VmRead> for VmInfo {
+    type Error = String;
+    fn try_from(v: VmRead) -> Result<VmInfo, String> {
+        let word = |s: &str, words: &[&'static str]| {
+            words
+                .iter()
+                .copied()
+                .find(|w| *w == s)
+                .ok_or_else(|| format!("{s:?} isn't a word burner writes here"))
+        };
+        Ok(VmInfo {
+            backend: word(&v.backend, &["firecracker", "libkrun"])?,
+            net: word(&v.net, &["none", "web", "open"])?,
+            img: v.img,
+            vcpus: v.vcpus,
+            mem_mib: v.mem_mib,
+            disk_gib: v.disk_gib,
+            ttl_secs: v.ttl_secs,
+            tag: v.tag,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Timing {
     pub queue: Option<f64>,
     pub prepare: Option<f64>,
@@ -104,7 +151,8 @@ pub struct Timing {
     pub teardown: Option<f64>,
 }
 
-#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OutputInfo {
     /// what the command wrote in all, null when the result never came
     pub bytes: Option<u64>,
@@ -116,13 +164,15 @@ pub struct OutputInfo {
     pub dropped: bool,
 }
 
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TarInfo {
     pub bytes: u64,
     pub delivered: bool,
 }
 
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RunResult {
     pub id: String,
     pub outcome: RunOutcome,

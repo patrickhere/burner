@@ -22,7 +22,7 @@ use crate::config::{Config, Log};
 use crate::ledger::valid_id;
 use crate::netlog::NetLog;
 use crate::run::RunArgs;
-use crate::run::record::{Finished, RunOutcome};
+use crate::run::record::{Finished, RunOutcome, RunResult};
 
 /// the head's version: it goes up when a field changes or goes away
 pub const RECORD: u32 = 1;
@@ -210,6 +210,10 @@ fn keep_remote(
     else {
         return Ok(false);
     };
+    // a result that isn't this run's isn't kept with it
+    if str_at(&result, &["id"]).as_deref() != Some(rid.as_str()) {
+        result = Value::Null;
+    }
     let said = str_at(&result, &["outcome"]).map(|o| text(&o, 32));
     let outcome = match (outcome, said) {
         (Some(o), _) => outcome_name(o),
@@ -304,29 +308,34 @@ fn store(dir: &Path, name: &str, head: &Head, result: &Value, keep: &Log) -> io:
 /// and no leftovers of a write that didn't finish
 fn prune_dir(dir: &Path, keep: &Log) {
     let max_age = Duration::from_secs(u64::from(keep.keep_days) * 86_400);
-    for (i, (t, p)) in records_in(dir).into_iter().enumerate() {
+    let mut records = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Some(t) = e.metadata().and_then(|m| m.modified()).ok() else {
+            continue;
+        };
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if record_name(&name).is_some() {
+            records.push((t, e.path()));
+        } else if name
+            .strip_suffix(".new")
+            .is_some_and(|n| record_name(n).is_some())
+            && t.elapsed().is_ok_and(|d| d > Duration::from_secs(600))
+        {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    newest_first(&mut records);
+    for (i, (t, p)) in records.into_iter().enumerate() {
         let old = t.elapsed().is_ok_and(|a| a > max_age);
         if i >= keep.keep_runs as usize || old {
             let _ = fs::remove_file(p);
         }
     }
-    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-        let stale = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|d| d > Duration::from_secs(600));
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if stale
-            && name
-                .strip_suffix(".new")
-                .is_some_and(|n| record_name(n).is_some())
-        {
-            let _ = fs::remove_file(e.path());
-        }
-    }
+}
+
+fn newest_first(v: &mut [(SystemTime, PathBuf)]) {
+    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 }
 
 /// a record's file name: its id, and for a -H copy the host's slug
@@ -351,14 +360,33 @@ fn slug_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
 }
 
-/// a -H host's name as a file name can have it
+/// a -H host's name as a file name can have it, one name to one slug: a
+/// byte past letters, digits, . and - is _xx. a long one is its start and
+/// a hash of all of it
 fn slug(host: &str) -> String {
-    let s: String = host
-        .bytes()
-        .take(SLUG_CAP)
-        .map(|b| if slug_byte(b) { b as char } else { '_' })
-        .collect();
-    if s.is_empty() { "_".into() } else { s }
+    let tok = |b: u8| {
+        if b.is_ascii_alphanumeric() || b == b'.' || b == b'-' {
+            (b as char).to_string()
+        } else {
+            format!("_{b:02x}")
+        }
+    };
+    let full: String = host.bytes().map(tok).collect();
+    if !full.is_empty() && full.len() <= SLUG_CAP {
+        return full;
+    }
+    let mut s = String::new();
+    for t in host.bytes().map(tok) {
+        if s.len() + t.len() > SLUG_CAP - 18 {
+            break;
+        }
+        s += &t;
+    }
+    // fnv-1a: no crate for it, and it only has to tell long names apart
+    let h = host.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{s}_h{h:016x}")
 }
 
 /// the records in a dir, newest first
@@ -373,7 +401,7 @@ fn records_in(dir: &Path) -> Vec<(SystemTime, PathBuf)> {
             Some((e.metadata().ok()?.modified().ok()?, e.path()))
         })
         .collect();
-    v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    newest_first(&mut v);
     v
 }
 
@@ -641,7 +669,7 @@ impl Store {
     pub fn list(&self, keep: impl Fn(&Head) -> bool, limit: usize) -> Vec<Head> {
         self.files()
             .into_iter()
-            .filter_map(|(_, p, s)| read(&p, s, true))
+            .filter_map(|(_, p, s)| read(&p, s))
             .map(|k| k.head)
             .filter(|h| keep(h))
             .take(limit)
@@ -667,7 +695,7 @@ impl Store {
             if !matches {
                 continue;
             }
-            if let Some(k) = read(&p, s, false) {
+            if let Some(k) = read(&p, s) {
                 if id.is_none() || !k.copy {
                     return Some(k);
                 }
@@ -690,19 +718,21 @@ fn open_checked(path: &Path, uid: u32) -> Option<fs::File> {
     (m.is_file() && m.uid() == uid && m.len() <= RECORD_CAP as u64).then_some(f)
 }
 
-/// a record, its head alone when `head_only`. None for anything that isn't
-/// one: the wrong owner, a head that doesn't fit its file name, a copy
-/// where only this machine's runs are
-fn read(path: &Path, s: &Source, head_only: bool) -> Option<Kept> {
+/// a record, checked whole: None for anything that isn't one. the wrong
+/// owner, a head that doesn't fit its file name, a copy where only this
+/// machine's runs are, a result that doesn't parse or is another run's
+fn read(path: &Path, s: &Source) -> Option<Kept> {
     let (id, slug) = record_name(path.file_name()?.to_str()?)?;
     let copy = slug.is_some();
     if s.copies_only && !copy {
         return None;
     }
     let f = open_checked(path, s.uid)?;
-    let cap = if head_only { HEAD_CAP } else { RECORD_CAP };
     let mut b = Vec::new();
-    f.take(cap as u64 + 1).read_to_end(&mut b).ok()?;
+    f.take(RECORD_CAP as u64 + 1).read_to_end(&mut b).ok()?;
+    if b.len() > RECORD_CAP {
+        return None;
+    }
     let nl = b
         .iter()
         .position(|&c| c == b'\n')
@@ -716,19 +746,20 @@ fn read(path: &Path, s: &Source, head_only: bool) -> Option<Kept> {
     if head.id != id || head.host.is_some() != copy || s.owner.is_some_and(|o| head.owner != o) {
         return None;
     }
-    if head_only {
-        return Some(Kept {
-            head,
-            result: Value::Null,
-            copy,
-        });
-    }
-    if b.len() > cap {
-        return None;
-    }
     let mut result: Value = serde_json::from_slice(&b[nl + 1..]).ok()?;
     if copy {
+        // a far end's result, or none when the client decided how it ended
         clean(&mut result);
+        let same = result.get("id").and_then(Value::as_str) == Some(id);
+        if !(result.is_null() || result.is_object() && same) {
+            return None;
+        }
+    } else {
+        // burner's own: read with the types it was written from
+        let r: RunResult = serde_json::from_value(result.clone()).ok()?;
+        if r.id != id {
+            return None;
+        }
     }
     Some(Kept { head, result, copy })
 }
@@ -835,6 +866,7 @@ fn round3(s: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::record::{Timing, VmInfo};
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("burner-runlog-{name}-{}", std::process::id()));
@@ -866,6 +898,45 @@ mod tests {
         }
     }
 
+    /// a result the way a run of this burner writes one
+    fn result(id: &str, network: Option<Value>) -> Value {
+        let r = RunResult {
+            id: id.into(),
+            outcome: RunOutcome::Exited,
+            rc: Some(0),
+            shell_end: None,
+            guest_error: None,
+            guest_result: None,
+            secs: 1.5,
+            timing_secs: Timing::default(),
+            vm: Some(VmInfo {
+                img: "alpine".into(),
+                backend: "libkrun",
+                vcpus: 1,
+                mem_mib: 512,
+                disk_gib: 2,
+                ttl_secs: 600,
+                net: "web",
+                tag: None,
+            }),
+            output: None,
+            result_tar: None,
+            network: network.map(|n| serde_json::from_value(n).unwrap()),
+            files: None,
+            processes: None,
+        };
+        serde_json::to_value(r).unwrap()
+    }
+
+    fn log(id: &str) -> Value {
+        serde_json::json!({
+            "id": id, "net": "web", "platform": "linux", "owner": 1000, "started_unix": 1,
+            "secs": 1.0, "complete": true, "lost": 0, "not_itemized": 0, "invalid": 0,
+            "summary": {"allowed": 1, "blocked": 0, "blocked_attempts": 0, "dns": 0, "unknown": 0},
+            "events": []
+        })
+    }
+
     fn id(i: usize) -> String {
         format!("burner-{i:012x}")
     }
@@ -874,6 +945,10 @@ mod tests {
         let f = fs::File::options().write(true).open(p).unwrap();
         f.set_modified(SystemTime::now() - Duration::from_secs(secs))
             .unwrap();
+    }
+
+    fn line(h: &Head, r: &Value) -> String {
+        format!("{}\n{r}\n", serde_json::to_value(h).unwrap())
     }
 
     #[test]
@@ -896,10 +971,18 @@ mod tests {
         ] {
             assert!(record_name(bad).is_none(), "{bad}");
         }
-        assert_eq!(slug("pat@mini.tail1234.ts.net"), "pat_mini.tail1234.ts.net");
-        assert_eq!(slug(""), "_");
-        assert_eq!(slug(&"x".repeat(200)).len(), SLUG_CAP);
-        assert!(record_name(&format!("burner-0123456789ab@{}.json", slug("a b/c"))).is_some());
+        assert_eq!(slug("mini.tail1234.ts.net"), "mini.tail1234.ts.net");
+        assert_eq!(slug("pat@mini"), "pat_40mini");
+        // one name, one slug: these used to be the same file
+        assert_ne!(slug("a@b"), slug("a_b"));
+        let long = "x".repeat(200);
+        let other = "x".repeat(199) + "y";
+        assert!(slug(&long).len() <= SLUG_CAP && slug(&long) != slug(&other));
+        assert!(slug("").starts_with("_h"));
+        for h in ["pat@mini", "a b/c", "", &long, "é"] {
+            let name = format!("burner-0123456789ab@{}.json", slug(h));
+            assert!(record_name(&name).is_some(), "{name}");
+        }
     }
 
     #[test]
@@ -918,11 +1001,12 @@ mod tests {
             keep_days: 30,
         };
         for i in 0..5 {
+            let r = result(&id(i), None);
             store(
                 &d,
                 &format!("{}.json", id(i)),
                 &head(&id(i), None),
-                &Value::Null,
+                &r,
                 &keep,
             )
             .unwrap();
@@ -951,11 +1035,12 @@ mod tests {
             keep_runs: 0,
             keep_days: 30,
         };
+        let r = result(&id(7), None);
         store(
             &d,
             &format!("{}.json", id(7)),
             &head(&id(7), None),
-            &Value::Null,
+            &r,
             &none,
         )
         .unwrap();
@@ -967,27 +1052,21 @@ mod tests {
     fn reads_back_strict_and_lenient() {
         let d = tmp("read");
         let keep = Log::default();
-        let mut log = serde_json::json!({
-            "id": id(1), "net": "web", "platform": "linux", "owner": 1000, "started_unix": 1,
-            "secs": 1.0, "complete": true, "lost": 0, "not_itemized": 0, "invalid": 0,
-            "summary": {"allowed": 1, "blocked": 0, "blocked_attempts": 0, "dns": 0, "unknown": 0},
-            "events": []
-        });
-        let result =
-            serde_json::json!({"id": id(1), "outcome": "exited", "rc": 0, "network": log.clone()});
+        let mut l = log(&id(1));
+        let r = result(&id(1), Some(l.clone()));
         store(
             &d,
             &format!("{}.json", id(1)),
             &head(&id(1), None),
-            &result,
+            &r,
             &keep,
         )
         .unwrap();
         age(&d.join(format!("{}.json", id(1))), 100);
         // a copy from a newer far end: a field more in the log and the head
-        log["report"] = "x".into();
+        l["report"] = "x".into();
         let copy = serde_json::json!({"id": id(1), "outcome": "exited", "rc": 0,
-            "guest_error": "a\u{9b}b", "network": log});
+            "guest_error": "a\u{9b}b", "network": l});
         let mut h = head(&id(1), Some("mini"));
         h.exit = 3;
         store(&d, &format!("{}@mini.json", id(1)), &h, &copy, &keep).unwrap();
@@ -1025,23 +1104,21 @@ mod tests {
     fn refuses_what_isnt_a_record() {
         let d = tmp("refuse");
         let keep = Log::default();
-        let good = format!(
-            "{}\nnull\n",
-            serde_json::to_value(head(&id(1), None)).unwrap()
-        );
+        let good = |i: usize| line(&head(&id(i), None), &result(&id(i), None));
         // a link to a record is never followed
         let target = d.join("target");
-        fs::write(&target, &good).unwrap();
+        fs::write(&target, good(1)).unwrap();
         std::os::unix::fs::symlink(&target, d.join(format!("{}.json", id(1)))).unwrap();
         // a head that names another run than its file, or claims to be from
         // here in a copy's name, or is strict and has a field too many
-        fs::write(d.join(format!("{}.json", id(2))), &good).unwrap();
-        fs::write(d.join(format!("{}@x.json", id(1))), &good).unwrap();
+        fs::write(d.join(format!("{}.json", id(2))), good(1)).unwrap();
+        fs::write(d.join(format!("{}@x.json", id(1))), good(1)).unwrap();
         let mut extra = serde_json::to_value(head(&id(3), None)).unwrap();
         extra["x"] = 1.into();
+        let r3 = result(&id(3), None);
         fs::write(
             d.join(format!("{}.json", id(3))),
-            format!("{extra}\nnull\n"),
+            format!("{extra}\n{r3}\n"),
         )
         .unwrap();
         // a fifo would hang a reader that blocks
@@ -1054,22 +1131,50 @@ mod tests {
         // SAFETY: mkfifo on a path we made
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
         // too big
-        let mut big = good.clone().into_bytes();
+        let mut big = good(5).into_bytes();
         big.resize(RECORD_CAP + 10, b' ');
         fs::write(d.join(format!("{}.json", id(5))), big).unwrap();
+        // a result cut short, one that's another run's, one this burner
+        // didn't write (a field too many, a backend it doesn't have)
+        let g = good(6);
+        fs::write(d.join(format!("{}.json", id(6))), &g[..g.len() - 20]).unwrap();
+        let other = line(&head(&id(7), None), &result(&id(8), None));
+        fs::write(d.join(format!("{}.json", id(7))), other).unwrap();
+        let mut odd = result(&id(8), None);
+        odd["report"] = 1.into();
+        fs::write(
+            d.join(format!("{}.json", id(8))),
+            line(&head(&id(8), None), &odd),
+        )
+        .unwrap();
+        let mut vmm = result(&id(9), None);
+        vmm["vm"]["backend"] = "qemu".into();
+        fs::write(
+            d.join(format!("{}.json", id(9))),
+            line(&head(&id(9), None), &vmm),
+        )
+        .unwrap();
+        // a copy whose result is another run's
+        let wrong = line(&head(&id(10), Some("x")), &result(&id(11), None));
+        fs::write(d.join(format!("{}@x.json", id(10))), wrong).unwrap();
         let s = Store::at(&[(&d, false)]);
-        assert!(s.list(|_| true, 10).is_empty());
+        assert!(
+            s.list(|_| true, 20).is_empty(),
+            "{:?}",
+            s.list(|_| true, 20)
+        );
         assert!(s.find(None).is_none());
-        // and the same file from its owner is fine
+        // and the same written by store is fine
+        let r = result(&id(12), None);
         store(
             &d,
-            &format!("{}.json", id(6)),
-            &head(&id(6), None),
-            &Value::Null,
+            &format!("{}.json", id(12)),
+            &head(&id(12), None),
+            &r,
             &keep,
         )
         .unwrap();
-        assert_eq!(s.list(|_| true, 10).len(), 1);
+        assert_eq!(s.list(|_| true, 20).len(), 1);
         fs::remove_dir_all(&d).unwrap();
     }
 
