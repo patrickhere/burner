@@ -267,8 +267,16 @@ recover_share() {
 # any older one goes. sudo $SHARE/previous/install.sh goes back to it
 switch() {
     as_root rm -rf "$SHARE/.old"
-    if [ -e "$SHARE/$name" ]; then as_root mv -T "$SHARE/$name" "$SHARE/.old"; fi
-    as_root mv -T "$SHARE/.new/$name" "$SHARE/$name"
+    if [ -e "$SHARE/$name" ] && as_root diff -r "$SHARE/$name" "$SHARE/.new/$name" >/dev/null 2>&1; then
+        # a reinstall of the same files: the copy that's there stays
+        :
+    elif [ -e "$SHARE/$name" ] && as_root mv --exchange -T "$SHARE/.new/$name" "$SHARE/$name" 2>/dev/null; then
+        # one step where mv can (coreutils 9.5 and later)
+        :
+    else
+        if [ -e "$SHARE/$name" ]; then as_root mv -T "$SHARE/$name" "$SHARE/.old"; fi
+        as_root mv -T "$SHARE/.new/$name" "$SHARE/$name"
+    fi
     as_root rm -rf "$SHARE/.new" "$SHARE/.old"
     was=$(readlink "$SHARE/current" 2>/dev/null) || was=""
     if [ -n "$was" ] && [ "$was" != "$name" ] && [ -d "$SHARE/$was" ]; then
