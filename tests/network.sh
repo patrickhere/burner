@@ -361,8 +361,9 @@ rec=/var/lib/burner/logs/$owner/$rid.json
 check $? "run log: kept in /var/lib/burner/logs, root only, nothing in the state dir" "rec=$rec $(sudo ls -la /var/lib/burner/logs 2>&1 | head -n 3 | tr '\n' ' ')"
 # without sudo: only your -H copies, and a line on how to see this machine's.
 # the suite can run as root itself (sudo bash tests/network.sh): then "you"
-# is the sudo caller
+# is the sudo caller, or nobody when there's none
 if [ "$(id -u)" = 0 ]; then me=${SUDO_UID:-0}; else me=$(id -u); fi
+[ "$me" = 0 ] && me=$(id -u nobody 2>/dev/null || echo 0)
 as_me() {
     if [ "$(id -u)" = 0 ]; then
         sudo -u "#$me" env -u SUDO_UID -u SUDO_GID -u SUDO_USER -u SUDO_COMMAND "$@"
@@ -373,7 +374,7 @@ as_me() {
 # root through sudo, as the caller would be
 as_sudo() { if [ "$(id -u)" = 0 ]; then env SUDO_UID="$me" "$@"; else sudo "$@"; fi; }
 if [ "$me" = 0 ]; then
-    echo "SKIP  run log without sudo  (no user to be, run this as a sudoer or through sudo)"
+    echo "SKIP  run log without sudo  (no user to be: no sudo caller and no nobody)"
 else
     out=$(as_me burner log --list 2>&1); prc=$?
     as_me burner log "$rid" >/dev/null 2>"$T/pl.err"; pirc=$?

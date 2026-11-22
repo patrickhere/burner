@@ -9,8 +9,7 @@
 #
 # BURNER picks the client binary (default: burner on PATH). nothing outside a
 # temp dir is touched: the sshd, its keys, known_hosts, ssh config and
-# hosts.toml all live there and go at the end. on a mac the client's copies
-# of -H runs go in burner's own log store, and the stand-ins' go at the end
+# hosts.toml all live there and go at the end
 set -u
 FAKE_ONLY=0
 [ "${1:-}" = --fake-only ] && FAKE_ONLY=1
@@ -32,8 +31,6 @@ SSHD_PID=
 cleanup() {
     [ -n "$SSHD_PID" ] && kill "$SSHD_PID" 2>/dev/null
     rm -rf "$T"
-    # a mac keeps -H copies in burner's own store: the stand-ins' ids go
-    [ "$(uname -s)" = Darwin ] && rm -f "$HOME/Library/Application Support/burner/logs/$(id -u)"/burner-{0123456789ab,feedfacecafe}@*.json
 }
 trap cleanup EXIT
 pass=0; fail=0
@@ -121,7 +118,7 @@ printf '#!/bin/sh\n[ "$1" = -G ] || sleep 20 &\nexec ssh -F %s "$@"\n' "$T/ssh_c
 chmod 755 "$T/ssh" "$T/ssh-linger"
 export BURNER_SSH=$T/ssh XDG_CONFIG_HOME=$T/xdg
 unset BURNER_HOST BURNER_BATCH
-# the client's copies of -H runs, on linux. a mac keeps them in burner's own store
+# where the client keeps its copies of -H runs, a mac included
 export XDG_STATE_HOME=$T/state
 
 # ---- the stand-in burner: does what the command after -- asks
@@ -561,10 +558,7 @@ chmod 600 "$T/xdg/burner/hosts.toml"
 # F22 the client keeps its own copy of every -H run and shell, with the host
 # in it: here the ~. from F19 is the newest. what the far end said is cleaned,
 # read leniently, and shown escaped
-case $(uname -s) in
-    Darwin) copies="$HOME/Library/Application Support/burner/logs/$(id -u)" ;;
-    *) copies=$T/state/burner/logs ;;
-esac
+copies=$T/state/burner/logs
 "$B" log --list --json >"$T/cl.json" 2>"$T/e"; rc=$?
 [ "$rc" = 0 ] && json_is '[(r["host"], r["shell"], r["outcome"], r["exit"]) for r in d["result"]["runs"] if r["id"] == "burner-0123456789ab"][:1] == [("fake", True, "detached", 0)]' < "$T/cl.json" \
   && ok "copy: a shell left with ~. over -H is kept here" || bad "copy of ~." "rc=$rc $(short "$T/cl.json")"
