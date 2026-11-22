@@ -5,6 +5,8 @@
 #[cfg_attr(target_os = "macos", path = "cgroup_macos.rs")]
 pub mod cgroup;
 #[doc(hidden)]
+pub mod completions;
+#[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
 pub mod dns;
@@ -44,7 +46,7 @@ pub mod result;
 #[doc(hidden)]
 pub mod run;
 #[doc(hidden)]
-#[cfg(target_os = "macos")]
+#[cfg_attr(target_os = "linux", path = "setup_linux.rs")]
 pub mod setup;
 #[doc(hidden)]
 pub mod sys;

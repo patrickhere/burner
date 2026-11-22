@@ -9,12 +9,19 @@ use burnervm::json::{self, Kind};
 #[cfg(target_os = "linux")]
 use burnervm::net;
 #[cfg(target_os = "macos")]
-use burnervm::{cgroup, krun, macnet, setup, sys};
-use burnervm::{doctor, exit, explain, probe, remote, result, run};
+use burnervm::{cgroup, krun, macnet, sys};
+use burnervm::{completions, doctor, exit, explain, probe, remote, result, run, setup};
 
-/// throwaway firecracker VMs on your own hardware
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version)]
+#[cfg_attr(
+    target_os = "linux",
+    command(about = "throwaway firecracker VMs on your own hardware")
+)]
+#[cfg_attr(
+    target_os = "macos",
+    command(about = "throwaway linux VMs on your mac, through libkrun")
+)]
 struct Cli {
     /// config file [default: /etc/burner/config.toml, on macOS in
     /// ~/Library/Application Support/burner]
@@ -54,9 +61,9 @@ enum Cmd {
     /// list running VMs
     Ls,
     /// every connection a run's VM tried, allowed or blocked: yours, the newest without an ID
-    Log { id: Option<String> },
+    Log(run::LogArgs),
     /// stop a running VM
-    Kill { id: String },
+    Kill(run::KillArgs),
     /// list installed images
     Images,
     /// this burner's version, backend and the json and guest protocol it speaks
@@ -67,9 +74,22 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// fetch the guest kernel and alpine image from a release and install them
-    #[cfg(target_os = "macos")]
+    #[cfg_attr(
+        target_os = "linux",
+        command(about = "fetch this version's images from its release and install them")
+    )]
+    #[cfg_attr(
+        target_os = "macos",
+        command(
+            about = "install the guest kernel and images: the copy homebrew installed, or a release"
+        )
+    )]
     Setup(setup::SetupArgs),
+    /// print completions for a shell
+    Completions(completions::CompletionsArgs),
+    /// the man pages, for packaging
+    #[command(name = "__man", hide = true)]
+    Man(completions::ManArgs),
     /// clean up after dead runs (run by the burner-reap timer)
     #[command(hide = true)]
     Reap,
@@ -211,13 +231,14 @@ impl Cmd {
                 _ => "net show",
             },
             Cmd::Ls => "ls",
-            Cmd::Log { .. } => "log",
-            Cmd::Kill { .. } => "kill",
+            Cmd::Log(_) => "log",
+            Cmd::Kill(_) => "kill",
             Cmd::Images => "images",
             Cmd::Version => "version",
             Cmd::Hosts { .. } => "hosts",
-            #[cfg(target_os = "macos")]
             Cmd::Setup(_) => "setup",
+            Cmd::Completions(_) => "completions",
+            Cmd::Man(_) => "__man",
             Cmd::Reap => "reap",
             Cmd::ParseResult { .. } => "__parse-result",
             #[cfg(target_os = "linux")]
@@ -283,8 +304,22 @@ fn command_word(args: &[String]) -> Option<&'static str> {
         _ => cmd,
     };
     [
-        "config", "doctor", "run", "shell", "explain", "net up", "net down", "net show", "ls",
-        "log", "kill", "images", "setup", "version", "hosts",
+        "config",
+        "doctor",
+        "run",
+        "shell",
+        "explain",
+        "net up",
+        "net down",
+        "net show",
+        "ls",
+        "log",
+        "kill",
+        "images",
+        "setup",
+        "version",
+        "hosts",
+        "completions",
     ]
     .into_iter()
     .find(|c| *c == full)
@@ -302,6 +337,8 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
         Cmd::Run(a) if a.is_remote() => return None,
         Cmd::Shell(a) if a.is_remote() => return None,
         Cmd::ParseResult { .. } | Cmd::Hosts { .. } => return None,
+        // about this burner's own command line, nothing to ask a host
+        Cmd::Completions(_) | Cmd::Man(_) => return None,
         _ => {}
     }
     let env = std::env::var("BURNER_HOST").ok();
@@ -337,13 +374,13 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     let h = &host.name;
     Some(match &cli.cmd {
         Cmd::Ls => remote::client::oneshot(&host, "ls", words(&["ls"]), Mode::Auto),
-        // checked here: an id like -Hother would be a flag on the far end
-        Cmd::Kill { id } if !burnervm::ledger::valid_id(id) => {
-            return usage("usage: burner kill burner-xxxxxxxxxxxx".into());
-        }
-        Cmd::Kill { id } => {
-            remote::client::oneshot(&host, "kill", words(&["kill", id]), Mode::Auto)
-        }
+        Cmd::Kill(a) => match a.remote_argv() {
+            Ok(argv) => {
+                let w: Vec<&str> = argv.iter().map(String::as_str).collect();
+                remote::client::oneshot(&host, "kill", words(&w), Mode::Auto)
+            }
+            Err(e) => return usage(e),
+        },
         // the sudo rule names `burner images` exactly, so no --config for it
         Cmd::Images => {
             remote::client::oneshot(&host, "images", vec!["images".to_string()], Mode::Auto)
@@ -360,14 +397,13 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
             ));
         }
         // the summary after a run over -H names a log that's kept there
-        Cmd::Log { id: Some(id) } if !burnervm::ledger::valid_id(id) => {
-            return usage("usage: burner log [burner-xxxxxxxxxxxx]".into());
-        }
-        Cmd::Log { id } => {
-            let mut w = vec!["log"];
-            w.extend(id.as_deref());
-            remote::client::oneshot(&host, "log", words(&w), Mode::Auto)
-        }
+        Cmd::Log(a) => match a.remote_argv() {
+            Ok(argv) => {
+                let w: Vec<&str> = argv.iter().map(String::as_str).collect();
+                remote::client::oneshot(&host, "log", words(&w), Mode::Auto)
+            }
+            Err(e) => return usage(e),
+        },
         Cmd::Explain(a) => match a.remote_argv() {
             Ok(argv) => {
                 let w: Vec<&str> = argv.iter().map(String::as_str).collect();
@@ -398,6 +434,11 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     }
     if let Cmd::Hosts { check } = cli.cmd {
         return Ok(remote::doctor::hosts(check));
+    }
+    match &cli.cmd {
+        Cmd::Completions(a) => return Ok(completions::main(Cli::command(), a)),
+        Cmd::Man(a) => return Ok(completions::man(Cli::command(), a)),
+        _ => {}
     }
     let t0 = Instant::now();
     // a shell is a run with the caller's terminal from here on
@@ -491,8 +532,8 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         },
         Cmd::Explain(a) => explain_main(&cfg, &a, cli.json),
         Cmd::Ls => run::ls(&cfg),
-        Cmd::Log { id } => run::log(&cfg, id.as_deref()),
-        Cmd::Kill { id } => run::kill(&cfg, &id),
+        Cmd::Log(a) => run::log(&cfg, &a),
+        Cmd::Kill(a) => run::kill(&cfg, &a),
         Cmd::Images if cli.json => Ok(json::reply("images", 0, Some(run::images_result(&cfg)))),
         Cmd::Images => {
             for i in run::images(&cfg) {
@@ -501,8 +542,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Reap => run::reap(&cfg),
-        Cmd::Version | Cmd::Hosts { .. } => unreachable!("handled before the config loads"),
-        #[cfg(target_os = "macos")]
+        Cmd::Version | Cmd::Hosts { .. } | Cmd::Completions(_) | Cmd::Man(_) => {
+            unreachable!("handled before the config loads")
+        }
         Cmd::Setup(a) => setup::main(&cfg, a),
         Cmd::ParseResult { .. } => unreachable!("handled before the config loads"),
         #[cfg(target_os = "linux")]

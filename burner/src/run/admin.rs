@@ -4,6 +4,7 @@ use std::process::{Child, ExitCode};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use clap::Args;
 use serde::Serialize;
 
 use super::EXIT_USAGE;
@@ -308,15 +309,54 @@ pub struct KillResult {
     pub state: &'static str,
 }
 
-pub fn kill(cfg: &Config, id: &str) -> Result<ExitCode> {
-    if !valid_id(id) {
-        return Ok(json::fail(
-            "kill",
-            EXIT_USAGE,
-            Kind::Usage,
-            "usage: burner kill burner-xxxxxxxxxxxx",
-        ));
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+pub struct KillArgs {
+    /// the VM's id, from burner ls
+    id: Option<String>,
+    /// every VM of yours with this tag
+    #[arg(long)]
+    tag: Option<String>,
+    /// every VM of yours
+    #[arg(long)]
+    mine: bool,
+}
+
+const KILL_USAGE: &str = "usage: burner kill burner-xxxxxxxxxxxx";
+
+impl KillArgs {
+    /// a flag that parses but isn't built yet
+    fn unbuilt(&self) -> Option<&'static str> {
+        if self.tag.is_some() {
+            Some("burner kill --tag: not yet")
+        } else if self.mine {
+            Some("burner kill --mine: not yet")
+        } else {
+            None
+        }
     }
+
+    /// burner's argv on the far end of -H. checked here: an id like
+    /// -Hother would be a flag there
+    pub fn remote_argv(&self) -> std::result::Result<Vec<String>, String> {
+        if let Some(why) = self.unbuilt() {
+            return Err(why.into());
+        }
+        match &self.id {
+            Some(id) if valid_id(id) => Ok(vec!["kill".into(), id.clone()]),
+            _ => Err(KILL_USAGE.into()),
+        }
+    }
+}
+
+pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
+    if let Some(why) = a.unbuilt() {
+        return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, why));
+    }
+    let id = match &a.id {
+        Some(id) if valid_id(id) => id.as_str(),
+        _ => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, KILL_USAGE)),
+    };
     // through sudo you can only kill what you started. real root can kill anything
     let caller: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
     // nothing is printed while the ledger is locked: a stalled stderr would hold it

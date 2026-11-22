@@ -56,6 +56,9 @@ pub struct SetupArgs {
     /// against that: the kernel's pinned checksum is skipped
     #[arg(long, value_name = "URL", conflicts_with = "version")]
     from: Option<String>,
+    /// remove what setup installed
+    #[arg(long, conflicts_with_all = ["images", "version", "from"])]
+    remove: bool,
 }
 
 /// where the kernel and images come from
@@ -103,6 +106,14 @@ fn and_list(names: &[String]) -> String {
 }
 
 pub fn main(cfg: &Config, a: SetupArgs) -> Result<ExitCode> {
+    if a.remove {
+        return Ok(json::fail(
+            "setup",
+            crate::run::EXIT_USAGE,
+            Kind::Usage,
+            "burner setup --remove: not yet",
+        ));
+    }
     // ctrl-c sets a flag instead of killing burner, so the stage dir goes and
     // curl or gzip with it
     crate::run::interrupted();

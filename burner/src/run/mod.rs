@@ -25,14 +25,14 @@ pub mod record;
 
 #[cfg(target_os = "linux")]
 pub use admin::reaper_age;
-pub use admin::{kill, ls, reap};
+pub use admin::{KillArgs, kill, ls, reap};
 pub(crate) use console::Escape;
 #[cfg(target_os = "linux")]
 pub use launch::VMM_OVERHEAD_MIB;
 #[cfg(target_os = "macos")]
 pub use launch::mkfs_bin;
 pub use launch::{GUEST_PROTO, VMM, check_fds, config_failed, finished, json_target, main, refuse};
-pub use log::log;
+pub use log::{LogArgs, log};
 
 /// the line the network log's reader writes first
 pub fn netlog_ready() -> &'static str {

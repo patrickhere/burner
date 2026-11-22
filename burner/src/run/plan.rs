@@ -21,6 +21,7 @@ pub struct RunArgs {
     /// image to boot (burner images lists them)
     #[arg(long, default_value = "alpine")]
     img: String,
+    /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
     /// memory in MiB
@@ -53,6 +54,10 @@ pub struct RunArgs {
     /// use 2: the json is then the last line on stderr
     #[arg(long, value_name = "FD")]
     pub(super) json_fd: Option<i32>,
+    /// mark the json with this nonce, so a line the guest wrote can't pass
+    /// for it
+    #[arg(long, value_name = "NONCE")]
+    json_mark: Option<String>,
     /// the connection log after a run with a network, on stderr: a summary,
     /// the full table, or nothing. it's kept either way (burner log)
     #[arg(long, value_enum, default_value_t = LogMode::Summary)]
@@ -60,6 +65,9 @@ pub struct RunArgs {
     /// fail right away instead of queueing when every slot is taken
     #[arg(long)]
     no_wait: bool,
+    /// how long to queue for a slot: 30s, 5m [default: 10m]
+    #[arg(long, value_name = "TIME", conflicts_with = "no_wait")]
+    wait: Option<String>,
     /// burner -H on the far end of ssh: how it ended goes to stderr as a
     /// marked line, and a closed stdout or stderr stops the run
     #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
@@ -69,6 +77,9 @@ pub struct RunArgs {
     cmd: Vec<String>,
     #[arg(skip)]
     pub(super) shell: bool,
+    /// shell --img was given
+    #[arg(skip)]
+    shell_img: bool,
     /// --net wasn't given: lower it to limits.net instead of refusing
     #[arg(skip)]
     net_default: bool,
@@ -78,6 +89,10 @@ pub struct RunArgs {
 pub struct ShellArgs {
     /// image to boot (burner images lists them), default alpine
     spec: Option<String>,
+    /// the image, as run takes it
+    #[arg(long, conflicts_with = "spec")]
+    img: Option<String>,
+    /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
     /// memory in MiB
@@ -93,12 +108,19 @@ pub struct ShellArgs {
     /// network: none, web or open (default web, or less if the config says so)
     #[arg(long)]
     net: Option<String>,
+    /// a label for burner ls
     #[arg(long)]
     tag: Option<String>,
     /// write the json result (docs/json.md) to this fd when the shell ends.
     /// through sudo use 2
     #[arg(long, value_name = "FD")]
     json_fd: Option<i32>,
+    /// mark the json with this nonce, see run
+    #[arg(long, value_name = "NONCE")]
+    json_mark: Option<String>,
+    /// how long to queue for a slot: 30s, 5m [default: 10m]
+    #[arg(long, value_name = "TIME")]
+    wait: Option<String>,
     /// the connection log when the shell ends: a summary, the full table, or nothing
     #[arg(long, value_enum, default_value_t = LogMode::Summary)]
     log: LogMode,
@@ -152,6 +174,19 @@ impl RunArgs {
 
     pub fn status_fd(&self) -> Option<i32> {
         self.status_fd
+    }
+
+    /// a flag that parses but isn't built yet
+    pub(super) fn unbuilt(&self) -> Option<&'static str> {
+        if self.json_mark.is_some() {
+            Some("--json-mark")
+        } else if self.wait.is_some() {
+            Some("--wait")
+        } else if self.shell_img {
+            Some("--img")
+        } else {
+            None
+        }
     }
 
     /// what burner -H checks here before it connects: everything that needs
@@ -265,10 +300,13 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         json_fd: a.json_fd,
         log: a.log,
         no_wait: false,
+        json_mark: a.json_mark.clone(),
+        wait: a.wait.clone(),
         remote: a.remote.clone(),
         net: a.net.clone().unwrap_or_else(|| "web".into()),
         cmd: vec!["true".into()],
         shell: true,
+        shell_img: a.img.is_some(),
     }
 }
 

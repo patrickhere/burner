@@ -115,8 +115,9 @@ fn fd_ok(fd: i32) -> bool {
         && (fd == 2 || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0)
 }
 
-/// the fds and the flags that write to stdout, checked before the config
-/// loads so a run that fails that early still writes its status line and json.
+/// the fds, the flags that write to stdout and the flags not built yet,
+/// checked before the config loads so a run that fails that early still
+/// writes its status line and json.
 /// Some(exit) when the run can't go ahead
 pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     let status_ok = a.status_fd.is_none_or(fd_ok);
@@ -141,7 +142,10 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
             "--json writes to stdout, --json-fd to another fd: pick one".into()
         }
         _ if a.result.is_some() && json_target(a) == Some(1) => tar_out.into(),
-        _ => return None,
+        _ => {
+            let cmd = if a.shell { "shell" } else { "run" };
+            format!("burner {cmd} {}: not yet", a.unbuilt()?)
+        }
     };
     // with nowhere to put the json, stderr is all that's left
     if !quiet() || !json_ok {
