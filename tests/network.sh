@@ -334,7 +334,7 @@ check $? "ipv6: taps' ipv6 is dropped before anything else sees it" "no such rul
 
 # doctor --probe: a VM per mode tries what it must not reach, the host's
 # log and witness counters judge it. nothing may leak, ipv6 included
-sudo burner doctor --probe --json > "$T/probe.json"; prc=$?
+sudo burner doctor --probe --img "$IMG" --json > "$T/probe.json"; prc=$?
 python3 -I - "$T/probe.json" <<'PY'
 import json, sys
 p = json.load(open(sys.argv[1]))["result"]

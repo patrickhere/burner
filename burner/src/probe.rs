@@ -40,6 +40,24 @@ pub struct ProbeArgs {
         value_name = "HOST"
     )]
     pub internet: String,
+    /// the image the probe VM boots. default alpine, or the only image there is
+    #[arg(long, requires = "probe", value_name = "IMAGE")]
+    pub img: Option<String>,
+}
+
+/// alpine when it's installed, else the first image there is: a box with
+/// only debian can still probe
+fn probe_image(cfg: &Config, a: &ProbeArgs) -> Result<String, String> {
+    if let Some(i) = &a.img {
+        return Ok(i.clone());
+    }
+    let have = crate::run::images(cfg);
+    if have.iter().any(|i| i == "alpine") {
+        return Ok("alpine".into());
+    }
+    have.into_iter()
+        .next()
+        .ok_or_else(|| "no image here to probe with (burner images)".to_string())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -731,12 +749,15 @@ fn rows(
 /// every way. (exit, the envelope's result, the guest's output)
 fn run_vm(
     config: &Path,
+    img: &str,
     mode: Mode,
     script: &str,
 ) -> Result<(u8, serde_json::Value, String), String> {
     let mut cmd = std::process::Command::new(crate::sys::self_exe());
     cmd.arg("--config").arg(config).args([
         "run",
+        "--img",
+        img,
         "--json",
         "--net",
         mode.name(),
@@ -789,7 +810,8 @@ fn probe_mode(
     #[cfg(target_os = "linux")]
     let witness =
         linux::Witness::up(cfg, &ts).map_err(|e| (125, format!("the witness table: {e}")))?;
-    let res = run_vm(config, mode, &script(&ts));
+    let img = probe_image(cfg, a).map_err(|e| (125, e))?;
+    let res = run_vm(config, &img, mode, &script(&ts));
     #[cfg(target_os = "linux")]
     let (counts, witness_rules) = (witness.read(), witness.rules.clone());
     #[cfg(target_os = "linux")]

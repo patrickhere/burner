@@ -11,7 +11,7 @@
 - a summary on stderr after every run and shell with a network, `--log full` for every row, `--log none` for nothing. `burner log [ID]` shows the last 32 runs, `--json` has all of it, and the run's json has it as `result.network`
 - a run whose log reader dies is stopped with 125, so nothing goes unrecorded. on a mac a log macnet couldn't write is marked incomplete
 - `burner explain [--net web|open] [--rules]`: what a VM could reach on this host, what it can't and why, and as root whether the loaded filter matches this config
-- `burner doctor --probe` boots a VM per mode that tries the gateway, the host, each lan and route, the tailnet, metadata, other VMs, dns to another server, a name that resolves to this host and ipv6. the host decides each row from its own log, on linux also from counters after the filter
+- `burner doctor --probe` boots a VM per mode (alpine, the only image there is, or `--img`) that tries the gateway, the host, each lan and route, the tailnet, metadata, other VMs, dns to another server, a name that resolves to this host and ipv6. the host decides each row from its own log, on linux also from counters after the filter
 - the network suite checks dns rebinding (a name that points at a blocked address is blocked like the address), ipv6 (no address or route in a VM, taps drop it), and the log (every blocked target is in it, it can't be forged, it survives hostile dns and floods)
 - a filter loaded by an older burner is reloaded by the reaper, and a new run says to run `burner net up` instead of failing on it
 - the sudoers example lets `burner log` and `burner explain` through
