@@ -173,6 +173,7 @@ pub fn run(cfg: &Config, config_path: &Path) -> Report {
             format!("burner macnet won't start: {e}. --net none still works"),
         ),
     }
+    network(&mut r, cfg);
     headless(&mut r);
 
     if !json::on() {
@@ -185,6 +186,79 @@ pub fn run(cfg: &Config, config_path: &Path) -> Report {
     }
     r.root = sys::is_root();
     r
+}
+
+/// the way out: NAT and the router, a full-tunnel vpn, and resolvers VMs
+/// can use. the same lines linux doctor has
+/// the default route's interface, and NAT behind it
+fn uplink(r: &mut Report, cfg: &Config, up: &crate::explain::Uplink) {
+    use crate::net;
+    let list: Vec<String> = up.addrs.iter().map(|a| a.to_string()).collect();
+    let gw = up
+        .gateway
+        .map_or_else(String::new, |g| format!(", default route via {g}"));
+    r.line(
+        Level::Ok,
+        "uplink",
+        format!("{} ({}){gw}", up.dev, list.join(", ")),
+    );
+    // behind NAT the router's public address is just "internet" to macnet,
+    // and from inside it's often the router's admin page or a port forward
+    let natted = up
+        .addrs
+        .iter()
+        .all(|ip| ip.is_private() || ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64);
+    let public_block =
+        cfg.net.block.iter().any(|b| {
+            config::parse_cidr(b).is_ok_and(|(ip, _)| !ip.is_private() && !ip.is_loopback())
+        });
+    if cfg.net.block_public_ip {
+        match net::public_ip(cfg) {
+            Some((ip, age)) => r.line(
+                Level::Ok,
+                "public ip",
+                format!("{ip} is blocked, looked up {} min ago on this network", age.as_secs() / 60),
+            ),
+            None => r.line(
+                Level::Ok,
+                "public ip",
+                "net.block_public_ip is on, not looked up on this network yet: burner run looks it up first",
+            ),
+        }
+    } else if natted && !public_block && !up.addrs.is_empty() {
+        r.line(
+            Level::Warn,
+            "router",
+            "this mac is behind NAT. VMs can reach your router's public address, and from the inside \
+             that's often its admin page, its ssh or your port forwards. set net.block_public_ip = true \
+             to have burner look it up and block it, or put it in net.block yourself",
+        );
+    }
+}
+
+fn network(r: &mut Report, cfg: &Config) {
+    use crate::net;
+    match crate::explain::mac_uplink() {
+        Some(up) => uplink(r, cfg, &up),
+        None => r.line(
+            Level::Warn,
+            "uplink",
+            "no default route right now, so VMs with a network can't reach anything",
+        ),
+    }
+    for t in crate::explain::tunnel_notes(&crate::macnet::route::tunnels_here(), None) {
+        r.line(Level::Warn, "vpn", t);
+    }
+    let blocked = crate::explain::mac_sources(cfg).ok();
+    for (sev, msg) in net::resolver_checks(cfg, blocked.as_deref(), crate::netmodel::Platform::Mac)
+    {
+        let level = match sev {
+            net::Severity::Ok => Level::Ok,
+            net::Severity::Warn => Level::Warn,
+            net::Severity::Fail => Level::Fail,
+        };
+        r.line(level, "dns", msg);
+    }
 }
 
 /// what matters for a mac nobody sits at: who's at the console, sleep,

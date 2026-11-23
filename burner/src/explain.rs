@@ -36,6 +36,30 @@ impl ExplainArgs {
         }
         Ok(v)
     }
+
+    /// -H runs explain --rules as the ssh user there, since sudo refuses it
+    pub fn wants_rules(&self) -> bool {
+        self.rules
+    }
+
+    /// --rules through sudo, for anyone but root: refused. the rule
+    /// install.sh --allow writes lets a restricted user run explain, and the
+    /// loaded rules (the tap entries, the public address) stay root's
+    pub fn refused(&self) -> Option<String> {
+        self.refused_for(std::env::var("SUDO_UID").ok().as_deref())
+    }
+
+    fn refused_for(&self, sudo_uid: Option<&str>) -> Option<String> {
+        let caller = sudo_uid?;
+        if !self.rules || !cfg!(target_os = "linux") || caller.trim() == "0" {
+            return None;
+        }
+        Some(
+            "burner explain --rules isn't allowed through sudo, the loaded rules are root's: \
+             burner explain --rules without sudo shows what would load (as root: nft list table inet burner)"
+                .into(),
+        )
+    }
 }
 
 #[derive(Serialize, Debug)]
@@ -181,6 +205,32 @@ pub fn allowed(cfg: &Config, mode: Mode, platform: Platform, way: &str) -> Vec<A
         detail: rate,
     });
     out
+}
+
+/// a line for each full-tunnel vpn. a default route on a vpn only matters
+/// when VM traffic leaves by that interface: on linux the uplink, on a mac
+/// (uplink None) whatever the default route is
+pub fn tunnel_notes(tunnels: &[net::Tunnel], uplink: Option<&str>) -> Vec<String> {
+    tunnels
+        .iter()
+        .filter(|t| match t {
+            net::Tunnel::Default { dev } => uplink.is_none_or(|u| u == dev),
+            _ => true,
+        })
+        .map(|t| net::tunnel_words(t, uplink))
+        .collect()
+}
+
+/// a line for each of net.resolvers that VMs can't reach
+pub fn resolver_notes(cfg: &Config, blocked: &[Blocked], platform: Platform) -> Vec<String> {
+    net::blocked_resolvers(cfg, blocked, platform)
+        .into_iter()
+        .map(|(ip, why)| {
+            format!(
+                "net.resolvers has {ip}, and VMs can't reach it: {why}. they get no dns from it"
+            )
+        })
+        .collect()
 }
 
 fn and_list(items: &[String]) -> String {
@@ -569,6 +619,9 @@ mod linux {
             "VM packets use their own routing table (29217) holding only the default route,\nso a VPN or tailnet that comes up later never applies to them."
                 .into(),
         );
+        let dev = up.as_ref().map(|u| u.dev.as_str());
+        notes.extend(tunnel_notes(&net::tunnels_here(), dev));
+        notes.extend(resolver_notes(cfg, &sources, Platform::Linux));
         let mut rules = Rules::default();
         if crate::sys::is_root() {
             let loaded = net::table_exists();
@@ -589,6 +642,12 @@ mod linux {
                     None => rules.stale = Some(true),
                 }
                 rules.refreshed_secs = crate::run::reaper_age(cfg).map(|d| d.as_secs());
+                if let Some((was, now)) = net::uplink_moved(cfg) {
+                    rules.stale = Some(true);
+                    notes.push(format!(
+                        "the loaded filter sends VM traffic out {was}, and the default route is on {now} now:\nVMs have no way out until the reaper reloads it (within 30s) or burner net up does"
+                    ));
+                }
             }
             if a.rules && loaded {
                 let mut t = String::new();
@@ -677,7 +736,8 @@ mod mac {
         Ok(out)
     }
 
-    fn uplink() -> Option<Uplink> {
+    /// the default route's interface, its gateway and its addresses
+    pub fn uplink() -> Option<Uplink> {
         let d = route::lookup(Ipv4Addr::UNSPECIFIED, true).ok()?;
         let addrs = host_addrs()?;
         let mut name = None;
@@ -751,6 +811,8 @@ mod mac {
             "each VM's network is its own macnet process. it reads the mac's addresses and routes\nfor every connection, so a vpn that comes up later is refused too."
                 .into(),
         );
+        notes.extend(tunnel_notes(&route::tunnels_here(), None));
+        notes.extend(resolver_notes(cfg, &sources, Platform::Mac));
         let rules = Rules {
             text: a.rules.then(|| policy_words(cfg, mode)),
             ..Rules::default()
@@ -770,7 +832,7 @@ mod mac {
 }
 
 #[cfg(target_os = "macos")]
-pub use mac::{build, sources as mac_sources};
+pub use mac::{build, sources as mac_sources, uplink as mac_uplink};
 
 #[cfg(test)]
 mod tests {
@@ -899,5 +961,67 @@ mod tests {
         assert!(a[0].detail.contains("any tcp port but mail"));
         let a = allowed(&cfg, Mode::Web, Platform::Mac, "out");
         assert!(a.iter().any(|x| x.detail.starts_with("no ping")));
+    }
+
+    #[test]
+    fn rules_through_sudo() {
+        let a = |net: Option<&str>, rules: bool| ExplainArgs {
+            net: net.map(str::to_string),
+            rules,
+        };
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(a(None, true).refused_for(Some("1000")).is_some(), linux);
+        assert_eq!(
+            a(Some("open"), true).refused_for(Some("")).is_some(),
+            linux,
+            "a SUDO_UID that isn't a number isn't root"
+        );
+        assert!(
+            a(None, true).refused_for(Some("0")).is_none(),
+            "root's own sudo"
+        );
+        assert!(
+            a(None, true).refused_for(None).is_none(),
+            "not through sudo"
+        );
+        assert!(a(None, false).refused_for(Some("1000")).is_none());
+        assert!(a(Some("web"), false).refused_for(Some("1000")).is_none());
+    }
+
+    #[test]
+    fn vpn_and_resolver_notes() {
+        use crate::net::Tunnel;
+        let t = vec![
+            Tunnel::Default { dev: "tun0".into() },
+            Tunnel::Policy {
+                dev: "wg0".into(),
+                table: "51820".into(),
+            },
+        ];
+        // linux: a default route on a vpn that isn't the uplink says nothing
+        let n = tunnel_notes(&t, Some("eth0"));
+        assert_eq!(n.len(), 1);
+        assert!(
+            n[0].contains("VM traffic leaves outside the vpn, through eth0"),
+            "{n:?}"
+        );
+        assert_eq!(tunnel_notes(&t, Some("tun0")).len(), 2);
+        // a mac: the default route is the way out, whatever it's on
+        assert_eq!(tunnel_notes(&t, None).len(), 2);
+        let mut cfg = Config::default();
+        cfg.net.resolvers = vec![Ipv4Addr::new(192, 168, 1, 53)];
+        let b = sources_from(
+            &cfg,
+            None,
+            &parse_addrs(net::tests::HOMELAB_ADDRS.as_bytes()).unwrap(),
+            &parse_routes(net::tests::HOMELAB_ROUTES.as_bytes(), "eth0").unwrap(),
+        )
+        .unwrap();
+        let n = resolver_notes(&cfg, &b, Platform::Linux);
+        assert_eq!(n.len(), 1);
+        assert!(
+            n[0].starts_with("net.resolvers has 192.168.1.53, and VMs can't reach it: your lan"),
+            "{n:?}"
+        );
     }
 }

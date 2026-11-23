@@ -474,7 +474,10 @@ if [ "$(uname -s)" = Linux ] && sudo -n true 2>/dev/null; then
     sudo -n env XDG_CONFIG_HOME="$XDG_CONFIG_HOME" BURNER_SSH="$BURNER_SSH" "$B" -H fake ls >/dev/null 2>"$T/e.root"; rroot=$?
     grep -q "drop the sudo" "$T/e.root" || rroot="$rroot: $(short "$T/e.root")"
 fi
-[ "$rn" = 2 ] && grep -q "runs on the machine itself" "$T/e" && [ "$rr" = 2 ] && [ "$rroot" = 2 ] \
+# a mac far end has no burner net at all
+net_says="runs on the machine itself"
+[ "$(uname -s)" = Darwin ] && net_says="burner net is for linux: fake is a mac"
+[ "$rn" = 2 ] && grep -q "$net_says" "$T/e" && [ "$rr" = 2 ] && [ "$rroot" = 2 ] \
   && ok "net and reap stay local, a kill id like a flag and -H as root are refused: exit 2" \
   || bad "refusals" "net=$rn reap+kill=$rr root=$rroot"
 
@@ -547,6 +550,26 @@ case $d2 in "EXIT 0 "*OK) e2=ok ;; *) e2=no ;; esac
   && [ "$rh" = 0 ] && grep -q "^lo .*192.0.2.1 (" "$T/hosts" && grep -q "lo (0 ms)\|lo ([0-9]* ms)" "$T/hosts" \
   && json_is 'len(d["result"]["hosts"]) == 8' < "$T/hosts.json" \
   && ok "doctor over -H, burner hosts --check and --json" || bad "doctor and hosts" "doctor=$rd hosts=$rh $(short "$T/doc")"
+
+# D1 what runs on the host itself says how, for that host's OS: no sudo on
+# a mac, sudo on linux, both ways when the host doesn't answer
+"$B" -H fake setup debian >/dev/null 2>"$T/e.setup"; rs=$?
+"$B" -H fake doctor --probe --img alpine >/dev/null 2>"$T/e.probe"; rp=$?
+"$B" -H down setup debian >/dev/null 2>"$T/e.down"; rd=$?
+"$B" --json -H fake setup debian >"$T/setup.json" 2>/dev/null; rj=$?
+if [ "$(uname -s)" = Darwin ]; then
+    want_setup="(ssh lo $T/fake-burner setup debian, or -H local here)"
+    want_probe="(ssh lo $T/fake-burner doctor --probe --img alpine)"
+else
+    want_setup="(ssh -t lo sudo $T/fake-burner setup debian, or -H local here)"
+    want_probe="(ssh -t lo sudo $T/fake-burner doctor --probe --img alpine)"
+fi
+[ "$rs" = 2 ] && grep -qF "burner setup runs on the machine itself, not over -H $want_setup" "$T/e.setup" \
+  && [ "$rp" = 2 ] && grep -qF "$want_probe" "$T/e.probe" \
+  && [ "$rd" = 2 ] && grep -qF "(ssh -t 192.0.2.1 sudo burner setup debian, without the sudo on a mac, or -H local here)" "$T/e.down" \
+  && [ "$rj" = 2 ] && json_is 'd["errors"][0]["kind"] == "usage" and "fake-burner setup debian" in d["errors"][0]["message"]' < "$T/setup.json" \
+  && ok "the run-it-there hints follow the far end's OS, and say both when it doesn't answer" \
+  || bad "run-it-there hints" "setup=$rs probe=$rp down=$rd json=$rj $(short "$T/e.setup") / $(short "$T/e.probe") / $(short "$T/e.down")"
 
 # F21 a hosts.toml others can write is refused
 chmod 666 "$T/xdg/burner/hosts.toml"
@@ -767,6 +790,22 @@ nid=$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["resul
 "$B" -H lo explain --net web >"$T/nl.ex" 2>&1; rx=$?
 [ -n "$nid" ] && [ "$rl" = 0 ] && json_is "d['host'] == 'lo' and d['command'] == 'log' and d['result']['id'] == '$nid' and len(d['result']['events']) >= 300" < "$T/nl.log" \
   && [ "$rx" = 0 ] && [ -s "$T/nl.ex" ] && ok "real: burner -H log and explain" || bad "real log/explain" "id=$nid log=$rl explain=$rx $(short "$T/nl.ex")"
+
+# D2 a sudo rule from before 0.3.1 has no doctor in it: doctor says to
+# rerun install.sh --allow there. and explain --rules: refused through sudo
+# for anyone but root, run as the ssh user over -H
+cp "$T/partsudo-bin/sudo" "$T/partsudo.keep"
+printf '#!/bin/sh\n[ "$1 $2" = "-n -l" ] && [ "$4" = doctor ] && exit 1\nexec /usr/bin/sudo "$@"\n' > "$T/partsudo-bin/sudo"
+"$B" -H partsudo doctor >"$T/doc.old" 2>&1; rd=$?
+cp "$T/partsudo.keep" "$T/partsudo-bin/sudo"
+sudo -n burner explain --rules >/dev/null 2>"$T/e.rules"; rs=$?
+"$B" -H lo explain --rules >"$T/ex.rules" 2>&1; rx=$?
+grep -q "^warn  doctor .*older than burner 0.3.1 and doesn't cover burner doctor, so it ran without root" "$T/doc.old" \
+  && grep -qF "install.sh --allow $ME there" "$T/doc.old" && grep -q "^ok    sudo .*run, shell, ls, kill, images, log and explain allowed" "$T/doc.old" \
+  && [ "$rs" = 2 ] && grep -q "isn't allowed through sudo" "$T/e.rules" \
+  && [ "$rx" = 0 ] && grep -q "^rules (what would load):" "$T/ex.rules" \
+  && ok "real: doctor names install.sh --allow for an old rule, explain --rules stays out of sudo" \
+  || bad "real old rule, explain --rules" "doctor=$rd sudo-rules=$rs -H-rules=$rx $(short "$T/doc.old") / $(short "$T/e.rules")"
 
 vms_gone && ok "no VMs left running" || bad "leftovers" "$(sudo -n burner ls)"
 echo "---- $pass passed, $fail failed"

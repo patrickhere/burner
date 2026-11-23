@@ -273,6 +273,32 @@ pub fn parse_dump(mut b: &[u8], default: Option<&Route>) -> Vec<Route> {
     out
 }
 
+/// the routes the full-tunnel check reads: what dump() lists plus the
+/// default route, each with its interface's name
+pub fn tunnel_lines(
+    dumped: &[(Route, String)],
+    default: Option<&Route>,
+) -> Vec<crate::net::RouteLine> {
+    let line = |r: &Route, dev: String| crate::net::RouteLine {
+        dst: r.dst,
+        prefix: r.prefix,
+        dev,
+        table: "main".into(),
+    };
+    dumped
+        .iter()
+        .map(|(r, dev)| line(r, dev.clone()))
+        .chain(default.map(|d| line(d, ifname(d.index))))
+        .collect()
+}
+
+/// the full-tunnel vpns on this mac now. nothing when the routes can't be read
+pub fn tunnels_here() -> Vec<crate::net::Tunnel> {
+    let default = lookup(Ipv4Addr::UNSPECIFIED, true).ok();
+    let dumped = dump().unwrap_or_default();
+    crate::net::tunnels(&tunnel_lines(&dumped, default.as_ref()))
+}
+
 fn ifname(index: u16) -> String {
     let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
     // SAFETY: if_indextoname writes at most IF_NAMESIZE bytes, NUL included
@@ -365,5 +391,162 @@ mod tests {
             }
         }
         assert!(check(Ipv4Addr::new(127, 0, 0, 1)).is_err());
+    }
+
+    /// one NET_RT_DUMP message the way the kernel writes it: the header, then
+    /// dst, gateway and a netmask cut short after its last nonzero byte
+    fn rt_msg(dst: [u8; 4], gw: [u8; 4], mask: &[u8], index: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        for ip in [dst, gw] {
+            let mut sa = [0u8; SIN];
+            sa[0] = SIN as u8;
+            sa[1] = libc::AF_INET as u8;
+            sa[4..8].copy_from_slice(&ip);
+            body.extend_from_slice(&sa);
+        }
+        let mut m = vec![0u8; 4];
+        m.extend_from_slice(mask);
+        m[0] = m.len() as u8;
+        while !m.len().is_multiple_of(4) {
+            m.push(0);
+        }
+        body.extend_from_slice(&m);
+        // SAFETY: zeroed is a valid rt_msghdr
+        let mut h: libc::rt_msghdr = unsafe { std::mem::zeroed() };
+        h.rtm_msglen = (HDR + body.len()) as u16;
+        h.rtm_version = libc::RTM_VERSION as u8;
+        h.rtm_type = libc::RTM_GET as u8;
+        h.rtm_addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;
+        h.rtm_flags = libc::RTF_UP | libc::RTF_GATEWAY | libc::RTF_STATIC;
+        h.rtm_index = index;
+        let mut out = vec![0u8; HDR];
+        // SAFETY: out is HDR bytes, an unaligned write of a plain struct
+        unsafe { std::ptr::write_unaligned(out.as_mut_ptr().cast(), h) };
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// `netstat -rn -f inet` as captured, read into the tunnel check's lines.
+    /// the shapes: "default", "0/1", "128.0/1", "10.8/24", "10.8.0.1"
+    fn netstat(text: &str) -> Vec<crate::net::RouteLine> {
+        text.lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                if f.len() < 4 || f[0] == "Destination" {
+                    return None;
+                }
+                let (net, prefix) = match f[0] {
+                    "default" => ("0", Some(0)),
+                    d => match d.split_once('/') {
+                        Some((n, p)) => (n, p.parse().ok()),
+                        None => (d, None),
+                    },
+                };
+                let mut o: Vec<u8> = net
+                    .split('.')
+                    .map(|x| x.parse().ok())
+                    .collect::<Option<_>>()?;
+                let given = o.len() as u8;
+                o.resize(4, 0);
+                Some(crate::net::RouteLine {
+                    dst: Ipv4Addr::new(o[0], o[1], o[2], o[3]),
+                    prefix: prefix.unwrap_or(given * 8),
+                    dev: f[3].to_string(),
+                    table: "main".into(),
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_tunnel_halves_from_the_dump() {
+        let d = r("0.0.0.0", 0, Some("192.168.1.1"), 11);
+        let mut buf = rt_msg([0, 0, 0, 0], [10, 8, 0, 1], &[0x80], 23);
+        buf.extend(rt_msg([128, 0, 0, 0], [10, 8, 0, 1], &[0x80], 23));
+        buf.extend(rt_msg(
+            [10, 8, 0, 0],
+            [10, 8, 0, 1],
+            &[0xff, 0xff, 0xff],
+            23,
+        ));
+        let got = parse_dump(&buf, Some(&d));
+        assert_eq!(
+            got,
+            vec![
+                r("0.0.0.0", 1, Some("10.8.0.1"), 23),
+                r("128.0.0.0", 1, Some("10.8.0.1"), 23),
+                r("10.8.0.0", 24, Some("10.8.0.1"), 23),
+            ]
+        );
+        let named: Vec<(Route, String)> = got.into_iter().map(|r| (r, "utun3".into())).collect();
+        let lines = tunnel_lines(&named, None);
+        assert_eq!(
+            crate::net::tunnels(&lines),
+            vec![crate::net::Tunnel::Halves {
+                dev: "utun3".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn full_tunnels_in_netstat_shapes() {
+        use crate::net::{Tunnel, tunnels};
+        // tunnelblick / openvpn with def1, and the wireguard app
+        let openvpn = "Routing tables\n\nInternet:\n\
+            Destination        Gateway            Flags               Netif Expire\n\
+            0/1                10.8.0.1           UGScg               utun3\n\
+            default            192.168.1.1        UGScg                 en0\n\
+            10.8/24            10.8.0.1           UGSc                utun3\n\
+            10.8.0.1           10.8.0.6           UH                  utun3\n\
+            127                127.0.0.1          UCS                   lo0\n\
+            128.0/1            10.8.0.1           UGSc                utun3\n\
+            185.65.135.1       192.168.1.1        UGHS                  en0\n\
+            192.168.1          link#11            UCS                   en0      !\n";
+        assert_eq!(
+            tunnels(&netstat(openvpn)),
+            vec![Tunnel::Halves {
+                dev: "utun3".into()
+            }]
+        );
+        let wireguard = "Destination        Gateway            Flags               Netif Expire\n\
+            0/1                utun4              USc                 utun4\n\
+            default            10.1.0.1           UGScg                 en0\n\
+            128.0/1            utun4              USc                 utun4\n";
+        assert_eq!(
+            tunnels(&netstat(wireguard)),
+            vec![Tunnel::Halves {
+                dev: "utun4".into()
+            }]
+        );
+        // a client that takes the default route itself (anyconnect, globalprotect)
+        let corp = "Destination        Gateway            Flags               Netif Expire\n\
+            default            10.200.0.1         UGScg               utun2\n\
+            default            192.168.1.1        UGScIg                en0\n\
+            10.200/16          10.200.0.1         UGSc                utun2\n";
+        assert_eq!(
+            tunnels(&netstat(corp)),
+            vec![Tunnel::Default {
+                dev: "utun2".into()
+            }]
+        );
+        // this mac on a plain lan, and a split tunnel to one network
+        let lan = "Destination        Gateway            Flags               Netif Expire\n\
+            default            10.1.0.1           UGScg                 en0\n\
+            10.1/24            link#11            UCS                   en0      !\n\
+            100.64/10          utun5              USc                 utun5\n\
+            127                127.0.0.1          UCS                   lo0\n";
+        assert!(tunnels(&netstat(lan)).is_empty());
+        let n = netstat(openvpn);
+        assert_eq!(n[0].dst, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(
+            (n[0].prefix, n[5].dst, n[5].prefix),
+            (1, "128.0.0.0".parse().unwrap(), 1)
+        );
+    }
+
+    #[test]
+    fn this_macs_tunnels_read() {
+        // whatever this mac has, it reads without failing
+        let _ = tunnels_here();
     }
 }
