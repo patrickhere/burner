@@ -546,14 +546,21 @@ fn install(r: &mut Report, cfg: &Config) {
             r.line(
                 Level::Warn,
                 "images",
-                format!("{name} was built with a different guest init, rebuild it: tools/build-image {name}"),
+                format!(
+                    "{name} was built with a different guest init: {}",
+                    crate::run::image_fix(&name)
+                ),
             );
         }
     }
     if images > 0 {
         r.line(Level::Ok, "images", format!("{images} installed"));
     } else {
-        r.line(Level::Warn, "images", "none installed yet");
+        r.line(
+            Level::Warn,
+            "images",
+            "none installed yet, sudo burner setup alpine fetches one",
+        );
     }
 }
 

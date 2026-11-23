@@ -624,7 +624,7 @@ fn missing_how(img: &str, installed: bool) -> String {
 
 /// how to get an image whose guest init isn't this burner's
 #[cfg(target_os = "linux")]
-pub(super) fn image_fix(img: &str) -> String {
+pub(crate) fn image_fix(img: &str) -> String {
     image_fix_linux(img, build_image_here())
 }
 

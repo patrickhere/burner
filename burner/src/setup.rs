@@ -115,20 +115,6 @@ pub(crate) fn fix_hint(imgs: &[String]) -> String {
     }
 }
 
-/// the same on linux, where setup needs root and other images are built here.
-/// nothing on linux points to it yet, the hints there still name build-image
-#[cfg(target_os = "linux")]
-#[allow(dead_code)]
-pub(crate) fn fix_hint(imgs: &[String]) -> String {
-    match imgs {
-        _ if imgs.iter().all(|i| IMAGES.contains(&i.as_str())) => {
-            format!("run sudo burner setup {}", imgs.join(" "))
-        }
-        [one] => format!("rebuild it: tools/build-image {one}"),
-        _ => "rebuild them with tools/build-image".into(),
-    }
-}
-
 /// the release file for an image, built for this cpu
 fn asset(img: &str) -> String {
     format!("{img}-{}.ext4.gz", std::env::consts::ARCH)
@@ -984,20 +970,10 @@ mod tests {
                 fix_hint(&["alpine".into(), "debian".into()]),
                 "run burner setup alpine debian"
             );
+            assert!(fix_hint(&["debian".into(), "mine".into()]).starts_with("rebuild"));
         }
         #[cfg(target_os = "linux")]
-        {
-            assert_eq!(package_list("debian"), format!("debian-{arch}.packages"));
-            assert_eq!(
-                fix_hint(&["alpine".into(), "debian".into()]),
-                "run sudo burner setup alpine debian"
-            );
-            assert_eq!(
-                fix_hint(&["mine".into()]),
-                "rebuild it: tools/build-image mine"
-            );
-        }
-        assert!(fix_hint(&["debian".into(), "mine".into()]).starts_with("rebuild"));
+        assert_eq!(package_list("debian"), format!("debian-{arch}.packages"));
         assert_eq!(wanted(&[]), ["alpine"]);
         assert_eq!(
             wanted(&["debian".into(), "alpine".into(), "debian".into()]),

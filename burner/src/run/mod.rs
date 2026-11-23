@@ -35,6 +35,8 @@ pub use launch::{
     GUEST_PROTO, VMM, check_fds, config_failed, finished, json_line, json_target, main, refuse,
 };
 pub use log::{LogArgs, log};
+#[cfg(target_os = "linux")]
+pub(crate) use plan::image_fix;
 
 /// the line the network log's reader writes first
 pub fn netlog_ready() -> &'static str {
