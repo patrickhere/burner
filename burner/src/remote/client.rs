@@ -294,7 +294,8 @@ pub(super) fn remote_failed(c: &Conn, s: &Seen, what: &str) -> Option<Failed> {
         return Some(Failed::new(
             Kind::RemoteError,
             format!(
-                "{name}: sudo wants a password for burner {what}. -H needs a NOPASSWD rule for burner there, see dist/sudoers.example (burner -H {name} doctor checks it)"
+                "{name}: sudo wants a password for burner {what}, and -H needs a rule without one: {}. burner -H {name} doctor checks it",
+                super::doctor::allow_hint(&c.pick.conf.user)
             ),
         ));
     }

@@ -281,15 +281,7 @@ pub fn doctor(host: &Host, config: &[String]) -> ExitCode {
             format!("ssh'd in as uid {uid}, burner runs without sudo"),
         );
     } else {
-        // the rule install.sh --allow writes, and how to get it there
-        let rule_user = if c.pick.conf.user.is_empty() {
-            "USER"
-        } else {
-            c.pick.conf.user.as_str()
-        };
-        let allow = format!(
-            "sudo /usr/local/share/burner/current/install.sh --allow {rule_user} there (install.sh in burner's source for a cargo install)"
-        );
+        let allow = allow_hint(&c.pick.conf.user);
         // log and explain are lines of their own in the example rule, and
         // only those two commands need them
         let optional = |c: &str| c == "log" || c == "explain";
@@ -573,5 +565,14 @@ pub fn hosts(check: bool) -> ExitCode {
             path: path.display().to_string(),
             hosts: lines,
         }),
+    )
+}
+
+/// the rule install.sh --allow writes, and how to get it there for `user`,
+/// the one ssh logs in as
+pub(super) fn allow_hint(user: &str) -> String {
+    let user = if user.is_empty() { "USER" } else { user };
+    format!(
+        "sudo /usr/local/share/burner/current/install.sh --allow {user} there (install.sh in burner's source for a cargo install)"
     )
 }
