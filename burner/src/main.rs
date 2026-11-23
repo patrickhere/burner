@@ -437,8 +437,9 @@ fn remote(cli: &Cli) -> Option<ExitCode> {
     })
 }
 
-/// the command line as typed, without -H, --json and --config, quoted for a
-/// shell: what to run on the host itself
+/// the command line as typed, without -H and --json, quoted for a shell:
+/// what to run on the host itself. --config stays, it names a file there
+/// like it does over -H
 fn typed_words() -> String {
     words_there(std::env::args().skip(1))
 }
@@ -451,11 +452,11 @@ fn words_there(mut args: impl Iterator<Item = String>) -> String {
                 out.push(a);
                 out.extend(args.by_ref());
             }
-            "-H" | "--host" | "--config" => {
+            "-H" | "--host" => {
                 args.next();
             }
             "--json" => {}
-            _ if a.starts_with("--host=") || a.starts_with("--config=") => {}
+            _ if a.starts_with("--host=") => {}
             _ if a.starts_with("-H") => {}
             _ => out.push(a),
         }
@@ -670,9 +671,12 @@ mod tests {
                 "--probe",
                 "-Hmini"
             ]),
-            "doctor --probe"
+            "--config /x doctor --probe"
         );
-        assert_eq!(w(&["net", "up", "--config=/etc/x.toml"]), "net up");
+        assert_eq!(
+            w(&["net", "up", "--config=/etc/x.toml"]),
+            "net up '--config=/etc/x.toml'"
+        );
         assert_eq!(
             w(&["setup", "it's", "\u{1b}]0;x"]),
             "setup 'it'\\''s' '?]0;x'"
