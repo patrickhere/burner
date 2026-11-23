@@ -1,5 +1,48 @@
 # changelog
 
+## 0.3.1
+
+- the run log: every run and shell is kept, with a network or without, and survives a reboot. a record has the command (escaped, cut at 300 characters), image, net, tag, exit, owner, when it ran and the run's whole `--json` result, the connection log included. on linux it's in `/var/lib/burner/logs`, root-only, on a mac in `~/Library/Application Support/burner/logs`
+- `burner log --list` shows them newest first: id, when, host, image, net, tag, exit, the out and blocked counts and the start of the command. `--from HOST`, `--limit N` and `--json`. `burner log ID` opens with one line saying when, where, which image, the exit and the command, and `burner log ID --json` adds the record as `run` next to every 0.3.0 field
+- each user keeps their newest 200 runs, none older than 30 days: `keep_runs` and `keep_days` under `[log]`. pruned when a run is kept and by the reaper
+- `-H` runs and shells are kept here too, with the far end's name in the host column and the summary saying `kept here too, burner log ID`. on a mac they go in the same store, on linux in your own `~/.local/state/burner/logs`, written as you. what the far end sent is read leniently, size-capped and escaped
+- through sudo, `burner log` shows the caller's runs only. on linux, `burner log` without sudo shows your `-H` copies and says how to see this machine's runs
+- the summary says where a run went: `reached: github.com, objects.githubusercontent.com, +3 more`, every name the VM looked up for an address it connected to, in the order it did
+- a run without `--net` whose command fails ends with `burner: this run had no network (--net web for http and https)`, and a `no_net` warning in the json
+- `burner: burner-xxxx started` on stderr when it's a terminal, once the run has a slot, so you can `burner kill` it from another one
+- `burner ls` has a header row, a blank tag when there's none and ages like `4m12s`. through sudo it shows only the caller's VMs, root through sudo included. on linux `ls` and `kill` without root say they need it, like `log`
+- `burner kill --tag T` and `burner kill --mine` stop your VMs in one go. `--wait 30s` on run and shell says how long to queue for a slot (10m by default), `--no-wait` fails right away as before
+- `--mem 512M` and `--disk 4G` on run and shell, plain numbers still mean MiB and GiB. `burner shell --img debian`
+- `--json-mark NONCE` on run and shell writes the json as one `burner-NONCE status {...}` line, so nothing the guest prints can pass for it
+- the log reader has a watchdog on linux: every 3s it reads the slot's counters, and a reader that stops passing messages on for 5s while some are owed stops the VM with 125, the same as a reader that died. so does one that overflowed with messages still owed
+- an image built with another guest init warns on runs too, not just in doctor, and says how to fix it. a missing image says the full path to `tools/build-image` when get.sh put it there
+- `sudo burner setup [alpine] [debian]` on linux: this release's images from github, checked against the `SHA256SUMS` get.sh verified at install and `install.sh` keeps in `/var/lib/burner` (from a crates.io or source install, against the release's own, and it says so). get.sh uses it and offers debian at the end. the release has an alpine image for x86_64 now too
+- alpine has bash, about 1M, so `curl -fsSL URL | sudo burner run --net web --in stdin -- bash` works there too. debian gets a 4G scratch disk by default, apt needs the room
+- `burner setup --remove` on a mac takes off the kernel and the images and says what's left (your config, the run log)
+- `install.sh` stops when VMs are running unless `--force`, and `--uninstall` and `--purge` take burner off. get.sh keeps the release before as `/usr/local/share/burner/previous`, brings your alpine and debian images to the new release on an upgrade, and `curl -fsSL https://get.burnervm.dev | sh -s -- --uninstall` (or `--purge`) undoes it, on a mac too
+- `sudo ./install.sh --allow alice` writes the sudo rule to `/etc/sudoers.d/burner` and checks it with visudo, and get.sh asks who. the rule now lets `doctor` and `doctor --json` through, and `explain` and `explain --json` but not `--rules`: through sudo `explain --rules` is refused for anyone but root
+- `burner completions bash|zsh|fish|elvish|powershell` and a man page per command (`man burner-run`). install.sh and the homebrew formula put them in place
+- burner-tui doesn't use sudo on a mac, where burner runs VMs as you
+- `burner doctor` on a mac: the uplink and router, a warning when the mac is behind NAT and nothing public is blocked, and one line when a full-tunnel VPN is up (VMs can't reach anything while it is). on both: a FAIL when a `net.resolvers` entry is in a range VMs can't reach, a warning when it's behind a full tunnel, and whether each resolver answers from here
+- on linux, `burner explain` and doctor say what a VPN means for VMs: a full tunnel's `0.0.0.0/1` routes block them, and one with a routing table of its own (wg-quick, a tailscale exit node) doesn't apply to them, so their traffic leaves outside it. the reaper reloads the filter within 30s when a VPN takes over the default route, so VMs follow it instead of losing their network
+- `burner doctor` names the cpu when there's no `/dev/kvm` and fails inside a container
+- the "run it there" hints for `-H` follow the far end's OS: `ssh mini burner setup debian` for a mac, with `sudo` for linux. `-H HOST doctor` with a sudo rule from before 0.3.1 says to run `install.sh --allow USER` there, and so does a `-H` run that hits a password prompt
+- the readme: trying an install script in a VM, and a section on networks that aren't a home LAN (VPNs, pi-hole, NAT)
+- the release builds with rust 1.98.1, pinned in `rust-toolchain.toml`, and ci checks debian's `keys.asc` against a pinned fingerprint list
+
+things to know:
+
+- the guest protocol didn't change, so 0.3.0 images keep working. 0.3.0's alpine has no bash: `burner setup` on a mac, or `sudo burner setup alpine` on linux, gets this release's
+- the run log starts with 0.3.1. 0.3.0's connection logs in the state dir aren't carried over, and the reaper clears them
+- the record keeps the command line, as `ps` and the sudo log already do. keep secrets off it
+- scripts that compare a failed run's stderr exactly get one more line when they didn't pass `--net`. pass `--net none`, or read `--json-fd`
+- through sudo `ls`, `kill` and `log` only see that user's VMs and runs. root itself, without sudo, sees everyone's
+- the sudo rule changed. upgrades through get.sh keep it in step for the users in it; a rule written by hand stays as it was until `install.sh --allow`, and `burner -H HOST doctor` says when it's an old one
+- `-H` copies follow this machine's `[log]` settings, since `--config` goes to the far end
+- a full-tunnel VPN still blocks every VM while it's up, on a mac and on linux. that's on purpose: sending VM traffic through it would put it on the network behind the VPN
+- give an image of your own a name of its own: `burner setup` and upgrades replace `alpine` and `debian`
+- on a mac, run `burner setup` again after `brew upgrade burner`, the formula says so too
+
 ## 0.3.0
 
 - `--json` on every command: one JSON document with the same envelope everywhere (`exit`, `ok`, the command's `result`, burner's own lines as `errors` and `warnings`), schema in docs/json.md. `burner run --json` puts only that on stdout and the command's output on stderr. `--json-fd N` on run and shell writes it to fd N and leaves stdout and stderr alone, through sudo `--json-fd 2`. `--status-fd` stays byte for byte what it was
