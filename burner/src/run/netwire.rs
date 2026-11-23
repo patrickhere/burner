@@ -220,9 +220,10 @@ struct Counts {
     up: u64,
     /// reply messages
     down: u64,
-    /// the four counters' nft handles: new ones after a reload or when the
-    /// slot's counters were made again
-    ids: [u64; 4],
+    /// the handle of the table they're in. the kernel never gives a table
+    /// handle out twice, and a reload makes the table again, so a new one
+    /// means new counters
+    table: u64,
     /// how many too many this read may say were sent: over-limit attempts
     /// that came between its two lists. the next read takes them back
     slack: u64,
@@ -235,10 +236,10 @@ impl Counts {
         i128::from(self.tries) - i128::from(self.over) + i128::from(self.up) + i128::from(self.down)
     }
 
-    /// not the counters `before` read: a filter reload or the slot's
-    /// counters made again (other handles), or one went down
+    /// not the counters `before` read: a filter reload made the table
+    /// again, or one went down
     fn reset_since(self, before: Counts) -> bool {
-        self.ids != before.ids
+        self.table != before.table
             || self.tries < before.tries
             || self.over < before.over
             || self.up < before.up
@@ -295,8 +296,9 @@ impl Watch {
     /// wasn't reading, and messages did go unrecorded. a filter
     /// reload makes the counters again from zero: what they say then was
     /// all sent since the last read, and what was sent between the last
-    /// read and the reload is only in the counters the reload threw away,
-    /// as is the read that would have taken back the last one's slack
+    /// read and the reload is only in the counters the reload threw away.
+    /// so is the read that would have taken back the last one's slack: that
+    /// comes off what was owed before the reload, never off what's new
     fn tick(&mut self, now: Instant, before: Seen, counts: Option<Counts>, after: Seen) -> Health {
         let Some(c) = counts else {
             if now.duration_since(self.at) >= BLIND_AFTER {
@@ -305,7 +307,8 @@ impl Watch {
             return self.health(now);
         };
         let sent = if c.reset_since(self.counts) {
-            c.sent() - i128::from(self.counts.slack)
+            self.owed = (self.owed - i128::from(self.counts.slack)).max(0);
+            c.sent()
         } else {
             c.sent() - self.counts.sent()
         };
@@ -336,7 +339,7 @@ impl Watch {
 /// only make what was sent look more, never fewer (the next read takes it
 /// back). each list is one ruleset generation, nft starts over when the
 /// ruleset changes under it, and a filter reload between the two shows as a
-/// count that went down or a counter with another handle: then it reads
+/// table with another handle (or a count that went down): then it reads
 /// again, so a sample never mixes an old count with a new one
 #[cfg(target_os = "linux")]
 fn live_counts(tap: &str) -> Option<Counts> {
@@ -362,19 +365,17 @@ fn combine(first: Counts, next: Counts) -> Option<Counts> {
     })
 }
 
-/// linux: one `nft list` of the slot's four counters
+/// linux: the tables and the slot's four counters, from one nft run, which
+/// is one snapshot of the ruleset
 #[cfg(target_os = "linux")]
 fn list_counts(tap: &str) -> Option<Counts> {
+    let script = format!(
+        "list tables\nlist counters table inet {}\n",
+        crate::net::TABLE
+    );
     let out = crate::sys::run_timeout(
-        std::process::Command::new("nft").args([
-            "-j",
-            "list",
-            "counters",
-            "table",
-            "inet",
-            crate::net::TABLE,
-        ]),
-        None,
+        std::process::Command::new("nft").args(["-j", "-f", "-"]),
+        Some(script.as_bytes()),
         COUNTER_TIMEOUT,
     )
     .ok()?;
@@ -384,30 +385,34 @@ fn list_counts(tap: &str) -> Option<Counts> {
     slot_counts(&out.stdout, tap)
 }
 
-/// the four counters named for `tap` in an `nft -j list counters`
+/// the handle of table inet burner and the four counters named for `tap`,
+/// from `nft -j` output: one json document per line, a list each. None
+/// when any of them is missing
 #[cfg(any(target_os = "linux", test))]
 fn slot_counts(json: &[u8], tap: &str) -> Option<Counts> {
-    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
-    let all = v["nftables"].as_array()?;
-    // packets, and the handle (0 from an nft that leaves it out)
-    let get = |c: &str| -> Option<(u64, u64)> {
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    for doc in serde_json::Deserializer::from_slice(json).into_iter::<serde_json::Value>() {
+        all.extend(doc.ok()?["nftables"].as_array()?.iter().cloned());
+    }
+    let ours = |o: &serde_json::Value| o["family"] == "inet" && o["table"] == crate::net::TABLE;
+    let table = all
+        .iter()
+        .filter_map(|o| o.get("table"))
+        .find(|t| t["family"] == "inet" && t["name"] == crate::net::TABLE)?["handle"]
+        .as_u64()?;
+    let get = |c: &str| -> Option<u64> {
         let name = format!("{c}_{tap}");
-        let o = all
-            .iter()
+        all.iter()
             .filter_map(|o| o.get("counter"))
-            .find(|c| c["name"] == name.as_str() && c["table"] == crate::net::TABLE)?;
-        Some((o["packets"].as_u64()?, o["handle"].as_u64().unwrap_or(0)))
+            .find(|c| c["name"] == name.as_str() && ours(c))?["packets"]
+            .as_u64()
     };
-    let (over, h0) = get("over")?;
-    let (tries, h1) = get("n")?;
-    let (up, h2) = get("up")?;
-    let (down, h3) = get("down")?;
     Some(Counts {
-        over,
-        tries,
-        up,
-        down,
-        ids: [h0, h1, h2, h3],
+        over: get("over")?,
+        tries: get("n")?,
+        up: get("up")?,
+        down: get("down")?,
+        table,
         slack: 0,
     })
 }
@@ -812,10 +817,15 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn slot_counts_from_one_list() {
+    fn slot_counts_from_one_run() {
         let c = |name: &str, table: &str, n: u64| {
             format!(
                 r#"{{"counter": {{"family": "inet", "name": "{name}", "table": "{table}", "handle": 9, "packets": {n}, "bytes": 0}}}}"#
+            )
+        };
+        let t = |family: &str, name: &str, handle: u64| {
+            format!(
+                r#"{{"table": {{"family": "{family}", "name": "{name}", "handle": {handle}}}}}"#
             )
         };
         let list = |rows: Vec<String>| {
@@ -824,7 +834,12 @@ mod tests {
                 rows.join(", ")
             )
         };
-        let all = list(vec![
+        let tables = list(vec![
+            t("ip", "burner", 5),
+            t("inet", "burner", 391),
+            t("ip", "nat", 1),
+        ]);
+        let counters = list(vec![
             c("n_bn1", "burner", 99),
             c("n_bn3", "other", 98),
             c("n_bn3", "burner", 7),
@@ -832,35 +847,36 @@ mod tests {
             c("up_bn3", "burner", 3),
             c("down_bn3", "burner", 4),
         ]);
-        let got = slot_counts(all.as_bytes(), "bn3").unwrap();
+        // nft -f with two lists writes one json document per line
+        let out = format!("{tables}\n{counters}\n");
+        let got = slot_counts(out.as_bytes(), "bn3").unwrap();
         assert_eq!((got.tries, got.over, got.up, got.down), (7, 2, 3, 4));
-        assert_eq!((got.ids, got.slack), ([9, 9, 9, 9], 0));
-        // a slot with a counter missing, or nothing that parses: unread
+        assert_eq!((got.table, got.slack), (391, 0));
+        // no table handle, a counter missing, or nothing that parses: unread
+        assert!(slot_counts(counters.as_bytes(), "bn3").is_none());
         let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
-        assert!(slot_counts(part.as_bytes(), "bn3").is_none());
+        assert!(slot_counts(format!("{tables}\n{part}").as_bytes(), "bn3").is_none());
         assert!(slot_counts(b"not json", "bn3").is_none());
     }
 
     #[test]
     fn over_first_then_the_rest() {
-        let c = |tries: u64, over: u64, up: u64| Counts {
+        let table_gen = |table: u64, tries: u64, over: u64, up: u64| Counts {
             tries,
             over,
             up,
-            ids: [1, 2, 3, 4],
+            table,
             ..Counts::default()
         };
+        let c = |tries: u64, over: u64, up: u64| table_gen(1, tries, over, up);
         // 100 over-limit attempts between the two lists: over from the
         // first, so the sample says 100 more sent, never fewer, and says so
         let got = combine(c(100, 0, 5), c(200, 100, 5)).unwrap();
         assert_eq!((got.tries, got.over, got.up, got.slack), (200, 0, 5, 100));
-        // a reload between them: a count went down, or the counters have
-        // other handles even when every count went up. read again
+        // a reload between them: the table has another handle, even when
+        // every count went up, or a count went down. read again
+        assert!(combine(c(100, 0, 5), table_gen(2, 300, 50, 9)).is_none());
         assert!(combine(c(100, 0, 5), c(3, 0, 0)).is_none());
-        assert!(combine(c(100, 0, 5), c(150, 0, 2)).is_none());
-        let mut other = c(300, 50, 9);
-        other.ids = [5, 6, 7, 8];
-        assert!(combine(c(100, 0, 5), other).is_none());
 
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
@@ -869,33 +885,84 @@ mod tests {
             gaps: 0,
             lost: 0,
         };
-        // the watchdog on such a sample: owed for one read, then the next
-        // read takes it back, and a quiet VM is never stopped
+        // a reader that passed everything on: such a sample is owed for one
+        // read, then the next read takes it back
         let mut w = Watch::new(t0, c(100, 0, 5), p(105));
         assert_eq!(w.tick(at(3), p(105), Some(got), p(105)), Health::Fine);
+        assert_eq!(w.owed, 100);
+        assert_eq!(
+            w.tick(at(6), p(105), Some(c(200, 100, 5)), p(105)),
+            Health::Fine
+        );
+        assert_eq!(w.owed, 0);
         assert!(
-            (2..10)
+            (3..10)
                 .all(|i| w.tick(at(3 * i), p(105), Some(c(200, 100, 5)), p(105)) == Health::Fine)
         );
-        // the same, with a reload before the read that would take it back:
-        // the slack goes with the old counters, nothing stays owed
+        // the same with a reload before the read that would take it back:
+        // the slack comes off what was owed before, nothing stays owed
         let mut w = Watch::new(t0, c(100, 0, 5), p(105));
-        assert_eq!(w.tick(at(3), p(105), Some(got), p(105)), Health::Fine);
-        let mut fresh = c(0, 0, 0);
-        fresh.ids = [9, 10, 11, 12];
-        assert!((2..10).all(|i| w.tick(at(3 * i), p(105), Some(fresh), p(105)) == Health::Fine));
-        // a reload whose new counts passed the old ones by the next read:
-        // the handles say it's new, so what it says was all sent since
+        w.tick(at(3), p(105), Some(got), p(105));
+        assert_eq!(
+            w.tick(at(6), p(105), Some(table_gen(2, 0, 0, 0)), p(105)),
+            Health::Fine
+        );
+        assert_eq!(w.owed, 0);
+        assert!((3..10).all(
+            |i| w.tick(at(3 * i), p(105), Some(table_gen(2, 0, 0, 0)), p(105)) == Health::Fine
+        ));
+        // slack with nothing owed, then a reload and 10 messages to a reader
+        // that's stuck: the slack doesn't cancel them, it's stopped
+        let mut w = Watch::new(t0, c(0, 0, 0), p(0));
+        let mut s = c(0, 0, 0);
+        s.slack = 100;
+        w.tick(at(3), p(0), Some(s), p(0));
+        assert_eq!(w.owed, 0);
+        assert_eq!(
+            w.tick(at(6), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
+            Health::Fine
+        );
+        assert_eq!(w.owed, 10);
+        assert_eq!(
+            w.tick(at(9), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
+            Health::Fine
+        );
+        assert_eq!(
+            w.tick(at(12), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
+            Health::Stalled
+        );
+        // a reload whose new counts passed the old ones, with the same
+        // counter handles inside the new table: the table handle says it's
+        // new, so what it says was all sent since. a reader that keeps up...
+        // (passed on while the counters were read: off what's owed at the next)
         let mut w = Watch::new(t0, c(50, 40, 0), p(10));
-        let mut new = c(200, 100, 0);
-        new.ids = [9, 10, 11, 12];
-        assert_eq!(w.tick(at(3), p(10), Some(new), p(110)), Health::Fine);
-        assert!((2..10).all(|i| w.tick(at(3 * i), p(110), Some(new), p(110)) == Health::Fine));
-        // and a reader stuck through such a reload is still caught
+        assert_eq!(
+            w.tick(at(3), p(10), Some(table_gen(2, 200, 100, 0)), p(110)),
+            Health::Fine
+        );
+        w.tick(at(6), p(110), Some(table_gen(2, 200, 100, 0)), p(110));
+        assert_eq!(w.owed, 0);
+        assert!((3..10).all(|i| w.tick(
+            at(3 * i),
+            p(110),
+            Some(table_gen(2, 200, 100, 0)),
+            p(110)
+        ) == Health::Fine));
+        // ...and one stuck through it is still caught
         let mut w = Watch::new(t0, c(50, 40, 0), p(10));
-        assert_eq!(w.tick(at(3), p(10), Some(new), p(10)), Health::Fine);
-        assert_eq!(w.tick(at(6), p(10), Some(new), p(10)), Health::Fine);
-        assert_eq!(w.tick(at(9), p(10), Some(new), p(10)), Health::Stalled);
+        assert_eq!(
+            w.tick(at(3), p(10), Some(table_gen(2, 200, 100, 0)), p(10)),
+            Health::Fine
+        );
+        assert_eq!(w.owed, 100);
+        assert_eq!(
+            w.tick(at(6), p(10), Some(table_gen(2, 200, 100, 0)), p(10)),
+            Health::Fine
+        );
+        assert_eq!(
+            w.tick(at(9), p(10), Some(table_gen(2, 200, 100, 0)), p(10)),
+            Health::Stalled
+        );
     }
 
     #[test]
