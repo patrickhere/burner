@@ -132,6 +132,12 @@ uninstall() {
     if vms_running; then
         die "VMs are running (sudo burner ls), stop them first"
     fi
+    # a paths.root of its own stays: said below, never removed blind
+    other_root=""
+    if [ -x "$BIN" ]; then
+        other_root=$("$BIN" config 2>/dev/null | sed -n '/^\[paths\]/,/^\[/s/^root = "\(.*\)"$/\1/p')
+    fi
+    [ "$other_root" != "$ROOT" ] && [ -d "$other_root" ] || other_root=""
     systemctl disable --now burner-reap.timer burner-net.service 2>/dev/null || true
     if [ -x "$BIN" ]; then "$BIN" net down >/dev/null 2>&1 || true; fi
     # checked again with the ledger locked: nothing may start from here on. a
@@ -155,6 +161,7 @@ uninstall() {
     [ -e /etc/burner ] && left="/etc/burner (your config)"
     [ -e "$RULE" ] && left="${left:+$left, }$RULE (the sudo rule)"
     [ -n "$left" ] && left="$left, --purge removes them. also "
+    [ -n "$other_root" ] && left="${left}$other_root (your paths.root, with its images and run log), "
     echo "removed burner and $ROOT (its images and this machine's run log). left in place: ${left}the ufw rule if you added one, docker images named burner-img-*," \
         "and each user's ~/.local/state/burner"
     exit 0
