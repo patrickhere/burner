@@ -39,6 +39,7 @@ things to know:
 - through sudo `ls`, `kill` and `log` only see that user's VMs and runs. root itself, without sudo, sees everyone's
 - the sudo rule changed. upgrades through get.sh keep it in step for the users in it; a rule written by hand stays as it was until `install.sh --allow`, and `burner -H HOST doctor` says when it's an old one
 - `-H` copies follow this machine's `[log]` settings, since `--config` goes to the far end
+- on linux the reader watchdog can't see across a filter reload (the reaper reloads when the uplink moves): a reader that gets stuck right as it happens can go unnoticed until more traffic comes (the end-of-run check still marks the log incomplete), and a connection flood at that same moment can stop a healthy VM with 125. 0.4 hands the old counts over at a reload
 - a full-tunnel VPN still blocks every VM while it's up, on a mac and on linux. that's on purpose: sending VM traffic through it would put it on the network behind the VPN
 - give an image of your own a name of its own: `burner setup` and upgrades replace `alpine` and `debian`
 - on a mac, run `burner setup` again after `brew upgrade burner`, the formula says so too
