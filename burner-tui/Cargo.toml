@@ -1,6 +1,6 @@
 [package]
 name = "burnervm-tui"
-version = "0.3.0"
+version = "0.3.1"
 description = "a terminal UI for burner: pick an image and settings, start a shell or run, watch and kill running VMs"
 readme = "../README.md"
 keywords = ["firecracker", "microvm", "sandbox", "tui"]
