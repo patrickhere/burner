@@ -321,12 +321,40 @@ impl Watch {
     }
 }
 
-/// linux: the slot's log counters, all four from one `nft list`, None when
-/// they can't be read in COUNTER_TIMEOUT. one list is one snapshot (nft
-/// starts its read over when the ruleset changes under it), so a filter
-/// reload can't land between two of them and mix an old count with a new one
+/// linux: the slot's log counters, None when they can't be read in
+/// COUNTER_TIMEOUT. the over-limit count comes from one list and the rest
+/// from the next, so it's read before the attempts and traffic between can
+/// only make what was sent look more, never fewer (the next read takes it
+/// back). each list is one ruleset generation, nft starts over when the
+/// ruleset changes under it, and a filter reload between the two shows as a
+/// count that went down: then it reads again, so a sample never mixes an old
+/// count with a new one
 #[cfg(target_os = "linux")]
 fn live_counts(tap: &str) -> Option<Counts> {
+    let mut first = list_counts(tap)?;
+    for _ in 0..3 {
+        let next = list_counts(tap)?;
+        if let Some(c) = combine(first, next) {
+            return Some(c);
+        }
+        first = next;
+    }
+    None
+}
+
+/// over from the first list, the rest from the second. None when a count
+/// went down between them, a reload
+#[cfg(any(target_os = "linux", test))]
+fn combine(first: Counts, next: Counts) -> Option<Counts> {
+    (!next.reset_since(first)).then_some(Counts {
+        over: first.over,
+        ..next
+    })
+}
+
+/// linux: one `nft list` of the slot's four counters
+#[cfg(target_os = "linux")]
+fn list_counts(tap: &str) -> Option<Counts> {
     let out = crate::sys::run_timeout(
         std::process::Command::new("nft").args([
             "-j",
@@ -792,6 +820,38 @@ mod tests {
         let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
         assert!(slot_counts(part.as_bytes(), "bn3").is_none());
         assert!(slot_counts(b"not json", "bn3").is_none());
+    }
+
+    #[test]
+    fn over_first_then_the_rest() {
+        let c = |tries: u64, over: u64, up: u64| Counts {
+            tries,
+            over,
+            up,
+            down: 0,
+        };
+        // 100 over-limit attempts between the two lists: over from the
+        // first, so the sample says 100 more sent, never fewer
+        let got = combine(c(100, 0, 5), c(200, 100, 5)).unwrap();
+        assert_eq!((got.tries, got.over, got.up), (200, 0, 5));
+        // a reload between them: counts went down, read again
+        assert!(combine(c(100, 0, 5), c(3, 0, 0)).is_none());
+        assert!(combine(c(100, 0, 5), c(150, 0, 2)).is_none());
+        // the watchdog on such a sample: owed for one read, then the next
+        // read takes it back, and a quiet VM is never stopped
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let p = |passed: u64| Seen {
+            passed,
+            gaps: 0,
+            lost: 0,
+        };
+        let mut w = Watch::new(t0, c(100, 0, 5), p(105));
+        assert_eq!(w.tick(at(3), p(105), Some(got), p(105)), Health::Fine);
+        assert!(
+            (2..10)
+                .all(|i| w.tick(at(3 * i), p(105), Some(c(200, 100, 5)), p(105)) == Health::Fine)
+        );
     }
 
     #[test]
