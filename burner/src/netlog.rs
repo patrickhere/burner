@@ -1208,8 +1208,9 @@ const REACHED_NAMES: usize = 3;
 const REACHED_WIDTH: usize = 60;
 
 /// where the run went: the allowed connections' names (the address when
-/// there's none), in the order they were first seen. None when nothing
-/// was allowed out
+/// there's none), in the order they were first seen. every name a row has:
+/// one address behind a CDN can stand for several hosts the run reached.
+/// None when nothing was allowed out
 fn reached(log: &NetLog) -> Option<String> {
     let mut rows: Vec<&Event> = log
         .events
@@ -1219,13 +1220,15 @@ fn reached(log: &NetLog) -> Option<String> {
     rows.sort_by(|a, b| a.t.total_cmp(&b.t));
     let mut names: Vec<String> = Vec::new();
     for e in rows {
-        let n = e
-            .names
-            .first()
-            .cloned()
-            .unwrap_or_else(|| e.dst.to_string());
-        if !names.contains(&n) {
-            names.push(n);
+        let row = if e.names.is_empty() {
+            vec![e.dst.to_string()]
+        } else {
+            e.names.clone()
+        };
+        for n in row {
+            if !names.contains(&n) {
+                names.push(n);
+            }
         }
     }
     let cut = |n: &str| -> String {
@@ -1842,7 +1845,19 @@ mod tests {
             };
             big.events.push(e);
         }
-        // the same name twice counts once
+        // the same name twice counts once, and a row's second name shows too
+        let mut shared = row.clone();
+        shared.t = 0.5;
+        shared.names = vec!["n0.example".into(), "cdn.example".into()];
+        let mut two = big.clone();
+        two.events.push(shared);
+        assert!(
+            reached(&two)
+                .unwrap()
+                .starts_with("n0.example, cdn.example, n1.example"),
+            "{:?}",
+            reached(&two)
+        );
         let mut dup = row.clone();
         dup.t = 9.0;
         dup.names = vec!["n0.example".into()];
