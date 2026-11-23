@@ -20,9 +20,16 @@ clean_state() {
 id=$(sudo burner run --img "$IMG" -- '. /etc/os-release; echo "$ID"' </dev/null 2>&1)
 [ "$id" = "$IMG" ] && ok "VMs boot $IMG" || bad "image" "asked for $IMG, os-release ID=$id"
 
-# 1 exit code + live output
-out=$(sudo burner run --img "$IMG" -- 'echo hi; exit 7' </dev/null 2>&1); rc=$?
+# 1 exit code + live output. with --net given nothing else is said; a run
+# left without one whose command fails gets one line saying it had no network
+out=$(sudo burner run --img "$IMG" --net none -- 'echo hi; exit 7' </dev/null 2>&1); rc=$?
 [ "$rc" = 7 ] && [ "$out" = hi ] && ok "exit code and output" || bad "exit code and output" "rc=$rc out=$out"
+o1=$(sudo burner run --img "$IMG" -- 'echo hi; exit 7' </dev/null 2>"$T/hint.err"); r1=$?
+o2=$(sudo burner run --img "$IMG" -- 'echo hi' </dev/null 2>&1); r2=$?
+[ "$r1" = 7 ] && [ "$o1" = hi ] && [ "$(wc -l < "$T/hint.err")" = 1 ] && grep -q '^burner: this run had no network' "$T/hint.err" \
+  && [ "$r2" = 0 ] && [ "$o2" = hi ] \
+  && ok "a failed run without --net says it had no network, a good one says nothing" \
+  || bad "no-network hint" "r=$r1,$r2 out=$o1 err=$(head -c 200 "$T/hint.err") ok-run=$o2"
 
 # 2 --in tar
 mkdir -p "$T/proj"; echo 'print me' > "$T/proj/a.txt"
@@ -183,10 +190,46 @@ for _ in $(seq 40); do vid=$(sudo burner ls | awk '$2 == "victim2" && /running/ 
 [ -n "$vid" ] && [ "$(cat "$T/k2.rc")" = 130 ] && grep -q 'killed by burner kill' "$T/k2.err" && ! grep -q 'VM ended before' "$T/k2.err" \
   && ok "sudo burner kill during boot: rc 130, no console dump" || bad "kill during boot" "vid=$vid rc=$(cat "$T/k2.rc") err=$(tr '\n' ' ' < "$T/k2.err" | head -c 300)"
 
+# 12b ls and kill: root's, like log, so without sudo they say so with exit 2.
+# through sudo ls shows only the caller's VMs, under a header row; root sees
+# every one, and a VM another user started can't be killed by this one
+# the suite itself may run as root (sudo bash tests/isolation.sh): nobody
+# is a user that surely isn't
+sudo -u nobody burner ls >/dev/null 2>"$T/nr.ls"; r1=$?
+sudo -u nobody burner kill burner-000000000000 >/dev/null 2>"$T/nr.kill"; r2=$?
+( sudo env SUDO_UID=4242 burner run --img "$IMG" --tag elses -- 'sleep 300' </dev/null >/dev/null 2>&1 ) &
+ov=""
+for _ in $(seq 40); do ov=$(sudo env -u SUDO_UID burner ls | awk '$2 == "elses" {print $1}'); [ -n "$ov" ] && break; sleep 0.25; done
+mine=$(sudo burner ls); minej=$(sudo burner ls --json)
+sudo burner kill "$ov" >/dev/null 2>&1; rk=$?
+head=$(sudo env -u SUDO_UID burner ls | head -n 1)
+[ -n "$ov" ] && sudo env -u SUDO_UID burner kill "$ov" >/dev/null; wait
+[ "$r1" = 2 ] && grep -q 'burner ls needs root' "$T/nr.ls" && [ "$r2" = 2 ] && grep -q 'burner kill needs root' "$T/nr.kill" \
+  && [ -n "$ov" ] && ! grep -q "$ov" <<<"$mine$minej" && [ "$rk" = 1 ] \
+  && [ "$(echo "$head" | awk '{print $1, $2, $NF}')" = "ID TAG LEFT" ] \
+  && ok "ls and kill need root (2); through sudo ls lists only yours and kill won't stop another user's VM" \
+  || bad "ls and kill owners" "noroot=$r1,$r2 other=$ov kill=$rk head=$head mine=$(head -c 200 <<<"$mine")"
+
+# 12c kill --tag and --mine stop the caller's VMs and nobody else's, and
+# --wait gives up queueing when it says
+( sudo burner run --img "$IMG" --tag grp -- 'sleep 300' </dev/null >/dev/null 2>"$T/g1.err"; echo $? > "$T/g1.rc" ) &
+( sudo env SUDO_UID=4242 burner run --img "$IMG" --tag grp -- 'sleep 300' </dev/null >/dev/null 2>&1; echo $? > "$T/g2.rc" ) &
+for _ in $(seq 40); do [ "$(sudo env -u SUDO_UID burner ls | grep -c ' grp ')" = 2 ] && break; sleep 0.25; done
+ws=$(date +%s); sudo burner run --img "$IMG" --wait 3s -- true </dev/null >/dev/null 2>"$T/w.err"; rw=$?; we=$(date +%s)
+kt=$(sudo burner kill --tag grp --json); rt=$?
+left=$(sudo env -u SUDO_UID burner ls | grep -c ' grp ')
+km=$(sudo burner kill --mine); rm_=$?
+sudo env SUDO_UID=4242 burner kill --mine >/dev/null; wait
+[ "$rw" = 125 ] && grep -q 'no free slot after 3s' "$T/w.err" && [ $((we - ws)) -le 15 ] \
+  && [ "$rt" = 0 ] && printf '%s' "$kt" | jq -e '(.result.vms | length) == 1 and .result.vms[0].state == "gone"' >/dev/null && [ "$left" = 1 ] \
+  && [ "$rm_" = 0 ] && [ "$km" = "no VMs of yours running" ] && [ "$(cat "$T/g1.rc")" = 130 ] && [ "$(cat "$T/g2.rc")" = 130 ] \
+  && ok "kill --tag and --mine stop only the caller's VMs, --wait 3s gives up (125)" \
+  || bad "kill --tag/--mine, --wait" "wait=$rw $((we - ws))s tag=$rt left=$left mine=$rm_ '$km' rcs=$(cat "$T/g1.rc" "$T/g2.rc" | tr '\n' ' ') $(head -c 200 <<<"$kt")"
+
 # 13 argument fuzzing: all must be refused with rc 2 before any VM starts
 fz=0
 for a in "--img ../alpine" "--img alpine/../x" "--img ALPINE" "--tag A_B" "--tag $(printf 'x%.0s' {1..40})" \
-         "--cpus 99" "--cpus 0" "--mem 99999" "--mem 1" "--ttl 2h" "--ttl 1s" "--ttl 5x" "--disk 0" "--disk 50" \
+         "--cpus 99" "--cpus 0" "--mem 99999" "--mem 1" "--mem 2T" "--disk 1500M" "--ttl 2h" "--ttl 1s" "--ttl 5x" "--disk 0" "--disk 50" \
          "--net lan" "--in auto" "--result zip" "--bogus 1"; do
   # shellcheck disable=SC2086
   sudo burner run $a -- true </dev/null >/dev/null 2>&1; r=$?
@@ -194,6 +237,8 @@ for a in "--img ../alpine" "--img alpine/../x" "--img ALPINE" "--tag A_B" "--tag
 done
 sudo burner run -- </dev/null >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      empty command not refused"; }
 sudo burner kill ../../etc >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad kill id not refused"; }
+sudo burner kill --tag A_B >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad kill tag not refused"; }
+sudo burner run --wait 2d -- true </dev/null >/dev/null 2>&1; [ $? = 2 ] || { fz=1; echo "      bad --wait not refused"; }
 [ "$fz" = 0 ] && ok "argument fuzzing: all refused" || bad "argument fuzzing" "see above"
 
 # 14 stdin cap is not tested here (512M); oversized command:

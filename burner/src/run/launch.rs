@@ -18,7 +18,7 @@ use serde_json::json;
 use super::admin::VM_DIRS;
 use super::admin::{caller_uid, log_line, remove_tree, teardown};
 use super::console::{Ended, ShellIo, deliver, print_rest, relay, stream, supervise};
-use super::plan::{Input, Plan, RunArgs, plan};
+use super::plan::{Input, Plan, RunArgs, image_fix, plan};
 use super::record::{self, Mark, OutputInfo, RunOutcome, ShellEnd, TarInfo, VmInfo};
 use super::{
     Deadline, EXIT_INTERRUPTED, EXIT_SANDBOX, EXIT_TIMEOUT, EXIT_USAGE, Exit, Outcome, exit,
@@ -35,7 +35,6 @@ use crate::sys;
 
 const STDIN_CAP: u64 = 512 << 20;
 const STDIN_TOTAL: Duration = Duration::from_secs(600);
-const QUEUE_WAIT: Duration = Duration::from_secs(600);
 const DELIVER_TIMEOUT: Duration = Duration::from_secs(300);
 #[cfg(target_os = "linux")]
 pub const VMM: &str = "firecracker";
@@ -81,6 +80,16 @@ pub fn json_target(a: &RunArgs) -> Option<i32> {
         Some(1)
     } else {
         a.json_fd
+    }
+}
+
+/// the json as it goes to its fd: as it is, or with --json-mark as the
+/// marked record the far end of -H sends its client, which remote/frame.rs
+/// reads. the guest never sees the nonce, so it can't print one
+pub fn json_line(a: &RunArgs, env: &str) -> String {
+    match &a.json_mark {
+        Some(m) => format!("burner-{m} status {env}"),
+        None => env.to_string(),
     }
 }
 
@@ -142,10 +151,11 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
             "--json writes to stdout, --json-fd to another fd: pick one".into()
         }
         _ if a.result.is_some() && json_target(a) == Some(1) => tar_out.into(),
-        _ => {
-            let cmd = if a.shell { "shell" } else { "run" };
-            format!("burner {cmd} {}: not yet", a.unbuilt()?)
+        // the far end's json goes back as a record, the client marks its own
+        _ if a.json_mark.is_some() && a.remote.is_none() && json_target(a).is_none() => {
+            "--json-mark marks the json, give --json-fd too (2 through sudo)".into()
         }
+        _ => return None,
     };
     // with nowhere to put the json, stderr is all that's left
     if !quiet() || !json_ok {
@@ -161,7 +171,7 @@ pub fn check_fds(a: &RunArgs, t0: Instant) -> Option<ExitCode> {
     }
     let env = envelope(a, f);
     if let (true, Some(fd)) = (json_ok, json_target(a)) {
-        json::write_fd(fd, &env);
+        json::write_fd(fd, &json_line(a, &env));
     }
     to_client(a, "status", &env);
     Some(ExitCode::from(EXIT_USAGE))
@@ -198,7 +208,7 @@ pub fn finished(a: &RunArgs, f: record::Finished) -> ExitCode {
     }
     let env = envelope(a, f);
     if let Some(fd) = json_target(a) {
-        json::write_fd(fd, &env);
+        json::write_fd(fd, &json_line(a, &env));
     }
     to_client(a, "status", &env);
     ExitCode::from(code)
@@ -244,12 +254,34 @@ pub fn main(cfg: &Config, a: &RunArgs) -> ExitCode {
         }
     };
     let f = record::finish(t0, code, failed);
+    if let Some(hint) = no_net_hint(cfg, a, &f) {
+        json::note_warning(Kind::NoNet, hint, !quiet());
+    }
     crate::runlog::keep(crate::runlog::Ended::Here {
         cfg,
         args: a,
         fin: &f,
     });
     finished(a, f)
+}
+
+/// a run left at --net none whose command failed: maybe it wanted the
+/// network
+fn no_net_hint(cfg: &Config, a: &RunArgs, f: &record::Finished) -> Option<&'static str> {
+    if a.shell
+        || !a.net_default()
+        || f.outcome != RunOutcome::Exited
+        || f.rc.is_none_or(|rc| rc == 0)
+    {
+        return None;
+    }
+    Some(
+        if net::Mode::parse(&cfg.limits.net).is_some_and(|m| m >= net::Mode::Web) {
+            "this run had no network (--net web for http and https)"
+        } else {
+            "this run had no network, and this machine allows none (limits.net)"
+        },
+    )
 }
 
 fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
@@ -323,8 +355,7 @@ fn run(cfg: &Config, a: &RunArgs) -> Result<u8> {
         }
         record::set_network(log);
     }
-    if died {
-        let msg = super::netwire::READER_DIED;
+    if let Some(msg) = died {
         record::set_outcome(
             RunOutcome::SandboxError,
             None,
@@ -408,6 +439,11 @@ fn run_vm(
     let (net_slot, uid) = take_slot(cfg, p, id, &diag)?;
     record::mark(Mark::Slot);
     *held = Some(());
+    // the id for burner kill from another terminal, once kill can find it.
+    // a shell has the terminal, and scripts get it in the json
+    if !p.shell && a.remote.is_none() && sys::is_tty(2) {
+        diag.put(format!("burner: {id} started\n").as_bytes(), None);
+    }
     // held until this returns, after teardown
     #[cfg(target_os = "macos")]
     let _awake = sys::Awake::hold(&format!("burner {id}"));
@@ -430,19 +466,16 @@ fn run_vm(
         .ok()
         .as_deref()
         != Some(crate::doctor::GUEST_INIT);
+    if legacy {
+        let msg = format!(
+            "image {} was built with a different guest init, {}",
+            p.img,
+            image_fix(&p.img)
+        );
+        json::note_warning(Kind::Image, &msg, false);
+        diag.put(format!("burner: {msg}\n").as_bytes(), None);
+    }
     if p.shell {
-        #[cfg(target_os = "linux")]
-        let fix = format!("rebuild it: tools/build-image {}", p.img);
-        #[cfg(target_os = "macos")]
-        let fix = crate::setup::fix_hint(std::slice::from_ref(&p.img));
-        if legacy {
-            let msg = format!(
-                "image {} was built with a different guest init, {fix}",
-                p.img
-            );
-            json::note_warning(Kind::Image, &msg, false);
-            diag.put(format!("burner: {msg}\n").as_bytes(), None);
-        }
         let io = ShellIo {
             legacy,
             tty_rec,
@@ -732,8 +765,9 @@ fn run_vm(
             // an image built from another burner's guest init: its results can't be trusted
             if meta.rc.is_some() && meta.proto != Some(GUEST_PROTO) {
                 let msg = format!(
-                    "image {} runs a guest init from another burner version, rebuild it: tools/build-image {}",
-                    p.img, p.img
+                    "image {} runs a guest init from another burner version, {}",
+                    p.img,
+                    image_fix(&p.img)
                 );
                 ends(RunOutcome::SandboxError, Kind::Sandbox, msg);
                 code = EXIT_SANDBOX;
@@ -919,6 +953,8 @@ fn launch(
         // the log's reader first: a tap never passes traffic nobody records
         super::netwire::start_linux(cfg, id, i, p.net)?;
         let s = net::tap_up(cfg, i, p.net, uid)?;
+        // and its watch, from a starting point before the VM can send
+        super::netwire::watch_linux(&s.tap)?;
         let rate = json!({"bandwidth": {"size": cfg.net.rate, "refill_time": 1000}});
         ifaces.push(json!({"iface_id": "eth0", "host_dev_name": s.tap, "guest_mac": format!("06:00:ac:1d:{:02x}:{:02x}", i >> 8, i & 0xff),
                            "rx_rate_limiter": rate, "tx_rate_limiter": rate}));
@@ -1467,9 +1503,19 @@ fn take_slot(cfg: &Config, p: &Plan, id: &str, diag: &Out) -> Result<(Option<u32
                 waited = true;
             }
         }
-        if start.elapsed() > QUEUE_WAIT {
+        if start.elapsed() > Duration::from_secs(u64::from(p.wait_secs)) {
             record::set_outcome(RunOutcome::Busy, None, None);
-            return Err(exit(EXIT_SANDBOX, Kind::Busy, "no free slot after 10 min"));
+            let w = p.wait_secs;
+            let after = if w.is_multiple_of(60) {
+                format!("{} min", w / 60)
+            } else {
+                format!("{w}s")
+            };
+            return Err(exit(
+                EXIT_SANDBOX,
+                Kind::Busy,
+                format!("no free slot after {after}"),
+            ));
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -1632,6 +1678,44 @@ mod tests {
         }
         assert!(!fd_ok(w) && !writable(w), "a closed fd");
         assert!(!fd_ok(0) && !fd_ok(1), "only 2 and up for fd_ok");
+    }
+
+    #[test]
+    fn marked_json_is_a_frame_record() {
+        use crate::remote::frame::{Frames, Record};
+        #[derive(clap::Parser)]
+        struct T {
+            #[command(flatten)]
+            a: RunArgs,
+        }
+        let n = "6b1f0e2a9c4d4e7f8a0b1c2d3e4f5a6b";
+        let a = <T as clap::Parser>::try_parse_from([
+            "run",
+            "--json-mark",
+            n,
+            "--json-fd",
+            "2",
+            "--",
+            "x",
+        ])
+        .unwrap()
+        .a;
+        let env = "{\"schema\":1,\"exit\":0}\n";
+        let line = json_line(&a, env);
+        assert_eq!(line, format!("burner-{n} status {env}"));
+        // a guest that printed a lookalike without a newline, then burner's line
+        let fake =
+            "{\"schema\":1,\"exit\":0}\nburner-0000000000000000 status {\"exit\":0}\nno newline";
+        let mut f = Frames::new(n);
+        let (mut out, mut recs) = (Vec::new(), Vec::new());
+        f.feed(format!("{fake}{line}").as_bytes(), &mut out, &mut recs);
+        f.finish(&mut out);
+        assert_eq!(recs, [Record::Status(env.trim_end().into())]);
+        assert_eq!(out, fake.as_bytes());
+        let plain = <T as clap::Parser>::try_parse_from(["run", "--json-fd", "2", "--", "x"])
+            .unwrap()
+            .a;
+        assert_eq!(json_line(&plain, env), env);
     }
 
     #[test]

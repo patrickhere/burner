@@ -24,11 +24,11 @@ pub struct RunArgs {
     /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
-    /// memory in MiB
-    #[arg(long)]
+    /// memory: 512M, 2G, or a number of MiB
+    #[arg(long, value_name = "SIZE", value_parser = mem_size)]
     mem: Option<u32>,
-    /// scratch disk in GiB
-    #[arg(long)]
+    /// scratch disk: 4G, or a number of GiB
+    #[arg(long, value_name = "SIZE", value_parser = disk_size)]
     disk: Option<u32>,
     /// time limit: 90s, 10m, 1h. the command is stopped a little before it (a
     /// quarter of it, 5s to 30s), so its output and /out still get saved
@@ -43,9 +43,10 @@ pub struct RunArgs {
     /// a label for burner ls
     #[arg(long)]
     tag: Option<String>,
-    /// network: none, web (http/https, dns, ping) or open (any port but mail). never the LAN
-    #[arg(long, default_value = "none")]
-    net: String,
+    /// network: none (the default), web (http/https, dns, ping) or open (any
+    /// port but mail). never the LAN
+    #[arg(long)]
+    net: Option<String>,
     /// the older one-line form of --json-fd: outcome, rc, exit, id and secs
     #[arg(long, value_name = "FD")]
     pub(super) status_fd: Option<i32>,
@@ -54,10 +55,11 @@ pub struct RunArgs {
     /// use 2: the json is then the last line on stderr
     #[arg(long, value_name = "FD")]
     pub(super) json_fd: Option<i32>,
-    /// mark the json with this nonce, so a line the guest wrote can't pass
-    /// for it
-    #[arg(long, value_name = "NONCE")]
-    json_mark: Option<String>,
+    /// write the json as one line `burner-NONCE status {...}`, so a line the
+    /// guest wrote can't pass for it. NONCE is 16 to 64 letters, digits and
+    /// dashes nobody else knows (openssl rand -hex 16)
+    #[arg(long, value_name = "NONCE", value_parser = json_nonce)]
+    pub(super) json_mark: Option<String>,
     /// the connection log after a run with a network, on stderr: a summary,
     /// the full table, or nothing. it's kept either way (burner log)
     #[arg(long, value_enum, default_value_t = LogMode::Summary)]
@@ -77,12 +79,6 @@ pub struct RunArgs {
     cmd: Vec<String>,
     #[arg(skip)]
     pub(super) shell: bool,
-    /// shell --img was given
-    #[arg(skip)]
-    shell_img: bool,
-    /// --net wasn't given: lower it to limits.net instead of refusing
-    #[arg(skip)]
-    net_default: bool,
 }
 
 #[derive(Args)]
@@ -95,11 +91,11 @@ pub struct ShellArgs {
     /// virtual CPUs (default the image's, else 1; at most limits.vcpus)
     #[arg(long)]
     cpus: Option<u32>,
-    /// memory in MiB
-    #[arg(long)]
+    /// memory: 512M, 2G, or a number of MiB
+    #[arg(long, value_name = "SIZE", value_parser = mem_size)]
     mem: Option<u32>,
-    /// scratch disk in GiB
-    #[arg(long)]
+    /// scratch disk: 4G, or a number of GiB
+    #[arg(long, value_name = "SIZE", value_parser = disk_size)]
     disk: Option<u32>,
     /// time limit: 30m, 1h. a shell isn't stopped early like a run, it closes
     /// at the limit
@@ -116,7 +112,7 @@ pub struct ShellArgs {
     #[arg(long, value_name = "FD")]
     json_fd: Option<i32>,
     /// mark the json with this nonce, see run
-    #[arg(long, value_name = "NONCE")]
+    #[arg(long, value_name = "NONCE", value_parser = json_nonce)]
     json_mark: Option<String>,
     /// how long to queue for a slot: 30s, 5m [default: 10m]
     #[arg(long, value_name = "TIME")]
@@ -127,6 +123,16 @@ pub struct ShellArgs {
     /// burner -H on the far end of ssh, see run. the ~ escape is the client's
     #[arg(long, hide = true, value_name = "PROTO:NONCE", value_parser = remote_nonce)]
     remote: Option<String>,
+}
+
+/// --json-mark: 16 to 64 ascii letters, digits and dashes, so the marker
+/// is one word and a guest can't guess it
+fn json_nonce(s: &str) -> Result<String, String> {
+    if (16..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        Ok(s.into())
+    } else {
+        Err("the nonce is 16 to 64 letters, digits and dashes (openssl rand -hex 16)".into())
+    }
 }
 
 /// the remote protocol this burner speaks
@@ -186,7 +192,15 @@ impl RunArgs {
 
     /// --net as given, before limits.net lowers a default
     pub fn net(&self) -> &str {
-        &self.net
+        self.net
+            .as_deref()
+            .unwrap_or(if self.shell { "web" } else { "none" })
+    }
+
+    /// --net wasn't given: a shell's default is lowered to limits.net
+    /// instead of refused, and a run that fails says it had no network
+    pub(super) fn net_default(&self) -> bool {
+        self.net.is_none()
     }
 
     /// the command as the VM's sh gets it, empty for a shell
@@ -197,27 +211,17 @@ impl RunArgs {
         command_string(&self.cmd)
     }
 
-    /// a flag that parses but isn't built yet
-    pub(super) fn unbuilt(&self) -> Option<&'static str> {
-        if self.json_mark.is_some() {
-            Some("--json-mark")
-        } else if self.wait.is_some() {
-            Some("--wait")
-        } else if self.shell_img {
-            Some("--img")
-        } else {
-            None
-        }
-    }
-
     /// what burner -H checks here before it connects: everything that needs
     /// no config. the image, the limits and limits.net are the far end's call
     pub fn check_local(&self) -> std::result::Result<(), String> {
         if let Some(t) = &self.ttl {
             parse_ttl(t, u32::MAX).map_err(|e| e.to_string())?;
         }
-        if net::Mode::parse(&self.net).is_none() {
-            return Err(format!("--net {:?}: use none, web or open", self.net));
+        if let Some(w) = &self.wait {
+            parse_wait(w).map_err(|e| e.to_string())?;
+        }
+        if net::Mode::parse(self.net()).is_none() {
+            return Err(format!("--net {:?}: use none, web or open", self.net()));
         }
         if !valid_name(&self.img) {
             return Err(format!("unknown image {:?} (burner images)", self.img));
@@ -263,7 +267,8 @@ impl RunArgs {
         opt("disk", self.disk.map(|n| n.to_string()));
         opt("ttl", self.ttl.clone());
         opt("tag", self.tag.clone());
-        opt("net", (!self.net_default).then(|| self.net.clone()));
+        // only when given: the far end's default is the same
+        opt("net", self.net.clone());
         // the summary is printed there, on the stderr that comes back here
         opt(
             "log",
@@ -273,6 +278,8 @@ impl RunArgs {
                 LogMode::Full => Some("full".into()),
             },
         );
+        // only when given: a 0.3.0 far end doesn't take it
+        opt("wait", self.wait.clone());
         if self.shell {
             v.push(self.img.clone());
             return v;
@@ -308,7 +315,11 @@ impl ShellArgs {
 /// a shell is a run with the caller's terminal and no command
 pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
     RunArgs {
-        img: a.spec.clone().unwrap_or_else(|| "alpine".into()),
+        img: a
+            .img
+            .clone()
+            .or_else(|| a.spec.clone())
+            .unwrap_or_else(|| "alpine".into()),
         cpus: a.cpus,
         mem: a.mem,
         disk: a.disk,
@@ -316,7 +327,6 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         input: Input::None,
         result: None,
         tag: a.tag.clone(),
-        net_default: a.net.is_none(),
         status_fd: None,
         json_fd: a.json_fd,
         log: a.log,
@@ -324,10 +334,9 @@ pub fn shell_run_args(a: &ShellArgs) -> RunArgs {
         json_mark: a.json_mark.clone(),
         wait: a.wait.clone(),
         remote: a.remote.clone(),
-        net: a.net.clone().unwrap_or_else(|| "web".into()),
+        net: a.net.clone(),
         cmd: vec!["true".into()],
         shell: true,
-        shell_img: a.img.is_some(),
     }
 }
 
@@ -463,17 +472,65 @@ fn image_defaults(cfg: &Config, img: &str) -> Result<ImageDefaults> {
     }
 }
 
-pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
+/// a size: a number, then M or G (MB, MiB, GB and GiB too, any case). None
+/// for the number's own unit
+fn size_unit(s: &str) -> Result<(u64, Option<u64>), String> {
+    let at = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let (num, unit) = s.split_at(at);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| format!("{s:?}: use a size like 512M or 2G"))?;
+    let mib = match unit.to_ascii_lowercase().as_str() {
+        "" => None,
+        "m" | "mb" | "mib" => Some(1),
+        "g" | "gb" | "gib" => Some(1024),
+        _ => return Err(format!("{s:?}: use a size like 512M or 2G")),
+    };
+    Ok((n, mib))
+}
+
+/// --mem in MiB: 512, 512M, 2G
+fn mem_size(s: &str) -> Result<u32, String> {
+    let (n, mib) = size_unit(s)?;
+    u32::try_from(n.saturating_mul(mib.unwrap_or(1))).map_err(|_| format!("{s:?} is too big"))
+}
+
+/// --disk in GiB: 4, 4G, 4096M
+fn disk_size(s: &str) -> Result<u32, String> {
+    let (n, mib) = size_unit(s)?;
+    let mib = n.saturating_mul(mib.unwrap_or(1024));
+    if !mib.is_multiple_of(1024) {
+        return Err(format!("{s:?}: the disk is whole GiB (4G)"));
+    }
+    u32::try_from(mib / 1024).map_err(|_| format!("{s:?} is too big"))
+}
+
+/// 90s, 10m, 1h or plain seconds
+fn secs_of(s: &str) -> Option<u32> {
     let (num, mult) = match s.as_bytes().last() {
         Some(b's') => (&s[..s.len() - 1], 1),
         Some(b'm') => (&s[..s.len() - 1], 60),
         Some(b'h') => (&s[..s.len() - 1], 3600),
         _ => (s, 1),
     };
-    let n: u32 = num
-        .parse()
-        .map_err(|_| usage(format!("bad --ttl {s:?} (use 90s, 10m, 1h)")))?;
-    let secs = n.saturating_mul(mult);
+    let n: u32 = num.parse().ok()?;
+    Some(n.saturating_mul(mult))
+}
+
+/// how long a run queues for a slot without --wait
+pub(super) const QUEUE_WAIT: u32 = 600;
+
+/// --wait: 1s to a day
+pub fn parse_wait(s: &str) -> Result<u32> {
+    let secs = secs_of(s).ok_or_else(|| usage(format!("bad --wait {s:?} (use 30s, 5m, 1h)")))?;
+    if !(1..=86400).contains(&secs) {
+        return Err(usage("--wait must be between 1s and 24h"));
+    }
+    Ok(secs)
+}
+
+pub fn parse_ttl(s: &str, max: u32) -> Result<u32> {
+    let secs = secs_of(s).ok_or_else(|| usage(format!("bad --ttl {s:?} (use 90s, 10m, 1h)")))?;
     if !(10..=max).contains(&secs) {
         return Err(usage(format!(
             "--ttl must be between 10s and {}m",
@@ -515,6 +572,28 @@ pub(super) struct Plan {
     pub(super) net: net::Mode,
     pub(super) shell: bool,
     pub(super) no_wait: bool,
+    /// how long to queue for a slot
+    pub(super) wait_secs: u32,
+}
+
+/// where get.sh keeps this release's tools/build-image
+#[cfg(target_os = "linux")]
+const BUILD_IMAGE: &str = "/usr/local/share/burner/current/tools/build-image";
+
+/// how to build `img` from source: the full path when get.sh put the
+/// script there
+#[cfg(target_os = "linux")]
+fn build_image(img: &str, installed: bool) -> String {
+    if installed {
+        format!("{BUILD_IMAGE} {img}")
+    } else {
+        format!("tools/build-image {img} from burner's source")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_image_here() -> bool {
+    std::path::Path::new(BUILD_IMAGE).is_file()
 }
 
 /// what to say for an image that isn't here: how to get one of the stock
@@ -524,13 +603,44 @@ fn missing_image(img: &str) -> String {
         return format!("unknown image {img:?} (burner images)");
     }
     #[cfg(target_os = "linux")]
-    let how = match img {
-        "debian" => "tools/build-image debian from burner's source builds it (it needs mmdebstrap)",
-        _ => "tools/build-image alpine from burner's source builds it",
-    };
+    let how = missing_how(img, build_image_here());
     #[cfg(target_os = "macos")]
     let how = format!("burner setup {img} fetches it");
     format!("no {img} image here (burner images): {how}")
+}
+
+#[cfg(target_os = "linux")]
+fn missing_how(img: &str, installed: bool) -> String {
+    let needs = if img == "debian" {
+        " (it needs mmdebstrap)"
+    } else {
+        ""
+    };
+    format!(
+        "sudo burner setup {img} fetches it, or {} builds it{needs}",
+        build_image(img, installed)
+    )
+}
+
+/// how to get an image whose guest init isn't this burner's
+#[cfg(target_os = "linux")]
+pub(super) fn image_fix(img: &str) -> String {
+    image_fix_linux(img, build_image_here())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn image_fix(img: &str) -> String {
+    crate::setup::fix_hint(&[img.to_string()])
+}
+
+#[cfg(target_os = "linux")]
+fn image_fix_linux(img: &str, installed: bool) -> String {
+    let build = build_image(img, installed);
+    if ["alpine", "debian"].contains(&img) {
+        format!("sudo burner setup {img} gets this version's, or rebuild it: {build}")
+    } else {
+        format!("rebuild it: {build}")
+    }
 }
 
 pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
@@ -565,14 +675,15 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         None if a.shell => 3600.min(max_ttl),
         None => d.ttl_secs.unwrap_or(600).clamp(10, max_ttl),
     };
-    let mut net = net::Mode::parse(&a.net)
-        .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net)))?;
+    let mut net = net::Mode::parse(a.net())
+        .ok_or_else(|| usage(format!("--net {:?}: use none, web or open", a.net())))?;
     let ceiling = net::Mode::parse(&cfg.limits.net).unwrap_or(net::Mode::None);
     if net > ceiling {
-        if !a.net_default {
+        if !a.net_default() {
             return Err(usage(format!(
                 "--net {} is more than this machine allows (limits.net = {})",
-                a.net, cfg.limits.net
+                a.net(),
+                cfg.limits.net
             )));
         }
         net = ceiling;
@@ -603,6 +714,10 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
             "--tag must be lowercase letters, digits and dashes, max 32",
         ));
     }
+    let wait_secs = match &a.wait {
+        Some(w) => parse_wait(w)?,
+        None => QUEUE_WAIT,
+    };
     let cmd = command_string(&a.cmd);
     if cmd.trim().is_empty() {
         return Err(usage("no command given (burner run [opts] -- COMMAND)"));
@@ -629,6 +744,7 @@ pub(super) fn plan(cfg: &Config, a: &RunArgs) -> Result<Plan> {
         net,
         shell: a.shell,
         no_wait: a.no_wait,
+        wait_secs,
     })
 }
 
@@ -639,10 +755,32 @@ mod tests {
     #[test]
     fn missing_images_say_how_to_get_them() {
         let d = missing_image("debian");
-        #[cfg(target_os = "linux")]
-        assert!(d.contains("tools/build-image debian") && d.contains("mmdebstrap"));
-        #[cfg(target_os = "macos")]
         assert!(d.contains("burner setup debian"));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(d.contains("tools/build-image debian") && d.contains("mmdebstrap"));
+            assert_eq!(
+                missing_how("alpine", true),
+                "sudo burner setup alpine fetches it, or \
+                 /usr/local/share/burner/current/tools/build-image alpine builds it"
+            );
+            assert_eq!(
+                missing_how("debian", false),
+                "sudo burner setup debian fetches it, or tools/build-image debian from \
+                 burner's source builds it (it needs mmdebstrap)"
+            );
+            assert_eq!(
+                image_fix_linux("debian", true),
+                "sudo burner setup debian gets this version's, or rebuild it: \
+                 /usr/local/share/burner/current/tools/build-image debian"
+            );
+            assert_eq!(
+                image_fix_linux("node", false),
+                "rebuild it: tools/build-image node from burner's source"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(image_fix("alpine"), "run burner setup alpine");
         assert!(missing_image("alpine").contains("alpine"));
         assert_eq!(
             missing_image("node"),
@@ -666,6 +804,81 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&r).unwrap(),
             r#"{"images":[{"name":"alpine","rootfs_bytes":268435456,"init_matches":true,"defaults":{"vcpus":null,"mem_mib":512,"disk_gib":null,"ttl_secs":null}}]}"#
+        );
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(mem_size("512"), Ok(512));
+        assert_eq!(mem_size("512M"), Ok(512));
+        assert_eq!(mem_size("512mib"), Ok(512));
+        assert_eq!(mem_size("2G"), Ok(2048));
+        assert_eq!(mem_size("2gb"), Ok(2048));
+        assert_eq!(disk_size("4"), Ok(4));
+        assert_eq!(disk_size("4G"), Ok(4));
+        assert_eq!(disk_size("4096M"), Ok(4));
+        assert!(disk_size("500M").is_err(), "not whole GiB");
+        for bad in ["", "G", "2T", "1.5G", "-1", " 2G", "2 G", "99999999999G"] {
+            assert!(mem_size(bad).is_err() && disk_size(bad).is_err(), "{bad:?}");
+        }
+        // the far end gets plain MiB and GiB, which 0.3.0 takes too
+        let n = "0123456789abcdef0123456789abcdef";
+        let a = parse(&["--mem", "2G", "--disk", "4G", "--", "x"]).remote_argv(n, false);
+        assert_eq!(a[3..7], ["--mem", "2048", "--disk", "4"]);
+    }
+
+    #[test]
+    fn shell_takes_img() {
+        #[derive(clap::Parser)]
+        struct S {
+            #[command(flatten)]
+            a: ShellArgs,
+        }
+        let sh = |args: &[&str]| {
+            <S as clap::Parser>::try_parse_from(
+                std::iter::once("shell").chain(args.iter().copied()),
+            )
+            .map(|s| shell_run_args(&s.a).img)
+        };
+        assert_eq!(sh(&[]).unwrap(), "alpine");
+        assert_eq!(sh(&["debian"]).unwrap(), "debian");
+        assert_eq!(sh(&["--img", "debian"]).unwrap(), "debian");
+        assert!(
+            sh(&["--img", "debian", "alpine"]).is_err(),
+            "one or the other"
+        );
+    }
+
+    #[test]
+    fn waits() {
+        assert_eq!(parse_wait("30s").unwrap(), 30);
+        assert_eq!(parse_wait("5m").unwrap(), 300);
+        assert_eq!(parse_wait("24h").unwrap(), 86400);
+        for bad in ["0s", "25h", "x", "", "5d"] {
+            assert!(parse_wait(bad).is_err(), "{bad:?}");
+        }
+        let n = "0123456789abcdef0123456789abcdef";
+        let a = parse(&["--wait", "30s", "--", "x"]);
+        assert!(a.check_local().is_ok());
+        let argv = a.remote_argv(n, false);
+        let at = argv.iter().position(|w| w == "--wait").unwrap();
+        assert_eq!(argv[at + 1], "30s");
+        assert!(at < argv.iter().position(|w| w == "--").unwrap());
+        assert!(
+            !parse(&["--", "x"])
+                .remote_argv(n, false)
+                .contains(&"--wait".into())
+        );
+        assert!(parse(&["--wait", "2d", "--", "x"]).check_local().is_err());
+        #[derive(clap::Parser)]
+        struct S {
+            #[command(flatten)]
+            a: ShellArgs,
+        }
+        let s = <S as clap::Parser>::try_parse_from(["shell", "--wait", "1m", "debian"]).unwrap();
+        assert_eq!(
+            shell_run_args(&s.a).remote_argv(n, false)[3..],
+            ["--wait", "1m", "debian"]
         );
     }
 
@@ -746,8 +959,7 @@ mod tests {
         assert_eq!(
             j[3..],
             [
-                "--net", "none", "--img", "alpine", "--in", "tar", "--result", "tar", "--json",
-                "--", "x"
+                "--img", "alpine", "--in", "tar", "--result", "tar", "--json", "--", "x"
             ]
         );
     }
@@ -774,6 +986,26 @@ mod tests {
         let s = <S as clap::Parser>::try_parse_from(["shell", "--log", "none", "debian"]).unwrap();
         let sh = shell_run_args(&s.a).remote_argv(n, false);
         assert_eq!(sh[3..], ["--log", "none", "debian"]);
+    }
+
+    #[test]
+    fn json_marks() {
+        let n = "0123456789abcdef0123456789abcdef";
+        assert_eq!(json_nonce(n).as_deref(), Ok(n));
+        assert!(json_nonce("A1b2-C3d4-E5f6-G7h8").is_ok());
+        for bad in [
+            "",
+            "short",
+            "0123456789abcde",
+            &"a".repeat(65),
+            "0123456789abcdef 1",
+            "0123456789abcdef\n",
+        ] {
+            assert!(json_nonce(bad).is_err(), "{bad:?}");
+        }
+        // the client marks its own json, the far end never gets the nonce
+        let a = parse(&["--json-mark", n, "--json-fd", "2", "--", "x"]);
+        assert!(!a.remote_argv(n, false).iter().any(|w| w.contains("json")));
     }
 
     #[test]

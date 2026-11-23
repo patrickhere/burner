@@ -259,7 +259,94 @@ impl LsVm {
     }
 }
 
+/// through sudo, the caller. None for root itself, which sees every VM
+fn sudo_caller() -> Option<u32> {
+    std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok())
+}
+
+/// ls and kill read and change the ledger, which is root's on linux
+#[cfg(target_os = "linux")]
+fn needs_root(cmd: &str, what: &str) -> Option<ExitCode> {
+    (!sys::is_root()).then(|| {
+        json::fail(
+            cmd,
+            EXIT_USAGE,
+            Kind::NotRoot,
+            format!("burner {cmd} needs root, like the VMs it {what} (sudo burner {cmd})"),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn needs_root(_cmd: &str, _what: &str) -> Option<ExitCode> {
+    None
+}
+
+/// an age or a time left: 42s, 4m12s, 1h03m, 2d05h
+fn short_secs(s: u64) -> String {
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        3600..86400 => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+        _ => format!("{}d{:02}h", s / 86400, s % 86400 / 3600),
+    }
+}
+
+/// 512M, or 2G when it's whole GiB
+fn short_mib(m: u32) -> String {
+    if m >= 1024 && m.is_multiple_of(1024) {
+        format!("{}G", m / 1024)
+    } else {
+        format!("{m}M")
+    }
+}
+
+/// the text table: a header, then one row per VM, columns as wide as
+/// their widest cell
+fn ls_table(vms: &[LsVm]) -> String {
+    let mut rows = vec![
+        [
+            "ID", "TAG", "IMG", "CPU", "MEM", "DISK", "NET", "STATUS", "AGE", "LEFT",
+        ]
+        .map(String::from),
+    ];
+    for v in vms {
+        rows.push([
+            v.id.clone(),
+            v.tag.clone().unwrap_or_default(),
+            v.img.clone(),
+            v.vcpus.to_string(),
+            short_mib(v.mem_mib),
+            format!("{}G", v.disk_gib),
+            v.net.clone(),
+            v.status.into(),
+            short_secs(v.age_secs),
+            v.ttl_left_secs.map_or("-".into(), short_secs),
+        ]);
+    }
+    let mut width = [0; 10];
+    for r in &rows {
+        for (w, c) in width.iter_mut().zip(r) {
+            *w = (*w).max(c.len());
+        }
+    }
+    let mut out = String::new();
+    for r in &rows {
+        let line: Vec<String> = r
+            .iter()
+            .zip(width)
+            .map(|(c, w)| format!("{c:<w$}"))
+            .collect();
+        out += line.join("  ").trim_end();
+        out += "\n";
+    }
+    out
+}
+
 pub fn ls(cfg: &Config) -> Result<ExitCode> {
+    if let Some(code) = needs_root("ls", "lists") {
+        return Ok(code);
+    }
     // no reaper timer on macOS: don't list VMs whose wrapper is long gone
     #[cfg(target_os = "macos")]
     let _ = reap(cfg);
@@ -270,34 +357,28 @@ pub fn ls(cfg: &Config) -> Result<ExitCode> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // the room left is the machine's, every user's VMs count
+    let used_mem_mib = vms.iter().map(|v| v.mem_mib).sum();
+    // through sudo it's the caller's VMs, like kill and log; root sees all
+    let caller = sudo_caller();
+    let mine: Vec<LsVm> = vms
+        .iter()
+        .filter(|v| caller.is_none_or(|c| v.owner == Some(c)))
+        .map(|v| LsVm::of(v, now, unix))
+        .collect();
     if json::on() {
         let res = LsResult {
-            vms: vms.iter().map(|v| LsVm::of(v, now, unix)).collect(),
+            vms: mine,
             max_vms: cfg.limits.max_vms,
             total_mem_mib: cfg.limits.total_mem_mib,
-            used_mem_mib: vms.iter().map(|v| v.mem_mib).sum(),
+            used_mem_mib,
         };
         return Ok(json::reply("ls", 0, Some(res)));
     }
-    if vms.is_empty() {
-        println!("no VMs running");
-    }
-    for v in vms {
-        let left = v
-            .deadline_boot
-            .map(|d| format!("{}s", (d - now).max(0.0) as u64))
-            .unwrap_or("-".into());
-        println!(
-            "{}  {:<12} {:<10} {}cpu {}M  net={}  {}  age={}s  ttl_left={left}",
-            v.id,
-            v.tag,
-            v.img,
-            v.vcpus,
-            v.mem_mib,
-            v.net,
-            v.status.name(),
-            unix.saturating_sub(v.started)
-        );
+    match (mine.is_empty(), caller) {
+        (true, Some(_)) => println!("no VMs of yours running"),
+        (true, None) => println!("no VMs running"),
+        (false, _) => print!("{}", ls_table(&mine)),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -322,43 +403,60 @@ pub struct KillArgs {
     mine: bool,
 }
 
-const KILL_USAGE: &str = "usage: burner kill burner-xxxxxxxxxxxx";
+/// with --tag or --mine: every VM it asked to stop
+#[derive(Serialize)]
+pub struct KillManyResult {
+    pub vms: Vec<KillResult>,
+}
+
+const KILL_USAGE: &str = "usage: burner kill burner-xxxxxxxxxxxx, --tag TAG or --mine";
+const TAG_USAGE: &str = "--tag must be lowercase letters, digits and dashes, max 32";
+
+/// which VMs a kill is for
+enum Pick<'a> {
+    Id(&'a str),
+    /// the caller's, with this tag or all of them
+    Mine(Option<&'a str>),
+}
 
 impl KillArgs {
-    /// a flag that parses but isn't built yet
-    fn unbuilt(&self) -> Option<&'static str> {
-        if self.tag.is_some() {
-            Some("burner kill --tag: not yet")
-        } else if self.mine {
-            Some("burner kill --mine: not yet")
-        } else {
-            None
+    fn pick(&self) -> std::result::Result<Pick<'_>, &'static str> {
+        match (&self.id, &self.tag, self.mine) {
+            (Some(id), None, false) if valid_id(id) => Ok(Pick::Id(id)),
+            (None, Some(t), false) if super::plan::valid_name(t) => Ok(Pick::Mine(Some(t))),
+            (None, Some(_), false) => Err(TAG_USAGE),
+            (None, None, true) => Ok(Pick::Mine(None)),
+            _ => Err(KILL_USAGE),
         }
     }
 
     /// burner's argv on the far end of -H. checked here: an id like
-    /// -Hother would be a flag there
+    /// -Hother would be a flag there. --tag and --mine need a 0.3.1 there
     pub fn remote_argv(&self) -> std::result::Result<Vec<String>, String> {
-        if let Some(why) = self.unbuilt() {
-            return Err(why.into());
+        let mut v = vec!["kill".to_string()];
+        match self.pick()? {
+            Pick::Id(id) => v.push(id.into()),
+            Pick::Mine(Some(t)) => v.extend(["--tag".into(), t.into()]),
+            Pick::Mine(None) => v.push("--mine".into()),
         }
-        match &self.id {
-            Some(id) if valid_id(id) => Ok(vec!["kill".into(), id.clone()]),
-            _ => Err(KILL_USAGE.into()),
-        }
+        Ok(v)
     }
 }
 
 pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
-    if let Some(why) = a.unbuilt() {
-        return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, why));
+    let pick = match a.pick() {
+        Ok(p) => p,
+        Err(why) => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, why)),
+    };
+    if let Some(code) = needs_root("kill", "stops") {
+        return Ok(code);
     }
-    let id = match &a.id {
-        Some(id) if valid_id(id) => id.as_str(),
-        _ => return Ok(json::fail("kill", EXIT_USAGE, Kind::Usage, KILL_USAGE)),
+    let id = match pick {
+        Pick::Id(id) => id,
+        Pick::Mine(tag) => return kill_mine(cfg, tag),
     };
     // through sudo you can only kill what you started. real root can kill anything
-    let caller: Option<u32> = std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok());
+    let caller = sudo_caller();
     // nothing is printed while the ledger is locked: a stalled stderr would hold it
     let refused = {
         let led = Ledger::open(&cfg.paths.state)?;
@@ -381,33 +479,109 @@ pub fn kill(cfg: &Config, a: &KillArgs) -> Result<ExitCode> {
             format!("{id}: {why}"),
         ));
     }
-    cgroup::kill(id);
-    log_line(&format!("kill {id}"));
+    let ids = [id.to_string()];
+    let gone = stop_and_wait(cfg, &ids);
     let done = |state| {
         Some(KillResult {
             id: id.into(),
             state,
         })
     };
-    // only say it's gone once its wrapper (or the reaper) has cleaned it up
-    let end = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < end {
-        // no reaper timer on macOS: a VM whose wrapper is gone is cleaned up here
-        #[cfg(target_os = "macos")]
-        let _ = reap(cfg);
-        if matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None)) {
-            if !json::on() {
-                println!("killed {id}");
-            }
-            return Ok(json::reply("kill", 0, done("gone")));
+    if gone[0] {
+        if !json::on() {
+            println!("killed {id}");
         }
-        std::thread::sleep(Duration::from_millis(200));
+        return Ok(json::reply("kill", 0, done("gone")));
     }
     json::error(
         Kind::StillStopping,
         format!("kill requested for {id}, still stopping (burner ls shows it)"),
     );
     Ok(json::reply("kill", EXIT_FAILED, done("stopping")))
+}
+
+/// kill --tag and --mine: the caller's VMs (the sudo caller's, else the
+/// uid burner runs as, which is what a VM's owner was set from). none is
+/// fine, there's nothing left to stop
+fn kill_mine(cfg: &Config, tag: Option<&str>) -> Result<ExitCode> {
+    let me: Option<u32> = caller_uid().parse().ok();
+    let ids: Vec<String> = {
+        let led = Ledger::open(&cfg.paths.state)?;
+        let mut ids = Vec::new();
+        for v in led.all() {
+            if v.owner.is_some()
+                && v.owner == me
+                && tag.is_none_or(|t| v.tag == t)
+                && led.update(&v.id, |v| v.cancel = true)?.is_some()
+            {
+                ids.push(v.id);
+            }
+        }
+        ids
+    };
+    let gone = stop_and_wait(cfg, &ids);
+    let vms: Vec<KillResult> = ids
+        .iter()
+        .zip(&gone)
+        .map(|(id, &g)| KillResult {
+            id: id.clone(),
+            state: if g { "gone" } else { "stopping" },
+        })
+        .collect();
+    if !json::on() {
+        for v in vms.iter().filter(|v| v.state == "gone") {
+            println!("killed {}", v.id);
+        }
+        if vms.is_empty() {
+            match tag {
+                Some(t) => println!("no VMs of yours tagged {t}"),
+                None => println!("no VMs of yours running"),
+            }
+        }
+    }
+    let left: Vec<&str> = vms
+        .iter()
+        .filter(|v| v.state == "stopping")
+        .map(|v| v.id.as_str())
+        .collect();
+    if left.is_empty() {
+        return Ok(json::reply("kill", 0, Some(KillManyResult { vms })));
+    }
+    json::error(
+        Kind::StillStopping,
+        format!(
+            "kill requested for {}, still stopping (burner ls shows it)",
+            left.join(", ")
+        ),
+    );
+    Ok(json::reply(
+        "kill",
+        EXIT_FAILED,
+        Some(KillManyResult { vms }),
+    ))
+}
+
+/// stop VMs whose cancel is set, and wait up to 20s for each to be gone.
+/// only gone once its wrapper (or the reaper) has cleaned it up
+fn stop_and_wait(cfg: &Config, ids: &[String]) -> Vec<bool> {
+    for id in ids {
+        cgroup::kill(id);
+        log_line(&format!("kill {id}"));
+    }
+    let mut gone = vec![false; ids.len()];
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end && !gone.iter().all(|&g| g) {
+        // no reaper timer on macOS: a VM whose wrapper is gone is cleaned up here
+        #[cfg(target_os = "macos")]
+        let _ = reap(cfg);
+        for (id, g) in ids.iter().zip(gone.iter_mut()) {
+            *g = *g || matches!(ledger::peek_strict(&cfg.paths.state, id), Ok(None));
+        }
+        if !gone.iter().all(|&g| g) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    gone
 }
 
 /// a wrapper that's still alive a minute past its VM's deadline without having
@@ -627,6 +801,78 @@ mod tests {
             serde_json::to_string(&r).unwrap(),
             r#"{"vms":[{"id":"burner-3f9a1c2b7d10","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,"disk_gib":2,"net":"web","status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,"ttl_secs":600,"ttl_left_secs":558}],"max_vms":2,"total_mem_mib":3072,"used_mem_mib":512}"#
         );
+    }
+
+    #[test]
+    fn ls_text() {
+        assert_eq!(
+            [0, 42, 60, 252, 3599, 3600, 3780, 86399, 86400, 183600].map(short_secs),
+            [
+                "0s", "42s", "1m00s", "4m12s", "59m59s", "1h00m", "1h03m", "23h59m", "1d00h",
+                "2d03h"
+            ]
+        );
+        assert_eq!(
+            [512, 1024, 1536, 3072].map(short_mib),
+            ["512M", "1G", "1536M", "3G"]
+        );
+        let vm = |id: &str, tag: Option<&str>, left: Option<u64>| LsVm {
+            id: id.into(),
+            tag: tag.map(String::from),
+            img: "alpine".into(),
+            vcpus: 1,
+            mem_mib: 512,
+            disk_gib: 2,
+            net: "none".into(),
+            status: "running",
+            owner: Some(1000),
+            started_unix: 0,
+            age_secs: 252,
+            ttl_secs: 600,
+            ttl_left_secs: left,
+        };
+        let t = ls_table(&[
+            vm("burner-3f9a1c2b7d10", Some("tests"), Some(348)),
+            vm("burner-0123456789ab", None, None),
+        ]);
+        assert_eq!(
+            t,
+            "ID                   TAG    IMG     CPU  MEM   DISK  NET   STATUS   AGE    LEFT\n\
+             burner-3f9a1c2b7d10  tests  alpine  1    512M  2G    none  running  4m12s  5m48s\n\
+             burner-0123456789ab         alpine  1    512M  2G    none  running  4m12s  -\n"
+        );
+        // what the suites match on: the id first, the tag as its own word
+        let row = t.lines().nth(1).unwrap();
+        assert!(row.starts_with("burner-") && row.contains(" tests "));
+        assert_eq!(row.split_whitespace().nth(1), Some("tests"));
+    }
+
+    #[test]
+    fn kill_picks() {
+        #[derive(clap::Parser)]
+        struct K {
+            #[command(flatten)]
+            a: KillArgs,
+        }
+        let argv = |args: &[&str]| {
+            <K as clap::Parser>::try_parse_from(std::iter::once("kill").chain(args.iter().copied()))
+                .map_err(|e| e.to_string())
+                .and_then(|k| k.a.remote_argv())
+        };
+        assert_eq!(
+            argv(&["burner-3f9a1c2b7d10"]).unwrap(),
+            ["kill", "burner-3f9a1c2b7d10"]
+        );
+        assert_eq!(
+            argv(&["--tag", "tests"]).unwrap(),
+            ["kill", "--tag", "tests"]
+        );
+        assert_eq!(argv(&["--mine"]).unwrap(), ["kill", "--mine"]);
+        assert_eq!(argv(&["--tag", "Tests_1"]).unwrap_err(), TAG_USAGE);
+        assert_eq!(argv(&["--tag=-Hx"]).unwrap_err(), TAG_USAGE);
+        assert_eq!(argv(&["../../etc"]).unwrap_err(), KILL_USAGE);
+        assert!(argv(&["--mine", "--tag", "x"]).is_err(), "one of them");
+        assert!(argv(&[]).is_err());
     }
 
     #[test]

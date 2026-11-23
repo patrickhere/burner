@@ -49,6 +49,7 @@ pub enum Kind {
     Result,
     Shell,
     Unverified,
+    NoNet,
     // reserved for -H, not written yet
     Unreachable,
     RemoteError,
@@ -251,6 +252,7 @@ mod tests {
     fn kinds_are_snake_case() {
         let k = |k: Kind| serde_json::to_string(&k).unwrap();
         assert_eq!(k(Kind::NotRoot), r#""not_root""#);
+        assert_eq!(k(Kind::NoNet), r#""no_net""#);
         assert_eq!(k(Kind::DoctorFailed), r#""doctor_failed""#);
         assert_eq!(k(Kind::RemoteError), r#""remote_error""#);
     }

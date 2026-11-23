@@ -784,7 +784,7 @@ pub(super) fn finish_run_with_id(
             if let Some(fd) = crate::run::json_target(a)
                 && let Some(line) = forward_json(&raw, host)
             {
-                json::write_fd(fd, &line);
+                json::write_fd(fd, &crate::run::json_line(a, &line));
             }
             ExitCode::from(code)
         }

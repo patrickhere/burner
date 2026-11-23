@@ -58,6 +58,8 @@ where it goes:
 
 sudo closes fds above 2, so through sudo use `--json-fd 2`. the fd is checked before a VM starts: one that isn't open for writing (stdout or stderr redirected from a file included) is exit 2, kind `usage`. `shell` refuses `--json` (the terminal has stdout) and takes `--json-fd`. with `--status-fd` on the same fd, the status line comes first and the json last.
 
+`--json-mark NONCE` writes the json as one line, `burner-NONCE status ` and then the document, the same record the far end of `-H` sends its client. NONCE is 16 to 64 letters, digits and dashes (`openssl rand -hex 16`). the VM never sees it, so a line the guest printed can't pass for burner's, even when burner was killed before it wrote its own, and with `--result tar` (where the command's output is on stderr too). the marker can come right after guest output that didn't end in a newline, so look for it anywhere in a line. it needs `--json-fd` or `--json`; over `-H` the client marks the json it writes here, and the nonce never goes to the far end.
+
 `result` is null for a usage error (bad flags, unknown image, not root, no terminal) and when burner failed before the run had an id (a config that didn't load, the reaper not running). otherwise:
 
 | field | what |
@@ -165,13 +167,16 @@ each of `runs` is a `run` above without `result`. `this_machine` is false when t
 ## the other commands
 
 ```json
-// ls
+// ls: through sudo only the caller's VMs, root sees every one. max_vms and the mem totals are the machine's
 {"vms":[{"id":"burner-3f9a1c2b7d10","tag":null,"img":"alpine","vcpus":1,"mem_mib":512,"disk_gib":2,"net":"web",
          "status":"running","owner":1000,"started_unix":1795000000,"age_secs":42,"ttl_secs":600,"ttl_left_secs":558}],
  "max_vms":2,"total_mem_mib":3072,"used_mem_mib":512}
 
 // kill: gone, or stopping with exit 1 and kind still_stopping
 {"id":"burner-3f9a1c2b7d10","state":"gone"}
+
+// kill --tag T and kill --mine: each VM of yours it stopped, the same way. none is exit 0 with an empty list
+{"vms":[{"id":"burner-3f9a1c2b7d10","state":"gone"},{"id":"burner-0c2e4f6a8b1d","state":"gone"}]}
 
 // images
 {"images":[{"name":"alpine","rootfs_bytes":96468992,"init_matches":true,
@@ -228,7 +233,7 @@ each of `runs` is a `run` above without `result`. `this_machine` is false when t
 
 errors: `usage`, `not_root`, `root`, `no_tty`, `unknown_image`, `config`, `unsupported` (not on this OS), `busy`, `no_reaper`, `no_public_ip`, `disk_full`, `sandbox`, `guest`, `input`, `timeout`, `interrupted`, `killed`, `poweroff`, `reboot`, `result_lost` (the result tar didn't get to you, or over `-H` didn't check out when it was parsed again here), `not_found`, `not_owner`, `still_stopping`, `doctor_failed`, `net`, `io` (anything else), and over `-H` `unreachable`, `remote_error`, `lost`, the same as the outcomes.
 
-warnings: `queued` (waited for a slot), `output` (output cut or dropped), `vmm` (the VMM's own log, or a VM that stopped before the job), `oom`, `image` (an image's guest init or defaults), `result` (something in the result was dropped), `shell` (how a shell ended when that wasn't a failure), `unverified` (setup: what wasn't checked).
+warnings: `queued` (waited for a slot), `output` (output cut or dropped), `vmm` (the VMM's own log, or a VM that stopped before the job), `oom`, `image` (an image's guest init or defaults), `result` (something in the result was dropped), `shell` (how a shell ended when that wasn't a failure), `unverified` (setup: what wasn't checked), `no_net` (a run without `--net` whose command exited non-zero: it had no network).
 
 ## --status-fd
 
