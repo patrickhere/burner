@@ -76,13 +76,14 @@ done
 [ -z "$remove" ] || [ -z "$allow$force" ] || die "--uninstall and --purge take no other options"
 
 # whether burner has VMs running. an older burner without --json says so in
-# its text; one that can't say at all counts as running
+# its text; one that can't say at all counts as running. SUDO_UID goes, so
+# ls lists every user's VMs and not only those of whoever ran sudo
 vms_running() {
     [ -x "$BIN" ] || return 1
-    if out=$("$BIN" ls --json 2>/dev/null); then
+    if out=$(SUDO_UID='' "$BIN" ls --json 2>/dev/null); then
         case "$out" in *'"id"'*) return 0 ;; *) return 1 ;; esac
     fi
-    if out=$("$BIN" ls 2>/dev/null); then
+    if out=$(SUDO_UID='' "$BIN" ls 2>/dev/null); then
         printf '%s\n' "$out" | grep -q '^burner-' && return 0
         return 1
     fi

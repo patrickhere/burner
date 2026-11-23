@@ -390,9 +390,9 @@ main() {
     tmp=$(as_root mktemp -d /tmp/burner-get-XXXXXX)
     trap 'as_root_n rm -rf "$tmp"; [ -n "$KEEP_LOG" ] || rm -f "$LOG"' EXIT
     # an upgrade stops for running VMs before downloading anything. install.sh
-    # checks again
+    # checks again. without SUDO_UID, ls lists every user's VMs
     if [ -z "$force" ] && [ -x /usr/local/bin/burner ] \
-        && as_root /usr/local/bin/burner ls --json 2>/dev/null | grep -q '"id"'; then
+        && as_root env SUDO_UID='' /usr/local/bin/burner ls --json 2>/dev/null | grep -q '"id"'; then
         die "VMs are running (sudo burner ls), stop them first." \
             "or upgrade anyway: curl -fsSL https://get.burnervm.dev | sh -s -- --force"
     fi
