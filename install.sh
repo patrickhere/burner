@@ -3,9 +3,14 @@
 # checkout after `cargo build --release`:
 #   sudo ./install.sh
 # downloads firecracker, the jailer and a guest kernel (pinned and checksummed),
-# creates the burner-parse user, installs the binary and systemd
-# units, then runs burner doctor. everything is downloaded and checked before
+# creates the burner-parse user, installs the binary, its completions and man
+# pages and the systemd units, then runs burner doctor. everything is downloaded and checked before
 # anything already installed is replaced. safe to run again to upgrade.
+#   --force         upgrade even with VMs running
+#   --allow USER    let USER run VMs through sudo with no password, the rule
+#                   in /etc/sudoers.d/burner. again for more users
+#   --uninstall     take it all back off, except /etc/burner and the sudo rule
+#   --purge         --uninstall, and /etc/burner and the sudo rule too
 set -eu
 umask 022
 
@@ -15,33 +20,152 @@ KERNEL_VERSION=6.1.188
 ROOT=/var/lib/burner
 BIN=/usr/local/bin/burner
 TUI=/usr/local/bin/burner-tui
+# completions and man pages, made by the binary itself
+COMP_BASH=/usr/local/share/bash-completion/completions/burner
+COMP_ZSH=/usr/local/share/zsh/site-functions/_burner
+COMP_FISH=/usr/local/share/fish/vendor_completions.d/burner.fish
+MAN1=/usr/local/share/man/man1
+
+RULE=/etc/sudoers.d/burner
+# the first line of a rule this script wrote, so it knows to keep it current
+MARK="# written by burner's install.sh"
 
 die() { echo "install: $*" >&2; exit 1; }
 
+# dirs root writes into must not be writable by anyone else: every dir above
+# the real path, so a symlink can't lead past a dir someone else can write
+root_only() { # path
+    above "$1"
+    real=$(readlink -f "$1" 2>/dev/null) || return 0
+    above "$real"
+}
+# the path and every dir above it, as written: a symlink's own dir included
+above() { # path
+    p=$1
+    while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
+        if [ -e "$p" ]; then
+            [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
+            # a symlink's own mode means nothing, its owner and its dir do
+            [ -L "$p" ] || case "$(stat -c %A "$p")" in
+                ?????w????|????????w?) die "$p is writable by others than root" ;;
+            esac
+        fi
+        p=$(dirname "$p")
+    done
+}
+
+force="" remove="" purge="" allow=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) force=1 ;;
+        --uninstall) remove=1 ;;
+        --purge) remove=1 purge=1 ;;
+        --allow)
+            [ $# -ge 2 ] || die "--allow takes a user name"
+            allow="$allow $2"
+            shift
+            ;;
+        -h | --help)
+            sed -n '2,/^set -eu/p' "$0" | sed '$d; s/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) die "unknown option $1 (--help says what it takes)" ;;
+    esac
+    shift
+done
+[ -z "$remove" ] || [ -z "$allow$force" ] || die "--uninstall and --purge take no other options"
+
+# whether burner has VMs running. an older burner without --json says so in
+# its text; one that can't say at all counts as running
+vms_running() {
+    [ -x "$BIN" ] || return 1
+    if out=$("$BIN" ls --json 2>/dev/null); then
+        case "$out" in *'"id"'*) return 0 ;; *) return 1 ;; esac
+    fi
+    if out=$("$BIN" ls 2>/dev/null); then
+        printf '%s\n' "$out" | grep -q '^burner-' && return 0
+        return 1
+    fi
+    return 0
+}
+
+# burner registers every VM in the ledger with this lock held, before it
+# starts. held, with the ledger empty, no VM can start until it's let go.
+# burner itself (reap, doctor, net) takes it too, so it's let go before those
+lock_vms() { # [what to run first when it finds VMs]
+    # paths.state, where the installed burner keeps its ledger
+    state=""
+    if [ -x "$BIN" ]; then
+        state=$("$BIN" config 2>/dev/null | sed -n '/^\[paths\]/,/^\[/s/^state = "\(.*\)"$/\1/p')
+    fi
+    state=${state:-/run/burner}
+    # made when it isn't there yet (after a reboot), so a VM that starts now
+    # meets the same lock. root's alone, as burner makes it
+    install -d -m 0700 "$state"
+    root_only "$state"
+    if [ -L "$state/ledger.lock" ] || { [ -e "$state/ledger.lock" ] && [ ! -f "$state/ledger.lock" ]; }; then
+        die "$state/ledger.lock isn't a plain file"
+    fi
+    command -v flock >/dev/null 2>&1 || die "needs flock (util-linux)"
+    (umask 077 && : >> "$state/ledger.lock")
+    exec 9<> "$state/ledger.lock"
+    flock -w 60 9 || die "couldn't lock the VM ledger, a burner command seems stuck"
+    if [ -z "$force" ] && [ -n "$(ls -A "$state/vms" 2>/dev/null)" ]; then
+        unlock_vms
+        if [ -n "${1:-}" ]; then "$1"; fi
+        die "VMs are running (sudo burner ls). stop them first, or --force to go on anyway"
+    fi
+}
+unlock_vms() {
+    exec 9>&-
+}
+services_back() {
+    systemctl enable --now burner-net.service burner-reap.timer >/dev/null 2>&1 || true
+}
+
 # sudo ./install.sh --uninstall: everything this script put on the machine, except
-# /etc/burner (your config) and the docker images tools/build-image left behind
+# /etc/burner (your config), the sudo rule and the docker images tools/build-image
+# left behind. --purge takes /etc/burner and the rule too
 uninstall() {
     [ "$(id -u)" = 0 ] || die "run as root (sudo ./install.sh --uninstall)"
-    if [ -x "$BIN" ] && "$BIN" ls --json 2>/dev/null | grep -q '"id"'; then
-        die "VMs are running (burner ls), stop them first"
+    if vms_running; then
+        die "VMs are running (sudo burner ls), stop them first"
     fi
     systemctl disable --now burner-reap.timer burner-net.service 2>/dev/null || true
     if [ -x "$BIN" ]; then "$BIN" net down >/dev/null 2>&1 || true; fi
+    # checked again with the ledger locked: nothing may start from here on. a
+    # VM that started since gets its services back and stops the uninstall.
+    # burner goes first, so nothing can start a VM once the lock file goes
+    lock_vms services_back
     rm -f /etc/systemd/system/burner-net.service /etc/systemd/system/burner-reap.service \
         /etc/systemd/system/burner-reap.timer
     systemctl daemon-reload
-    rm -rf "$ROOT" /run/burner
     rm -f "$BIN" "$TUI"
+    rm -rf "$ROOT" /run/burner
+    rm -f "$COMP_BASH" "$COMP_ZSH" "$COMP_FISH" "$MAN1/burner.1" "$MAN1"/burner-*.1
     for u in burner-parse burner; do
-        id "$u" >/dev/null 2>&1 && userdel "$u"
+        if id "$u" >/dev/null 2>&1; then userdel "$u"; fi
     done
-    echo "removed burner. left in place: /etc/burner, the ufw rule if you added one, docker images named burner-img-*"
+    if [ -n "$purge" ]; then
+        rm -rf /etc/burner
+        rm -f "$RULE" "$RULE.new" "$RULE.old"
+    fi
+    left=""
+    [ -e /etc/burner ] && left="/etc/burner (your config)"
+    [ -e "$RULE" ] && left="${left:+$left, }$RULE (the sudo rule)"
+    [ -n "$left" ] && left="$left, --purge removes them. also "
+    echo "removed burner. left in place: ${left}the ufw rule if you added one, docker images named burner-img-*," \
+        "and each user's ~/.local/state/burner"
     exit 0
 }
-[ "${1:-}" = --uninstall ] && uninstall
+[ -z "$remove" ] || uninstall
 
 [ "$(id -u)" = 0 ] || die "run as root (sudo ./install.sh)"
 [ "$(uname -s)" = Linux ] || die "burner only runs on linux"
+# an upgrade swaps firecracker, the kernel and burner itself under them
+if [ -z "$force" ] && vms_running; then
+    die "VMs are running (sudo burner ls). stop them first, or --force to upgrade anyway"
+fi
 case "$(uname -m)" in
     x86_64)
         FC_SHA=1ac8eec866dd5eea14efecf6323e22b23eea24054545338a5b34bc5bca6623cd
@@ -85,20 +209,6 @@ account() { # name
     esac
 }
 
-# dirs root writes into must not be writable by anyone else
-root_only() { # path
-    p=$1
-    while [ -n "$p" ] && [ "$p" != / ]; do
-        if [ -e "$p" ]; then
-            [ "$(stat -c %u "$p")" = 0 ] || die "$p isn't owned by root"
-            case "$(stat -c %A "$p")" in
-                ?????w????|????????w?) die "$p is writable by others than root" ;;
-            esac
-        fi
-        p=$(dirname "$p")
-    done
-}
-
 fetch() { # url sha256 dest
     curl -fsSL --proto '=https' --retry 3 -o "$3" "$1" || die "download failed: $1"
     echo "$2  $3" | sha256sum -c --quiet - || die "checksum mismatch for $1"
@@ -121,13 +231,97 @@ echo "guest kernel $KERNEL_VERSION"
 fetch "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$KERNEL_BUILD/$ARCH/vmlinux-$KERNEL_VERSION" \
     "$KERNEL_SHA" "$work/vmlinux"
 
-"$bin" config >/dev/null 2>&1 || "$bin" --help >/dev/null 2>&1 || die "$bin doesn't run here"
+# a config this burner won't take stops it here, before anything changes
+if [ -s /etc/burner/config.toml ]; then
+    "$bin" config >/dev/null || die "the new burner doesn't take /etc/burner/config.toml (above), nothing was changed"
+else
+    "$bin" --version >/dev/null 2>&1 || die "$bin doesn't run here"
+fi
+ver=$("$bin" --version | awk '{print $2}')
+
+# the SHA256SUMS get.sh checked this release against, kept for burner setup:
+# the images it fetches have to match it. it has to be this release's
+sums=""
+if [ -f "$src/SHA256SUMS" ]; then
+    grep -q "^[0-9a-f]\{64\}  burner-v$ver-$ARCH-linux\.tar\.gz\$" "$src/SHA256SUMS" \
+        || die "$src/SHA256SUMS has no burner-v$ver-$ARCH-linux.tar.gz, it's from another release"
+    sums="$src/SHA256SUMS"
+fi
+
+# who --allow names, checked before anything changes
+for u in $allow; do
+    case "$u" in
+        [a-z_]*) ;;
+        *) die "--allow $u: not a user name burner takes" ;;
+    esac
+    case "$u" in
+        *[!a-z0-9_-]*) die "--allow $u: not a user name burner takes" ;;
+    esac
+    [ "${#u}" -le 32 ] || die "--allow $u: not a user name burner takes"
+    id "$u" >/dev/null 2>&1 || die "--allow $u: no such user"
+    [ "$(id -u "$u")" != 0 ] || die "--allow $u: that's root, who needs no rule"
+done
+if [ -n "$allow" ]; then
+    command -v visudo >/dev/null 2>&1 || die "--allow needs sudo installed (visudo checks the rule)"
+fi
+
+# completions and man pages from this release's burner, so they have its flags
+extras=""
+mkdir "$work/comp"
+if "$bin" completions bash > "$work/comp/bash" 2>/dev/null && "$bin" completions zsh > "$work/comp/zsh" 2>/dev/null \
+    && "$bin" completions fish > "$work/comp/fish" 2>/dev/null && "$bin" __man "$work/man" >/dev/null 2>&1 \
+    && [ -s "$work/man/burner.1" ]; then
+    extras=1
+else
+    echo "$bin made no completions or man pages, so they're left out"
+fi
 
 # VMs run as uids from jail.uid_base, no account needed. a burner user from an
 # older install stays until --uninstall: VMs started before the upgrade run as it
 account burner-parse
 
-# 2. install: each file goes in under a temp name and is renamed into place
+# the sudo rule, written and checked now and put in place at the end. --allow
+# adds users to it, and a rule this script wrote gets this release's commands
+# on every upgrade. one written by hand is left alone, unless --allow replaces it
+rule_users=""
+if [ -f "$RULE" ] && [ "$(head -n 1 "$RULE")" = "$MARK" ]; then
+    rule_users=$(sed -n 's/^# users: //p' "$RULE")
+fi
+for u in $allow; do
+    case " $rule_users " in
+        *" $u "*) ;;
+        *) rule_users="${rule_users:+$rule_users }$u" ;;
+    esac
+done
+if [ -n "$rule_users" ] && ! command -v visudo >/dev/null 2>&1; then
+    echo "sudo isn't installed any more, so $RULE stays as it was"
+    rule_users=""
+fi
+if [ -n "$allow" ] && ! grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d/?[[:space:]]*$' /etc/sudoers 2>/dev/null; then
+    echo "warning: /etc/sudoers doesn't read /etc/sudoers.d, so the rule there does nothing until it does"
+fi
+if [ -n "$rule_users" ]; then
+    b=$BIN
+    # sudo skips files in sudoers.d with a dot in the name, so .new never counts
+    {
+        echo "$MARK"
+        echo "# and rewritten on every upgrade. sudo ./install.sh --allow USER adds a user,"
+        echo "# deleting this file takes the rule away. dist/sudoers.example says what it allows"
+        echo "# users: $rule_users"
+        echo "$(echo "$rule_users" | sed 's/ /, /g') ALL=(root) NOPASSWD: $b run *, $b shell, $b shell *, \\"
+        echo "    $b ls, $b ls *, $b kill *, $b images, $b images --json, $b log, $b log *, \\"
+        echo "    $b doctor, $b doctor --json, $b explain, $b explain --json"
+    } > "$RULE.new"
+    chmod 0440 "$RULE.new"
+    if ! visudo -cqf "$RULE.new" >/dev/null; then
+        rm -f "$RULE.new"
+        die "visudo didn't take the sudo rule, nothing in $RULE changed"
+    fi
+fi
+
+# 2. install: each file goes in under a temp name and is renamed into place,
+# with no VM able to start until the units are in
+lock_vms
 install -d -m 0755 "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images"
 for d in "$ROOT" "$ROOT/fc" "$ROOT/kernel" "$ROOT/images" /etc/burner "$(dirname "$BIN")"; do
     root_only "$d"
@@ -151,9 +345,37 @@ put 0644 "$work/vmlinux" "$ROOT/kernel/vmlinux-$KERNEL_VERSION"
 ln -sfn "vmlinux-$KERNEL_VERSION" "$ROOT/kernel/vmlinux.new"
 mv -fT "$ROOT/kernel/vmlinux.new" "$ROOT/kernel/vmlinux"
 put 0755 "$bin" "$BIN"
+if [ -n "$sums" ]; then
+    put 0644 "$sums" "$ROOT/SHA256SUMS"
+else
+    # one from an earlier install is another release's
+    rm -f "$ROOT/SHA256SUMS"
+fi
 # the tui is optional, it only runs the burner binary
 if [ -f "$tui" ] && [ -x "$tui" ]; then
     put 0755 "$tui" "$TUI"
+fi
+# every user's shell reads these, so only into dirs nobody else can write
+extra() { # src dest
+    # made when it isn't there, never chmod'ed when it is
+    [ -d "$(dirname "$2")" ] || install -d -m 0755 "$(dirname "$2")"
+    if (root_only "$(dirname "$2")") 2>/dev/null; then
+        put 0644 "$1" "$2"
+    else
+        echo "left out $2: $(dirname "$2") isn't root's alone"
+    fi
+}
+if [ -n "$extras" ]; then
+    extra "$work/comp/bash" "$COMP_BASH"
+    extra "$work/comp/zsh" "$COMP_ZSH"
+    extra "$work/comp/fish" "$COMP_FISH"
+    # a page for a command this release doesn't have goes
+    if [ -d "$MAN1" ] && (root_only "$MAN1") 2>/dev/null; then
+        rm -f "$MAN1/burner.1" "$MAN1"/burner-*.1
+    fi
+    for f in "$work/man"/burner*.1; do
+        extra "$f" "$MAN1/$(basename "$f")"
+    done
 fi
 
 install -d -m 0755 /etc/burner
@@ -170,6 +392,16 @@ fi
 for f in burner-net.service burner-reap.service burner-reap.timer; do
     put 0644 "$src/dist/$f" "/etc/systemd/system/$f"
 done
+
+if [ -n "$rule_users" ]; then
+    if [ -f "$RULE" ] && [ "$(head -n 1 "$RULE")" != "$MARK" ]; then
+        mv -f "$RULE" "$RULE.old"
+        echo "the sudo rule that was in $RULE is in $RULE.old now, sudo ignores it there"
+    fi
+    mv -f "$RULE.new" "$RULE"
+    echo "sudo rule: $rule_users can run burner VMs, $RULE"
+fi
+unlock_vms
 systemctl daemon-reload
 systemctl enable burner-net.service burner-reap.timer >/dev/null
 # reload, not restart: a restart runs net down first, which stops networked VMs
@@ -181,9 +413,18 @@ systemctl start burner-reap.timer
 echo
 "$BIN" doctor || die "burner doctor found problems, see the FAIL lines above"
 echo
-[ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: tools/build-image alpine"
-# a changed guest/init only reaches VMs through a rebuilt image
+# how to get an image: from this release when it has it, else built here
+fix() { # image
+    if [ -n "$sums" ] && grep -q "  $1-$ARCH\.ext4\.gz\$" "$sums"; then
+        echo "sudo burner setup $1"
+    else
+        echo "tools/build-image $1"
+    fi
+}
+[ -n "$(ls "$ROOT/images" 2>/dev/null)" ] || echo "no images yet: $(fix alpine)"
+# a changed guest/init only reaches VMs through a new image
 for img in "$ROOT"/images/*/; do
     [ -d "$img" ] || continue
-    cmp -s "$src/guest/init" "$img/init" || echo "rebuild $(basename "$img") to pick up the new guest init: tools/build-image $(basename "$img")"
+    name=$(basename "$img")
+    cmp -s "$src/guest/init" "$img/init" || echo "rebuild $name to pick up the new guest init: $(fix "$name")"
 done

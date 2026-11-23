@@ -1,5 +1,5 @@
 //! a terminal UI for burner. it only ever runs the burner binary ($BURNER, or
-//! burner on PATH), through sudo when not root
+//! burner on PATH), through sudo on linux when not root
 
 mod app;
 mod burner;
@@ -245,7 +245,7 @@ fn main() -> ExitCode {
         ["-h" | "--help"] => {
             println!(
                 "burner-tui [-H HOST]: pick an image and settings, start a burner shell or run, watch and kill running VMs\n\
-                 runs $BURNER (default: burner on PATH), through sudo when not root. -H (or $BURNER_HOST) drives\n\
+                 runs $BURNER (default: burner on PATH), through sudo on linux when not root. -H (or $BURNER_HOST) drives\n\
                  that host over ssh with burner -H, as you. ? inside shows the keys"
             );
             return ExitCode::SUCCESS;

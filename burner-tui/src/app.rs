@@ -348,7 +348,7 @@ mod tests {
         App::new(
             Burner {
                 bin: "burner".into(),
-                root: false,
+                sudo: true,
                 host: None,
             },
             vec!["alpine".into(), "node".into()],

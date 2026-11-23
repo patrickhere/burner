@@ -8,7 +8,9 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Burner {
     pub bin: String,
-    pub root: bool,
+    /// local commands go through sudo: on linux when not root. on macOS
+    /// burner runs VMs as you, and refuses some commands as root
+    pub sudo: bool,
     /// burner -H: the host the VMs run on, None for this machine
     pub host: Option<String>,
 }
@@ -21,11 +23,11 @@ impl Burner {
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| "burner".into());
         // SAFETY: geteuid has no preconditions and can't fail
-        let root = unsafe { libc::geteuid() } == 0;
+        let sudo = cfg!(target_os = "linux") && unsafe { libc::geteuid() } != 0;
         let host = host
             .or_else(|| std::env::var("BURNER_HOST").ok())
             .filter(|h| !h.is_empty() && h != "local");
-        Burner { bin, root, host }
+        Burner { bin, sudo, host }
     }
 
     fn with(&self, sudo: &[&str], args: &[String]) -> Vec<String> {
@@ -36,7 +38,7 @@ impl Burner {
             argv.extend(args.iter().cloned());
             return argv;
         }
-        if !self.root {
+        if self.sudo {
             argv.extend(sudo.iter().map(|s| s.to_string()));
         }
         argv.push(self.bin.clone());
@@ -361,7 +363,7 @@ mod tests {
     fn remote_hosts_never_go_through_sudo() {
         let b = Burner {
             bin: "burner".into(),
-            root: false,
+            sudo: true,
             host: Some("mini".into()),
         };
         assert_eq!(
@@ -483,7 +485,7 @@ mod tests {
     fn shell_with_defaults_only_names_the_image() {
         let b = Burner {
             bin: "burner".into(),
-            root: false,
+            sudo: true,
             host: None,
         };
         assert_eq!(
@@ -521,7 +523,7 @@ mod tests {
         };
         let b = Burner {
             bin: "/opt/burner/bin/burner".into(),
-            root: false,
+            sudo: true,
             host: None,
         };
         let argv = b.interactive(&l.args());
@@ -533,19 +535,26 @@ mod tests {
     }
 
     #[test]
-    fn root_skips_sudo() {
+    fn no_sudo_as_root_or_on_a_mac() {
         let b = Burner {
             bin: "burner".into(),
-            root: true,
+            sudo: false,
             host: None,
         };
         assert_eq!(b.quiet(&["ls", "--json"]), s(&["burner", "ls", "--json"]));
         assert_eq!(b.interactive(&s(&["shell"])), s(&["burner", "shell"]));
-        let b = Burner { root: false, ..b };
+        let b = Burner { sudo: true, ..b };
         assert_eq!(
             b.quiet(&["kill", "burner-0123456789ab"]),
             s(&["sudo", "-n", "burner", "kill", "burner-0123456789ab"])
         );
+        // what the environment decides: never sudo on a mac, root or not
+        let here = Burner::from_env(Some("local".into()));
+        if cfg!(target_os = "macos") {
+            assert!(!here.sudo);
+            assert_eq!(here.quiet(&["ls"])[0], here.bin);
+        }
+        assert_eq!(here.host, None);
     }
 
     #[test]

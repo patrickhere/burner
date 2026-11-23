@@ -32,9 +32,12 @@ jobs:
         with:
           persist-credentials: false
       - name: toolchain
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal -c clippy,rustfmt -t ${{ matrix.target }}
-          rustup default stable
+          # the one rust-toolchain.toml pins, which cargo picks up from there
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt -t "$TARGET"
           sudo apt-get install -y -qq musl-tools
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -51,6 +54,31 @@ jobs:
             f=target/${{ matrix.target }}/release/$b
             file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
             "$f" --version
+          done
+      # what install.sh and the formula install: completions for each shell
+      # and a man page per command, none of them for a hidden one
+      - name: completions and man pages
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          b="target/$TARGET/release/burner"
+          for sh in bash zsh fish elvish powershell; do
+            "$b" completions "$sh" > "$RUNNER_TEMP/comp-$sh"
+            grep -q 'burner' "$RUNNER_TEMP/comp-$sh"
+            if grep -qwE '__man|__parse-result|__read-netlog|reap' "$RUNNER_TEMP/comp-$sh"; then
+              echo "$sh completions offer a hidden command" >&2
+              exit 1
+            fi
+          done
+          bash -n "$RUNNER_TEMP/comp-bash"
+          "$b" __man "$RUNNER_TEMP/man"
+          for p in burner burner-run burner-shell burner-setup burner-completions; do
+            [ -s "$RUNNER_TEMP/man/$p.1" ] || { echo "no $p.1" >&2; exit 1; }
+          done
+          for f in "$RUNNER_TEMP/man"/*; do
+            case "${f##*/}" in
+              *__* | *reap*) echo "a man page for a hidden command: $f" >&2; exit 1 ;;
+            esac
           done
 
   # burner -H over ssh to a private sshd on localhost, with a stand-in burner
@@ -70,8 +98,8 @@ jobs:
           persist-credentials: false
       - name: toolchain and shells
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get install -y -qq zsh fish dash ksh
           else
@@ -90,5 +118,15 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck install.sh get.sh guest/init tools/build-image tools/formula-shas burner/src/remote/wrap.sh
+      # keys.asc is all apt trusts when the debian image is built, so it has to
+      # hold exactly the keys images/debian/keys.fingerprints pins
+      - name: debian keys match the pinned fingerprints
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --show-keys --with-colons images/debian/keys.asc | awk -F: '$1 == "fpr" { print $10 }' | sort > "$RUNNER_TEMP/have"
+          grep -v '^#' images/debian/keys.fingerprints | awk 'NF { print $1 }' | sort > "$RUNNER_TEMP/want"
+          [ -s "$RUNNER_TEMP/want" ]
+          diff "$RUNNER_TEMP/want" "$RUNNER_TEMP/have" || { echo "keys.asc and keys.fingerprints differ" >&2; exit 1; }
       # the suites run as a user with sudo and redirect on purpose
       - run: shellcheck -S warning -e SC2024 tests/*.sh

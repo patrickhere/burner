@@ -20,6 +20,17 @@ clean_state() {
 id=$(sudo burner run --img "$IMG" -- '. /etc/os-release; echo "$ID"' </dev/null 2>&1)
 [ "$id" = "$IMG" ] && ok "VMs boot $IMG" || bad "image" "asked for $IMG, os-release ID=$id"
 
+# 0b what every image gives a run: bash, for install scripts piped to it, and
+# the scratch disk its defaults.toml asks for (debian's is 4G, apt needs room)
+gib=$(sudo sed -n 's/^disk_gib *= *\([0-9]*\).*/\1/p' "/var/lib/burner/images/$IMG/defaults.toml" 2>/dev/null)
+gib=${gib:-2}
+out=$(sudo burner run --img "$IMG" -- 'bash -c "echo bash \${BASH_VERSINFO[0]}"; df -Pm / | awk "NR == 2 { print \$2 }"' </dev/null 2>&1); rc=$?
+mb=$(echo "$out" | tail -n 1)
+[ "$rc" = 0 ] && [[ "$(echo "$out" | head -n 1)" =~ ^bash\ [0-9]+$ ]] && [[ "$mb" =~ ^[0-9]+$ ]] \
+  && [ "$mb" -gt $((gib * 1024 * 9 / 10)) ] && [ "$mb" -le $((gib * 1024)) ] && { [ "$IMG" != debian ] || [ "$gib" = 4 ]; } \
+  && ok "$IMG has bash and a ${gib}G scratch disk" \
+  || bad "image contents" "rc=$rc gib=$gib out=$(echo "$out" | tr '\n' ' ' | tail -c 200)"
+
 # 1 exit code + live output. with --net given nothing else is said; a run
 # left without one whose command fails gets one line saying it had no network
 out=$(sudo burner run --img "$IMG" --net none -- 'echo hi; exit 7' </dev/null 2>&1); rc=$?

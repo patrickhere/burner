@@ -300,7 +300,7 @@ pub mod tests {
         let mut a = App::new(
             Burner {
                 bin: "burner".into(),
-                root: false,
+                sudo: true,
                 host: None,
             },
             vec!["alpine".into(), "node".into()],
@@ -380,7 +380,7 @@ pub mod tests {
         let a = App::new(
             Burner {
                 bin: "burner".into(),
-                root: true,
+                sudo: false,
                 host: None,
             },
             vec![],

@@ -1,8 +1,9 @@
 # a v* tag builds static binaries for x86_64 and arm, packs each with install.sh
 # and what it needs, and publishes them with SHA256SUMS and build provenance as a
-# github release. the release also carries the debian image for both arches, and
-# for burner on apple silicon a mac build for the homebrew formula, the arm guest
-# kernel and a ready alpine image. each image comes with the list of packages in it
+# github release. the release also carries the alpine and debian images for both
+# arches, what burner setup fetches, and for burner on apple silicon a mac build
+# for the homebrew formula and the arm guest kernel. each image comes with the
+# list of packages in it
 name: release
 
 on:
@@ -31,9 +32,12 @@ jobs:
         with:
           persist-credentials: false
       - name: toolchain
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
-          rustup toolchain install stable --profile minimal -c clippy,rustfmt -t ${{ matrix.target }}
-          rustup default stable
+          # the one rust-toolchain.toml pins, which cargo picks up from there
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt -t "$TARGET"
           sudo apt-get install -y -qq musl-tools
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: static binary
@@ -42,6 +46,31 @@ jobs:
             f=target/${{ matrix.target }}/release/$b
             file "$f" | tee /dev/stderr | grep -qE 'statically linked|static-pie linked'
             "$f" --version
+          done
+      # what install.sh and the formula install: completions for each shell
+      # and a man page per command, none of them for a hidden one
+      - name: completions and man pages
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          b="target/$TARGET/release/burner"
+          for sh in bash zsh fish elvish powershell; do
+            "$b" completions "$sh" > "$RUNNER_TEMP/comp-$sh"
+            grep -q 'burner' "$RUNNER_TEMP/comp-$sh"
+            if grep -qwE '__man|__parse-result|__read-netlog|reap' "$RUNNER_TEMP/comp-$sh"; then
+              echo "$sh completions offer a hidden command" >&2
+              exit 1
+            fi
+          done
+          bash -n "$RUNNER_TEMP/comp-bash"
+          "$b" __man "$RUNNER_TEMP/man"
+          for p in burner burner-run burner-shell burner-setup burner-completions; do
+            [ -s "$RUNNER_TEMP/man/$p.1" ] || { echo "no $p.1" >&2; exit 1; }
+          done
+          for f in "$RUNNER_TEMP/man"/*; do
+            case "${f##*/}" in
+              *__* | *reap*) echo "a man page for a hidden command: $f" >&2; exit 1 ;;
+            esac
           done
       - name: package
         env:
@@ -65,9 +94,9 @@ jobs:
           path: burner-*.tar.gz
           if-no-files-found: error
 
-  # the images, built with tools/build-image on each arch: debian for both,
-  # and what burner setup fetches on a mac, the kernel install.sh pins and
-  # the alpine image for aarch64
+  # the images, built with tools/build-image on each arch: alpine and debian,
+  # what burner setup fetches on linux and on a mac, and for the mac the
+  # kernel install.sh pins
   images:
     strategy:
       fail-fast: true
@@ -104,16 +133,17 @@ jobs:
             "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$build/aarch64/vmlinux-$ver"
           echo "$sha  out/vmlinux-aarch64" | sha256sum -c -
       - name: alpine image
-        if: matrix.arch == 'aarch64'
         run: |
           tools/build-image alpine
-          gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > out/alpine-aarch64.ext4.gz
+          gzip -9n -c "$BURNER_ROOT/images/alpine/rootfs.ext4" > "out/alpine-$ARCH.ext4.gz"
           # apk installs whatever the mirror has today, so this is the record of
           # what went into the image: every package and its version, which
           # build-image writes next to it
-          cp "$BURNER_ROOT/images/alpine/packages" out/alpine-aarch64.packages
-          grep -q '^apk-tools ' out/alpine-aarch64.packages || { echo "no package list from the image" >&2; exit 1; }
-          cat out/alpine-aarch64.packages
+          cp "$BURNER_ROOT/images/alpine/packages" "out/alpine-$ARCH.packages"
+          for p in apk-tools bash; do
+            grep -q "^$p " "out/alpine-$ARCH.packages" || { echo "no $p in the image's package list" >&2; exit 1; }
+          done
+          cat "out/alpine-$ARCH.packages"
       - name: debian image
         run: |
           # fails unless the packages match images/debian/lock-$ARCH
@@ -142,8 +172,8 @@ jobs:
       - name: toolchain and libkrun
         run: |
           [ "$(uname -m)" = arm64 ]
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
+            --profile minimal -c clippy,rustfmt
           # runners ship with brew's auto update off and an older formula list
           brew update --quiet
           brew install libkrun
@@ -163,6 +193,10 @@ jobs:
             "$d/$b" --version
           done
           otool -L "$d/burner" | tee /dev/stderr | grep -q "$(brew --prefix)/opt/libkrun/lib/libkrun"
+          # what the formula runs at install for the completions and man pages
+          for sh in bash zsh fish; do "$d/burner" completions "$sh" | grep -q burner; done
+          "$d/burner" __man "$RUNNER_TEMP/man" >/dev/null
+          [ -s "$RUNNER_TEMP/man/burner-run.1" ]
           COPYFILE_DISABLE=1 tar -C pkg --uid 0 --gid 0 --uname root --gname wheel -cf - "$name" | gzip -9n > "$name.tar.gz"
           tar -tzvf "$name.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -216,12 +250,12 @@ jobs:
           [ "${#tarballs[@]}" = 3 ] || { echo "expected 3 tarballs, got: ${tarballs[*]}" >&2; exit 1; }
           [ -f "burner-$TAG-aarch64-macos.tar.gz" ] || { echo "no mac build" >&2; exit 1; }
           # a missing image fails the release instead of shipping without it
-          for f in vmlinux-aarch64 {alpine-aarch64,debian-x86_64,debian-aarch64}.{ext4.gz,packages}; do
+          for f in vmlinux-aarch64 {alpine,debian}-{x86_64,aarch64}.{ext4.gz,packages}; do
             [ -f "$f" ] || { echo "no $f" >&2; exit 1; }
           done
           images=(*.ext4.gz)
-          [ "${#images[@]}" = 3 ] || { echo "expected 3 images, got: ${images[*]}" >&2; exit 1; }
-          sha256sum burner-*.tar.gz vmlinux-aarch64 *.ext4.gz *.packages > SHA256SUMS
+          [ "${#images[@]}" = 4 ] || { echo "expected 4 images, got: ${images[*]}" >&2; exit 1; }
+          sha256sum -- burner-*.tar.gz vmlinux-aarch64 *.ext4.gz *.packages > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
