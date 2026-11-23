@@ -354,13 +354,15 @@ fn live_counts(tap: &str) -> Option<Counts> {
     None
 }
 
-/// over from the first list, the rest from the second, with the over-limit
-/// attempts between them as slack. None when they aren't the same counters
+/// over from the first list, the rest from the second. None when they
+/// aren't the same counters. an attempt counted too many is one over the
+/// limit that came after the first list read over and before the second
+/// read the attempts, so it's in both differences: the smaller is the slack
 #[cfg(any(target_os = "linux", test))]
 fn combine(first: Counts, next: Counts) -> Option<Counts> {
-    (!next.reset_since(first)).then_some(Counts {
+    (!next.reset_since(first)).then(|| Counts {
         over: first.over,
-        slack: next.over - first.over,
+        slack: (next.over - first.over).min(next.tries - first.tries),
         ..next
     })
 }
@@ -931,6 +933,21 @@ mod tests {
             w.tick(at(12), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
             Health::Stalled
         );
+        // debt already owed, then over-limit attempts that came after the
+        // second list read the attempts (no attempt between the lists):
+        // no slack, so a reload doesn't take the old debt off
+        let mut w = Watch::new(t0, c(0, 0, 0), p(0));
+        w.tick(at(3), p(0), Some(c(10, 0, 0)), p(0));
+        assert_eq!(w.owed, 10);
+        let s = combine(c(10, 0, 0), c(10, 100, 0)).unwrap();
+        assert_eq!(s.slack, 0);
+        w.tick(at(6), p(0), Some(s), p(0));
+        assert_eq!(w.owed, 10);
+        assert_eq!(
+            w.tick(at(9), p(0), Some(table_gen(2, 0, 0, 0)), p(0)),
+            Health::Stalled
+        );
+        assert_eq!(w.owed, 10);
         // a reload whose new counts passed the old ones, with the same
         // counter handles inside the new table: the table handle says it's
         // new, so what it says was all sent since. a reader that keeps up...
