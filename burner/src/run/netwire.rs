@@ -224,9 +224,6 @@ struct Counts {
     /// handle out twice, and a reload makes the table again, so a new one
     /// means new counters
     table: u64,
-    /// how many too many this read may say were sent: over-limit attempts
-    /// that came between its two lists. the next read takes them back
-    slack: u64,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -297,8 +294,10 @@ impl Watch {
     /// reload makes the counters again from zero: what they say then was
     /// all sent since the last read, and what was sent between the last
     /// read and the reload is only in the counters the reload threw away.
-    /// so is the read that would have taken back the last one's slack: that
-    /// comes off what was owed before the reload, never off what's new
+    /// what was owed before it stays owed, even the bit the last read may
+    /// have said too many (over-limit attempts between its two lists) that
+    /// the next read would have taken back: which part that was can't be
+    /// told, so it fails closed
     fn tick(&mut self, now: Instant, before: Seen, counts: Option<Counts>, after: Seen) -> Health {
         let Some(c) = counts else {
             if now.duration_since(self.at) >= BLIND_AFTER {
@@ -307,7 +306,6 @@ impl Watch {
             return self.health(now);
         };
         let sent = if c.reset_since(self.counts) {
-            self.owed = (self.owed - i128::from(self.counts.slack)).max(0);
             c.sent()
         } else {
             c.sent() - self.counts.sent()
@@ -355,14 +353,11 @@ fn live_counts(tap: &str) -> Option<Counts> {
 }
 
 /// over from the first list, the rest from the second. None when they
-/// aren't the same counters. an attempt counted too many is one over the
-/// limit that came after the first list read over and before the second
-/// read the attempts, so it's in both differences: the smaller is the slack
+/// aren't the same counters
 #[cfg(any(target_os = "linux", test))]
 fn combine(first: Counts, next: Counts) -> Option<Counts> {
-    (!next.reset_since(first)).then(|| Counts {
+    (!next.reset_since(first)).then_some(Counts {
         over: first.over,
-        slack: (next.over - first.over).min(next.tries - first.tries),
         ..next
     })
 }
@@ -415,7 +410,6 @@ fn slot_counts(json: &[u8], tap: &str) -> Option<Counts> {
         up: get("up")?,
         down: get("down")?,
         table,
-        slack: 0,
     })
 }
 
@@ -853,7 +847,7 @@ mod tests {
         let out = format!("{tables}\n{counters}\n");
         let got = slot_counts(out.as_bytes(), "bn3").unwrap();
         assert_eq!((got.tries, got.over, got.up, got.down), (7, 2, 3, 4));
-        assert_eq!((got.table, got.slack), (391, 0));
+        assert_eq!(got.table, 391);
         // no table handle, a counter missing, or nothing that parses: unread
         assert!(slot_counts(counters.as_bytes(), "bn3").is_none());
         let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
@@ -872,9 +866,9 @@ mod tests {
         };
         let c = |tries: u64, over: u64, up: u64| table_gen(1, tries, over, up);
         // 100 over-limit attempts between the two lists: over from the
-        // first, so the sample says 100 more sent, never fewer, and says so
+        // first, so the sample says 100 more sent, never fewer
         let got = combine(c(100, 0, 5), c(200, 100, 5)).unwrap();
-        assert_eq!((got.tries, got.over, got.up, got.slack), (200, 0, 5, 100));
+        assert_eq!((got.tries, got.over, got.up), (200, 0, 5));
         // a reload between them: the table has another handle, even when
         // every count went up, or a count went down. read again
         assert!(combine(c(100, 0, 5), table_gen(2, 300, 50, 9)).is_none());
@@ -902,52 +896,28 @@ mod tests {
                 .all(|i| w.tick(at(3 * i), p(105), Some(c(200, 100, 5)), p(105)) == Health::Fine)
         );
         // the same with a reload before the read that would take it back:
-        // the slack comes off what was owed before, nothing stays owed
+        // which part of what's owed that was can't be told, so all of it
+        // stays owed and the VM is stopped. fail closed
         let mut w = Watch::new(t0, c(100, 0, 5), p(105));
         w.tick(at(3), p(105), Some(got), p(105));
+        w.tick(at(6), p(105), Some(table_gen(2, 0, 0, 0)), p(105));
+        assert_eq!(w.owed, 100);
         assert_eq!(
-            w.tick(at(6), p(105), Some(table_gen(2, 0, 0, 0)), p(105)),
-            Health::Fine
-        );
-        assert_eq!(w.owed, 0);
-        assert!((3..10).all(
-            |i| w.tick(at(3 * i), p(105), Some(table_gen(2, 0, 0, 0)), p(105)) == Health::Fine
-        ));
-        // slack with nothing owed, then a reload and 10 messages to a reader
-        // that's stuck: the slack doesn't cancel them, it's stopped
-        let mut w = Watch::new(t0, c(0, 0, 0), p(0));
-        let mut s = c(0, 0, 0);
-        s.slack = 100;
-        w.tick(at(3), p(0), Some(s), p(0));
-        assert_eq!(w.owed, 0);
-        assert_eq!(
-            w.tick(at(6), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
-            Health::Fine
-        );
-        assert_eq!(w.owed, 10);
-        assert_eq!(
-            w.tick(at(9), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
-            Health::Fine
-        );
-        assert_eq!(
-            w.tick(at(12), p(0), Some(table_gen(2, 10, 0, 0)), p(0)),
+            w.tick(at(9), p(105), Some(table_gen(2, 0, 0, 0)), p(105)),
             Health::Stalled
         );
-        // debt already owed, then over-limit attempts that came after the
-        // second list read the attempts (no attempt between the lists):
-        // no slack, so a reload doesn't take the old debt off
+        // debt owed by a stuck reader stays owed through a flood and a
+        // reload, and it's stopped
         let mut w = Watch::new(t0, c(0, 0, 0), p(0));
         w.tick(at(3), p(0), Some(c(10, 0, 0)), p(0));
-        assert_eq!(w.owed, 10);
-        let s = combine(c(10, 0, 0), c(10, 100, 0)).unwrap();
-        assert_eq!(s.slack, 0);
-        w.tick(at(6), p(0), Some(s), p(0));
+        let flood = combine(c(10, 100, 0), c(110, 200, 0)).unwrap();
+        w.tick(at(6), p(0), Some(flood), p(0));
+        w.tick(at(7), p(0), Some(table_gen(2, 0, 0, 0)), p(0));
         assert_eq!(w.owed, 10);
         assert_eq!(
             w.tick(at(9), p(0), Some(table_gen(2, 0, 0, 0)), p(0)),
             Health::Stalled
         );
-        assert_eq!(w.owed, 10);
         // a reload whose new counts passed the old ones, with the same
         // counter handles inside the new table: the table handle says it's
         // new, so what it says was all sent since. a reader that keeps up...
@@ -980,6 +950,15 @@ mod tests {
             w.tick(at(9), p(10), Some(table_gen(2, 200, 100, 0)), p(10)),
             Health::Stalled
         );
+        // the reload gap, deferred to 0.4: a message passed on just before
+        // a reload comes off one sent just after it, so a reader stuck on
+        // that second one isn't caught by the counters. here so it's known
+        let mut w = Watch::new(t0, c(0, 0, 0), p(0));
+        assert_eq!(
+            w.tick(at(3), p(1), Some(table_gen(2, 1, 0, 0)), p(1)),
+            Health::Fine
+        );
+        assert_eq!(w.owed, 0);
     }
 
     #[test]
