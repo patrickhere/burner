@@ -463,31 +463,40 @@ main() {
     # marked (above) until they're through, so a run that stops before then
     # (a failed fetch, ctrl-c) leaves the next one, already on this release,
     # to bring them along
-    upgraded=""
-    [ -e "$SHARE/.refresh-images" ] && upgraded=1
-    if ! as_root /usr/local/bin/burner images 2>/dev/null | grep -qx alpine \
-        || grep -q 'rebuild alpine' "$LOG" || { [ -n "$upgraded" ] && in_release alpine; }; then
-        image alpine
-    else
-        ok "alpine image" "already there"
+    # with --force and VMs still running, setup won't swap images under them.
+    # they stay marked, so running this again once they've stopped does it
+    busy=""
+    if [ -n "$force" ] && as_root env SUDO_UID='' /usr/local/bin/burner ls --json 2>/dev/null | grep -q '"id"'; then
+        busy=1
+        warn "VMs are running, so the images stay as they are. once they've stopped, run this again"
     fi
-    # an upgrade brings the debian image along when it's there. a new one only
-    # when you ask: it's ~100M, and built here it needs mmdebstrap
-    have_debian=""
-    as_root /usr/local/bin/burner images 2>/dev/null | grep -qx debian && have_debian=1
-    if [ -n "$have_debian" ] && { grep -q 'rebuild debian' "$LOG" || [ -n "$upgraded" ]; }; then
-        if in_release debian; then
-            image debian
-        elif grep -q 'rebuild debian' "$LOG"; then
-            warn "the debian image needs a rebuild for the new guest init: $SHARE/current/tools/build-image debian"
+    if [ -z "$busy" ]; then
+        upgraded=""
+        [ -e "$SHARE/.refresh-images" ] && upgraded=1
+        if ! as_root /usr/local/bin/burner images 2>/dev/null | grep -qx alpine \
+            || grep -q 'rebuild alpine' "$LOG" || { [ -n "$upgraded" ] && in_release alpine; }; then
+            image alpine
+        else
+            ok "alpine image" "already there"
         fi
-    elif [ -z "$have_debian" ]; then
-        if [ -n "$debian" ] || { in_release debian && yes_to "the debian image too, for install scripts that expect debian?"; }; then
-            image debian
+        # an upgrade brings the debian image along when it's there. a new one only
+        # when you ask: it's ~100M, and built here it needs mmdebstrap
+        have_debian=""
+        as_root /usr/local/bin/burner images 2>/dev/null | grep -qx debian && have_debian=1
+        if [ -n "$have_debian" ] && { grep -q 'rebuild debian' "$LOG" || [ -n "$upgraded" ]; }; then
+            if in_release debian; then
+                image debian
+            elif grep -q 'rebuild debian' "$LOG"; then
+                warn "the debian image needs a rebuild for the new guest init: $SHARE/current/tools/build-image debian"
+            fi
+        elif [ -z "$have_debian" ]; then
+            if [ -n "$debian" ] || { in_release debian && yes_to "the debian image too, for install scripts that expect debian?"; }; then
+                image debian
+            fi
         fi
-    fi
 
-    as_root rm -f "$SHARE/.refresh-images"
+        as_root rm -f "$SHARE/.refresh-images"
+    fi
 
     # the first sentence of each doctor warning, doctor itself has the rest
     warns=$(as_root /usr/local/bin/burner doctor 2>/dev/null | sed -n 's/^warn *[a-z]* *//p')
