@@ -199,11 +199,14 @@ pub fn teardown(cfg: &Config, id: &str, child: Option<&mut Child>) -> bool {
     }
 }
 
-/// who asked for the run: the sudo caller when there is one, else our own uid
+/// who asked for the run: the sudo caller when there is one, else our own
+/// uid. on a mac burner runs as you, so a SUDO_UID left by sudo -u is
+/// someone else's and doesn't count
 pub(super) fn caller_uid() -> String {
     std::env::var("SUDO_UID")
         .ok()
-        .filter(|u| u.bytes().all(|b| b.is_ascii_digit()) && !u.is_empty())
+        .filter(|_| cfg!(target_os = "linux"))
+        .filter(|u| u.bytes().all(|b| b.is_ascii_digit()) && u.parse::<u32>().is_ok())
         // SAFETY: getuid can't fail
         .unwrap_or_else(|| unsafe { libc::getuid() }.to_string())
 }
@@ -259,9 +262,13 @@ impl LsVm {
     }
 }
 
-/// through sudo, the caller. None for root itself, which sees every VM
+/// through sudo, the caller. None for root itself, which sees every VM, and
+/// on a mac, where every VM in the ledger is already yours
 fn sudo_caller() -> Option<u32> {
-    std::env::var("SUDO_UID").ok().and_then(|u| u.parse().ok())
+    std::env::var("SUDO_UID")
+        .ok()
+        .filter(|_| cfg!(target_os = "linux"))
+        .and_then(|u| u.parse().ok())
 }
 
 /// ls and kill read and change the ledger, which is root's on linux

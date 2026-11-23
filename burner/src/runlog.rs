@@ -528,10 +528,11 @@ fn home_of(uid: u32) -> Option<PathBuf> {
 }
 
 /// who asked for the run: the sudo caller when there is one, else our own
-/// uid. the same rule as run/admin.rs caller_uid
+/// uid. the same rule as run/admin.rs caller_uid: on a mac always our own
 fn caller_uid() -> u32 {
     std::env::var("SUDO_UID")
         .ok()
+        .filter(|_| cfg!(target_os = "linux"))
         .filter(|u| u.bytes().all(|b| b.is_ascii_digit()) && !u.is_empty())
         .and_then(|u| u.parse().ok())
         // SAFETY: getuid can't fail
