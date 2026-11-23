@@ -616,7 +616,7 @@ mod linux {
             });
         }
         notes.push(
-            "VM packets use their own routing table (29217) holding only the default route,\nso a VPN or tailnet that comes up later never applies to them."
+            "VM packets use their own routing table (29217) holding only the default route,\nso a VPN or tailnet that comes up later never applies to them, unless it\nreplaces the default route: the reaper then reloads for the new uplink."
                 .into(),
         );
         let dev = up.as_ref().map(|u| u.dev.as_str());
