@@ -343,6 +343,8 @@ pub(super) fn forward_json(reply: &str, host: &str) -> Option<String> {
     if !v.is_object() {
         return None;
     }
+    // and once parsed: a \u009b escape is a C1 control only then
+    crate::runlog::clean(&mut v);
     v["host"] = Value::String(host.into());
     Some(v.to_string() + "\n")
 }
@@ -730,14 +732,36 @@ pub(super) fn finish_run_with_id(
     id: Option<&str>,
 ) -> ExitCode {
     let code = end.code;
-    crate::runlog::keep(crate::runlog::Ended::Remote {
+    let kept = crate::runlog::keep(crate::runlog::Ended::Remote {
         host,
         args: a,
         t0,
         code,
         env: end.env.as_ref(),
         raw: end.raw.as_deref(),
+        id,
+        outcome: end.failed.as_ref().map(|(o, _)| *o),
     });
+    // the far end's summary named its own log: this one is kept here too
+    let logged = end
+        .env
+        .as_ref()
+        .and_then(|e| e.get("result"))
+        .and_then(|r| r.get("id").and_then(Value::as_str).zip(r.get("network")))
+        .filter(|(i, n)| crate::ledger::valid_id(i) && n.is_object())
+        .map(|(i, _)| i.to_string());
+    if kept
+        && !json::on()
+        && let Some(i) = logged
+        && !log_none(a)
+    {
+        let local = if std::env::var("BURNER_HOST").is_ok_and(|h| !h.is_empty()) {
+            "burner -H local log"
+        } else {
+            "burner log"
+        };
+        eprintln!("burner: kept here too, {local} {i}");
+    }
     match (end.failed, end.env, end.raw) {
         (Some((outcome, f)), _, _) => {
             if !json::on() {
@@ -766,6 +790,15 @@ pub(super) fn finish_run_with_id(
         }
         _ => ExitCode::from(EXIT_SANDBOX),
     }
+}
+
+/// the run was asked for with --log none: then nothing of the log is said
+/// here either. RunArgs keeps its log mode to itself, what goes to the far
+/// end says it
+fn log_none(a: &RunArgs) -> bool {
+    a.remote_argv("", false)
+        .windows(2)
+        .any(|w| w[0] == "--log" && w[1] == "none")
 }
 
 /// `burner -H HOST run`: stdin goes to ssh as it is, the command's output
@@ -1206,6 +1239,11 @@ mod tests {
         assert_eq!(
             forward_json(raw, "vps").unwrap(),
             "{\"a?\":[\"x?31m\",\"?\",1],\"b\":{\"c\":\"ok\\n\"},\"host\":\"vps\"}\n"
+        );
+        // escaped in the json, raw once parsed
+        assert_eq!(
+            forward_json(r#"{"a":"x\u009b31m\u007f\u0085"}"#, "vps").unwrap(),
+            "{\"a\":\"x?31m??\",\"host\":\"vps\"}\n"
         );
         // a host the far end sends twice is one, ours
         let twice = r#"{"host":"evil","exit":0,"host":null}"#;

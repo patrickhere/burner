@@ -210,7 +210,7 @@ pub fn shell(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
                     message: msg,
                 },
             );
-            return detached(a, fin);
+            return detached(a, fin, name, t0);
         }
         Ended::Interrupted => End {
             code: EXIT_INTERRUPTED,
@@ -245,7 +245,17 @@ pub fn shell(host: &Host, a: &RunArgs, config: &[String]) -> ExitCode {
 }
 
 /// a shell left with ~.: exit 0, the json says detached
-fn detached(a: &RunArgs, mut fin: record::Finished) -> ExitCode {
+fn detached(a: &RunArgs, mut fin: record::Finished, host: &str, t0: Instant) -> ExitCode {
+    crate::runlog::keep(crate::runlog::Ended::Remote {
+        host,
+        args: a,
+        t0,
+        code: fin.code,
+        env: None,
+        raw: None,
+        id: fin.id.as_deref(),
+        outcome: Some(RunOutcome::Detached),
+    });
     // leaving is how a shell ends fine: the reason is a warning, not an error
     if let Some(p) = fin.reason.take() {
         json::note_warning(p.kind, p.message, false);

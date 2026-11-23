@@ -274,7 +274,8 @@ sudo burner run --img "$IMG" --net web --ttl 3m --json-fd 2 -- "$PRE"'if command
 id=$(run_id "$T/flood.err")
 sudo burner log "$id" --json > "$T/flood.log" 2>/dev/null
 ni=$(logf "$T/flood.log" not_itemized 2>/dev/null)
-size=$(sudo stat -c %s "/run/burner/logs/$id.json" 2>/dev/null)
+# the log as the run's record keeps it, serialized the way burner caps it
+size=$(sudo burner log "$id" --json 2>/dev/null | python3 -I -c 'import json, sys; r = json.load(sys.stdin)["result"]; r.pop("run"); print(len(json.dumps(r, separators=(",", ":"), ensure_ascii=False).encode()))' 2>/dev/null)
 logq "$T/flood.log" verdict=allowed port=443 && [ "${ni:-0}" -gt 0 ] && [ "$(logf "$T/flood.log" complete)" = true ] && [ "${size:-9999999}" -le 1048576 ]
 check $? "log: a flood of 1600 blocked attempts is counted ($ni not listed), the allowed one after it is listed, log ${size}B" "ni=$ni size=$size complete=$(logf "$T/flood.log" complete 2>/dev/null)"
 
@@ -316,6 +317,111 @@ tar -tf "$T/res.tar" | grep -qx out/a && grep -q '^burner: net web: ' "$T/res.er
 check $? "summary: --result tar is still a tar, the summary on stderr" "$(tail -n 3 "$T/res.err" | tr '\n' ' ')"
 out=$(sudo burner run --img "$IMG" --net web --log none -- "$PRE"'nslookup github.com >/dev/null; echo ok' </dev/null 2>&1)
 [ "$out" = ok ] && ok "summary: --log none prints nothing of the log" || bad "summary: --log none" "$out"
+
+# the run log: every run and shell is kept, with a network or without, in
+# paths.root (it outlives a reboot), root's alone, with its command line
+# escaped and cut at 300 characters
+cmd="$PRE"'curl -s -o /dev/null https://github.com; : '"$(printf 'x%.0s' $(seq 400))"'; exit 3'
+sudo burner run --img "$IMG" --net web --tag rlog --json-fd 2 -- "$cmd" </dev/null >/dev/null 2>"$T/rl.err"
+rid=$(run_id "$T/rl.err")
+sudo burner run --img "$IMG" --json-fd 2 -- 'echo none' </dev/null >/dev/null 2>"$T/rn.err"
+nid=$(run_id "$T/rn.err")
+sudo burner log --list --json > "$T/rl.list" 2>/dev/null; lrc=$?
+sudo burner log "$rid" --json > "$T/rl.log" 2>/dev/null
+sudo burner log "$nid" --json > "$T/rn.log" 2>/dev/null
+sudo burner log "$rid" > "$T/rl.txt" 2>/dev/null
+# the owner is who sudo says ran it: you, or root when the suite runs as root
+owner=$(sudo sh -c 'echo "${SUDO_UID:-0}"')
+python3 -I - "$T" "$rid" "$nid" "$owner" "$lrc" <<'PY'
+import json, sys
+t, rid, nid, me, lrc = sys.argv[1:]
+runs = json.load(open(t + "/rl.list"))["result"]["runs"]
+ids = [r["id"] for r in runs]
+r = next(x for x in runs if x["id"] == rid)
+n = next(x for x in runs if x["id"] == nid)
+assert lrc == "0" and ids.index(nid) < ids.index(rid), ids[:5]
+assert (r["host"], r["net"], r["tag"], r["exit"], r["rc"], r["outcome"], r["owner"]) == (None, "web", "rlog", 3, 3, "exited", int(me)), r
+assert r["allowed"] >= 1 and n["net"] == "none" and n["allowed"] is None and "result" not in r, (r, n)
+log = json.load(open(t + "/rl.log"))["result"]
+assert log["id"] == rid and log["events"] and log["run"]["id"] == rid and "network" not in log["run"]["result"], log["run"]
+c = log["run"]["command"]
+assert len(c) == 300 and "\n" not in c and c.startswith("\\nmkdir -p /tmp/probe-bin"), c[:80]
+none = json.load(open(t + "/rn.log"))["result"]
+assert (none["net"], none["events"], none["complete"], none["run"]["result"]["outcome"]) == ("none", [], True, "exited"), none
+PY
+check $? "run log: a web run and a --net none run are both kept, newest first, command cut at 300" "$(head -c 300 "$T/rl.list")"
+head -n 1 "$T/rl.txt" | grep -qE "^20[0-9]{2}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}  local  $IMG  exit 3  \\\\nmkdir" \
+  && sed -n 2p "$T/rl.txt" | grep -q "^$rid: net web, "
+check $? "run log: burner log opens with date, host, image, exit and command" "$(head -n 2 "$T/rl.txt" | cut -c 1-120 | tr '\n' ' ')"
+grep -q '^burner:   reached: github.com' "$T/rl.err"
+check $? "summary: says where the run went (reached: github.com)" "$(grep '^burner: ' "$T/rl.err" | tr '\n' ' ')"
+rec=/var/lib/burner/logs/$owner/$rid.json
+[ "$(sudo stat -c '%U %a' "$rec" 2>/dev/null)" = "root 600" ] && [ "$(sudo stat -c '%U %a' "$(dirname "$rec")" 2>/dev/null)" = "root 700" ] \
+  && [ "$(sudo stat -c '%a' /var/lib/burner/logs)" = 700 ] && ! sudo test -e "/run/burner/logs/$rid.json"
+check $? "run log: kept in /var/lib/burner/logs, root only, nothing in the state dir" "rec=$rec $(sudo ls -la /var/lib/burner/logs 2>&1 | head -n 3 | tr '\n' ' ')"
+# without sudo: only your -H copies, and a line on how to see this machine's.
+# the suite can run as root itself (sudo bash tests/network.sh): then "you"
+# is the sudo caller, or nobody when there's none
+if [ "$(id -u)" = 0 ]; then me=${SUDO_UID:-0}; else me=$(id -u); fi
+[ "$me" = 0 ] && me=$(id -u nobody 2>/dev/null || echo 0)
+as_me() {
+    if [ "$(id -u)" = 0 ]; then
+        sudo -u "#$me" env -u SUDO_UID -u SUDO_GID -u SUDO_USER -u SUDO_COMMAND "$@"
+    else
+        "$@"
+    fi
+}
+# root through sudo, as the caller would be
+as_sudo() { if [ "$(id -u)" = 0 ]; then env SUDO_UID="$me" "$@"; else sudo "$@"; fi; }
+if [ "$me" = 0 ]; then
+    echo "SKIP  run log without sudo  (no user to be: no sudo caller and no nobody)"
+else
+    out=$(as_me burner log --list 2>&1); prc=$?
+    as_me burner log "$rid" >/dev/null 2>"$T/pl.err"; pirc=$?
+    [ "$prc" = 0 ] && [[ "$out" == *"sudo burner log --list"* ]] && [[ "$out" != *"$rid"* ]] && [ "$pirc" = 1 ] && grep -q "need root (sudo burner log $rid)" "$T/pl.err"
+    check $? "run log: without sudo only your -H copies, and how to see this machine's runs" "rc=$prc/$pirc $(printf '%s' "$out" | head -c 200) $(head -c 200 "$T/pl.err")"
+    # root reads the caller's -H copies only from files the caller owns, never
+    # through a link, and none that claims to be this machine's own run
+    U=$(as_me mktemp -d /tmp/burner-netu-XXXX)
+    trap 'rm -rf "$T"; sudo rm -rf "$U"' EXIT
+    as_me mkdir -p "$U/state/burner/logs" "$U/elsewhere"
+    as_me python3 -I - "$U" "$me" <<'PY'
+import json, sys
+t, me = sys.argv[1], int(sys.argv[2])
+def rec(id, host):
+    h = {"record": 1, "burner": "0.3.1", "id": id, "host": host, "shell": False, "command": "echo copy", "img": "alpine",
+         "net": "none", "tag": None, "owner": me, "started_unix": 1795000000, "secs": 1.0, "exit": 0, "outcome": "exited",
+         "rc": 0, "allowed": None, "blocked": None, "newer": "a field this burner doesn't know"}
+    return json.dumps(h) + "\n" + json.dumps({"id": id, "outcome": "exited", "rc": 0, "network": None}) + "\n"
+d = t + "/state/burner/logs/"
+open(d + "burner-aaaaaaaaaaaa@fakehost.json", "w").write(rec("burner-aaaaaaaaaaaa", "fakehost"))
+open(t + "/elsewhere/burner-bbbbbbbbbbbb@fakehost.json", "w").write(rec("burner-bbbbbbbbbbbb", "fakehost"))
+open(d + "burner-dddddddddddd.json", "w").write(rec("burner-dddddddddddd", None))
+open(t + "/rootcopy", "w").write(rec("burner-cccccccccccc", "fakehost"))
+PY
+    as_me ln -s "$U/elsewhere/burner-bbbbbbbbbbbb@fakehost.json" "$U/state/burner/logs/burner-bbbbbbbbbbbb@fakehost.json"
+    sudo install -o root -m 644 "$U/rootcopy" "$U/state/burner/logs/burner-cccccccccccc@fakehost.json"
+    as_sudo env XDG_STATE_HOME="$U/state" burner log --list --json > "$T/sl.json" 2>/dev/null
+    as_me env XDG_STATE_HOME="$U/state" burner log --list --json > "$T/ul.json" 2>/dev/null
+    as_me env XDG_STATE_HOME="$U/state" burner log burner-aaaaaaaaaaaa > "$T/ua.txt" 2>/dev/null; uarc=$?
+    python3 -I - "$T" "$rid" <<'PY'
+import json, sys
+t, rid = sys.argv[1:]
+s = json.load(open(t + "/sl.json"))["result"]
+u = json.load(open(t + "/ul.json"))["result"]
+fake = {"burner-aaaaaaaaaaaa", "burner-bbbbbbbbbbbb", "burner-cccccccccccc", "burner-dddddddddddd"}
+si = {r["id"] for r in s["runs"]}
+ui = {r["id"] for r in u["runs"]}
+assert si & fake == {"burner-aaaaaaaaaaaa"} and s["this_machine"], (si & fake, s["this_machine"])
+assert ui & fake == {"burner-aaaaaaaaaaaa"} and rid not in ui and not u["this_machine"], (ui, u["this_machine"])
+assert [r["host"] for r in s["runs"] if r["id"] == "burner-aaaaaaaaaaaa"] == ["fakehost"]
+PY
+    check $? "run log: -H copies are read only from files you own, never through a link, and never as this machine's" "$(head -c 300 "$T/sl.json")"
+    [ "$uarc" = 0 ] && head -n 1 "$T/ua.txt" | grep -q '  fakehost  alpine  exit 0  echo copy$'
+    check $? "run log: burner log ID finds a -H copy without sudo" "rc=$uarc $(head -c 200 "$T/ua.txt")"
+    sudo rm -rf "$U"
+    trap 'rm -rf "$T"' EXIT
+fi
 
 # explain names every target the suite found, or the range it's in, as blocked
 sudo burner explain --net web --json > "$T/explain.json"; erc=$?

@@ -36,7 +36,7 @@ that's linux with kvm (x86_64 or arm), or any apple silicon mac (M1 and newer, m
 - `burner run -- cmd` -> boots a VM (~2-3s), runs `cmd` in `sh`, streams the first 64K of output live and prints the rest when it ends (the serial console is slow), returns its exit code, deletes the VM
 - `--in tar` unpacks a tar from stdin into `/work`, `--in stdin` feeds stdin to the command, `--result tar` hands back whatever the command put in `/out`
 - `--net none|web|open` -> no network, http/https plus dns and ping only, or any port but mail. the LAN, the host and other VMs are always blocked
-- after a run with a network, a few lines on stderr say what it tried: connections out, what was blocked and why, dns lookups. `burner log` has every connection of the last 32 runs, see [what a VM tried](#what-a-vm-tried)
+- after a run with a network, a few lines on stderr say what it tried: connections out, what was blocked and why, dns lookups. `burner log` keeps your recent runs, with their command, exit and connections, see [what a VM tried](#what-a-vm-tried)
 - `burner explain` says what a VM could reach on this host and why the rest is blocked, `burner doctor --probe` boots a VM that tries it for real
 - `burner ls`, `burner kill ID`, `burner images`, `burner doctor`, `burner log`, `burner explain`, `burner version`. `--json` on any of them gives one JSON document instead ([docs/json.md](docs/json.md))
 
@@ -135,6 +135,7 @@ every run and shell with a network ends with a summary on stderr, after the comm
 
 ```
 burner: net web: 6 connections out, 2 blocked (5 attempts), 4 dns lookups (burner log burner-3fa1c2b7d10e for all of it)
+burner:   reached: github.com, objects.githubusercontent.com, +3 more
 burner:   blocked  tcp 192.168.1.1:22          your lan (192.168.1.0/24 on eth0)   x3
 burner:   blocked  tcp 169.254.169.254:80      cloud metadata and link-local (169.254.0.0/16)   x2
 ```
@@ -142,7 +143,12 @@ burner:   blocked  tcp 169.254.169.254:80      cloud metadata and link-local (16
 it's recorded on the host, not asked of the guest: on linux the nft table logs every new connection a VM tries, before and after the filter decides, and a reader running as `burner-parse` (hard limits, a seccomp list, no files) turns that into rows. on a mac macnet writes down each decision it makes. nothing the guest prints can add, change or hide a row. on a mac the log is only as good as macnet, though: a guest that took macnet over would control the policy and the log both, and a log marked incomplete there doesn't stop the VM.
 
 - `--log summary` is the default, `--log full` prints every row, `--log none` nothing. stdout is never touched, so `--result tar` still works. scripts that read a run's stderr whole want `--log none`, or `--json-fd`, where the log is `result.network`
-- `sudo burner log` prints your last run's log, `sudo burner log ID` a given one, `--json` all of it. the last 32 runs are kept, 1 MiB each, in the state dir, so on linux they're gone after a reboot. through sudo you only see your own runs
+- `reached` is where the allowed connections went: the name the VM looked up for each (the address when it didn't), in the order they first happened, three at most
+- every run and shell is kept, with a network or without: the command line (escaped, cut at 300 characters), image, net, tag, exit, when it ran, and its whole `--json` result, the connection log included (up to 1 MiB). it survives a reboot. on linux it's in `/var/lib/burner/logs`, root only, on a mac in `~/Library/Application Support/burner/logs`, mode 0600. the command line is kept as `ps` and the sudo log already show it, so keep secrets off it
+- each user keeps their newest 200 runs, none older than 30 days. `keep_runs` and `keep_days` under `[log]` in the config change that, 0 keeps none. for the copies of `-H` runs it's this machine's own config (`--config` goes to the far end), or the defaults when that one doesn't load
+- `sudo burner log --list` shows them newest first: id, when, host, img, net, tag, exit, connections out and blocked, and the start of the command. `--from HOST` shows one `-H` host's (`--from local` this machine's), `--limit N` how many (50 by default). `sudo burner log` prints your last run, `sudo burner log ID` a given one: a line with the date, host, image, exit and command, then its connection log. `--json` has all of it. through sudo you only see your own runs
+- a run or shell over `-H` is kept on the far end, and a copy is kept here, with the host in the host column. on a mac it goes in the same place (in `$XDG_STATE_HOME/burner/logs` when that's set), on linux in your own `~/.local/state/burner/logs` (or `$XDG_STATE_HOME`), mode 0600. a far end that says an id it used before doesn't replace that copy, the new one is kept beside it. `burner log ID` finds it here, `burner -H mini log ID` asks mini. the copy holds what the far end said, so it's that host's word
+- on linux, `burner log` without sudo shows only your `-H` copies, and says how to see this machine's runs. on a mac every run is yours, no sudo
 - a row is a destination and what happened to it: allowed and answered, refused or no answer, or blocked and why (this host, a lan or a route, a special range, net.block, your public address, another VM, a port or protocol the mode doesn't open, mail, a dns server that isn't one of net.resolvers, a rate limit). dns rows have the name and type asked and the answers
 - allowed connections are always listed. blocked attempts past 100 a second are counted, not listed, and the summary says how many. a log that may be missing something (the kernel dropped messages, counters that couldn't be read) says `incomplete`. an attempt is only called blocked when the slot's counters show the log got every message the filter sent: when one went missing, an attempt with nothing after it is `unknown`, not blocked
 - if the reader dies while the VM runs (a parser bug the guest found), the VM is stopped and the run exits 125, so nothing goes unrecorded
