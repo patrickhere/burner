@@ -155,7 +155,7 @@ uninstall() {
     [ -e /etc/burner ] && left="/etc/burner (your config)"
     [ -e "$RULE" ] && left="${left:+$left, }$RULE (the sudo rule)"
     [ -n "$left" ] && left="$left, --purge removes them. also "
-    echo "removed burner. left in place: ${left}the ufw rule if you added one, docker images named burner-img-*," \
+    echo "removed burner, its images and this machine's run log. left in place: ${left}the ufw rule if you added one, docker images named burner-img-*," \
         "and each user's ~/.local/state/burner"
     exit 0
 }

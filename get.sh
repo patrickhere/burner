@@ -201,10 +201,10 @@ linux_uninstall() {
     how=--uninstall
     if [ -n "$purge" ] && grep -q -- '--purge)' "$SHARE/current/install.sh"; then how=--purge; fi
     run "removing burner" as_root "$SHARE/current/install.sh" "$how"
-    ok "burner" "removed, with its VMs' state and images"
+    ok "burner" "removed, with its VMs' state, images and run log"
     as_root rm -rf "$SHARE"
     ok "$SHARE" "removed"
-    left=$(sed -n 's/^removed burner. left in place: //p' "$LOG" | tail -n 1)
+    left=$(sed -n 's/^removed burner.* left in place: //p' "$LOG" | tail -n 1)
     if [ -n "$purge" ] && [ "$how" = --uninstall ]; then
         as_root rm -rf /etc/burner
         as_root rm -f /etc/sudoers.d/burner /etc/sudoers.d/burner.new /etc/sudoers.d/burner.old
