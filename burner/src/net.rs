@@ -1483,6 +1483,14 @@ fn checks_asking(
         return out;
     }
     let bad = blocked.map_or_else(Vec::new, |b| blocked_resolvers(cfg, b, platform));
+    if blocked.is_none() {
+        out.push((
+            Severity::Warn,
+            "this host's addresses and routes couldn't be read, so whether VMs can reach \
+             net.resolvers wasn't checked"
+                .to_string(),
+        ));
+    }
     for (ip, why) in &bad {
         out.push((
             Severity::Fail,
@@ -2184,6 +2192,16 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(blocked_resolvers(&cfg, &b, crate::netmodel::Platform::Linux).is_empty());
+        // with no blocked ranges to check against, doctor says it didn't check
+        let unread = checks_asking(&cfg, None, crate::netmodel::Platform::Linux, |_| {
+            Err("not asked".into())
+        });
+        assert!(
+            unread
+                .iter()
+                .any(|(s, m)| *s == Severity::Warn && m.contains("wasn't checked")),
+            "{unread:?}"
+        );
         // doctor says the resolvers are behind it, as a warning like the vpn's
         let c = |b: &[Blocked]| {
             checks_asking(&cfg, Some(b), crate::netmodel::Platform::Linux, |_| {
