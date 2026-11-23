@@ -220,6 +220,12 @@ struct Counts {
     up: u64,
     /// reply messages
     down: u64,
+    /// the four counters' nft handles: new ones after a reload or when the
+    /// slot's counters were made again
+    ids: [u64; 4],
+    /// how many too many this read may say were sent: over-limit attempts
+    /// that came between its two lists. the next read takes them back
+    slack: u64,
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -229,9 +235,11 @@ impl Counts {
         i128::from(self.tries) - i128::from(self.over) + i128::from(self.up) + i128::from(self.down)
     }
 
-    /// a filter reload made them again from zero
+    /// not the counters `before` read: a filter reload or the slot's
+    /// counters made again (other handles), or one went down
     fn reset_since(self, before: Counts) -> bool {
-        self.tries < before.tries
+        self.ids != before.ids
+            || self.tries < before.tries
             || self.over < before.over
             || self.up < before.up
             || self.down < before.down
@@ -287,7 +295,8 @@ impl Watch {
     /// wasn't reading, and messages did go unrecorded. a filter
     /// reload makes the counters again from zero: what they say then was
     /// all sent since the last read, and what was sent between the last
-    /// read and the reload is only in the counters the reload threw away
+    /// read and the reload is only in the counters the reload threw away,
+    /// as is the read that would have taken back the last one's slack
     fn tick(&mut self, now: Instant, before: Seen, counts: Option<Counts>, after: Seen) -> Health {
         let Some(c) = counts else {
             if now.duration_since(self.at) >= BLIND_AFTER {
@@ -296,7 +305,7 @@ impl Watch {
             return self.health(now);
         };
         let sent = if c.reset_since(self.counts) {
-            c.sent()
+            c.sent() - i128::from(self.counts.slack)
         } else {
             c.sent() - self.counts.sent()
         };
@@ -327,8 +336,8 @@ impl Watch {
 /// only make what was sent look more, never fewer (the next read takes it
 /// back). each list is one ruleset generation, nft starts over when the
 /// ruleset changes under it, and a filter reload between the two shows as a
-/// count that went down: then it reads again, so a sample never mixes an old
-/// count with a new one
+/// count that went down or a counter with another handle: then it reads
+/// again, so a sample never mixes an old count with a new one
 #[cfg(target_os = "linux")]
 fn live_counts(tap: &str) -> Option<Counts> {
     let mut first = list_counts(tap)?;
@@ -342,12 +351,13 @@ fn live_counts(tap: &str) -> Option<Counts> {
     None
 }
 
-/// over from the first list, the rest from the second. None when a count
-/// went down between them, a reload
+/// over from the first list, the rest from the second, with the over-limit
+/// attempts between them as slack. None when they aren't the same counters
 #[cfg(any(target_os = "linux", test))]
 fn combine(first: Counts, next: Counts) -> Option<Counts> {
     (!next.reset_since(first)).then_some(Counts {
         over: first.over,
+        slack: next.over - first.over,
         ..next
     })
 }
@@ -379,18 +389,26 @@ fn list_counts(tap: &str) -> Option<Counts> {
 fn slot_counts(json: &[u8], tap: &str) -> Option<Counts> {
     let v: serde_json::Value = serde_json::from_slice(json).ok()?;
     let all = v["nftables"].as_array()?;
-    let get = |c: &str| -> Option<u64> {
+    // packets, and the handle (0 from an nft that leaves it out)
+    let get = |c: &str| -> Option<(u64, u64)> {
         let name = format!("{c}_{tap}");
-        all.iter()
+        let o = all
+            .iter()
             .filter_map(|o| o.get("counter"))
-            .find(|c| c["name"] == name.as_str() && c["table"] == crate::net::TABLE)?["packets"]
-            .as_u64()
+            .find(|c| c["name"] == name.as_str() && c["table"] == crate::net::TABLE)?;
+        Some((o["packets"].as_u64()?, o["handle"].as_u64().unwrap_or(0)))
     };
+    let (over, h0) = get("over")?;
+    let (tries, h1) = get("n")?;
+    let (up, h2) = get("up")?;
+    let (down, h3) = get("down")?;
     Some(Counts {
-        over: get("over")?,
-        tries: get("n")?,
-        up: get("up")?,
-        down: get("down")?,
+        over,
+        tries,
+        up,
+        down,
+        ids: [h0, h1, h2, h3],
+        slack: 0,
     })
 }
 
@@ -816,6 +834,7 @@ mod tests {
         ]);
         let got = slot_counts(all.as_bytes(), "bn3").unwrap();
         assert_eq!((got.tries, got.over, got.up, got.down), (7, 2, 3, 4));
+        assert_eq!((got.ids, got.slack), ([9, 9, 9, 9], 0));
         // a slot with a counter missing, or nothing that parses: unread
         let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
         assert!(slot_counts(part.as_bytes(), "bn3").is_none());
@@ -828,17 +847,21 @@ mod tests {
             tries,
             over,
             up,
-            down: 0,
+            ids: [1, 2, 3, 4],
+            ..Counts::default()
         };
         // 100 over-limit attempts between the two lists: over from the
-        // first, so the sample says 100 more sent, never fewer
+        // first, so the sample says 100 more sent, never fewer, and says so
         let got = combine(c(100, 0, 5), c(200, 100, 5)).unwrap();
-        assert_eq!((got.tries, got.over, got.up), (200, 0, 5));
-        // a reload between them: counts went down, read again
+        assert_eq!((got.tries, got.over, got.up, got.slack), (200, 0, 5, 100));
+        // a reload between them: a count went down, or the counters have
+        // other handles even when every count went up. read again
         assert!(combine(c(100, 0, 5), c(3, 0, 0)).is_none());
         assert!(combine(c(100, 0, 5), c(150, 0, 2)).is_none());
-        // the watchdog on such a sample: owed for one read, then the next
-        // read takes it back, and a quiet VM is never stopped
+        let mut other = c(300, 50, 9);
+        other.ids = [5, 6, 7, 8];
+        assert!(combine(c(100, 0, 5), other).is_none());
+
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
         let p = |passed: u64| Seen {
@@ -846,12 +869,33 @@ mod tests {
             gaps: 0,
             lost: 0,
         };
+        // the watchdog on such a sample: owed for one read, then the next
+        // read takes it back, and a quiet VM is never stopped
         let mut w = Watch::new(t0, c(100, 0, 5), p(105));
         assert_eq!(w.tick(at(3), p(105), Some(got), p(105)), Health::Fine);
         assert!(
             (2..10)
                 .all(|i| w.tick(at(3 * i), p(105), Some(c(200, 100, 5)), p(105)) == Health::Fine)
         );
+        // the same, with a reload before the read that would take it back:
+        // the slack goes with the old counters, nothing stays owed
+        let mut w = Watch::new(t0, c(100, 0, 5), p(105));
+        assert_eq!(w.tick(at(3), p(105), Some(got), p(105)), Health::Fine);
+        let mut fresh = c(0, 0, 0);
+        fresh.ids = [9, 10, 11, 12];
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(105), Some(fresh), p(105)) == Health::Fine));
+        // a reload whose new counts passed the old ones by the next read:
+        // the handles say it's new, so what it says was all sent since
+        let mut w = Watch::new(t0, c(50, 40, 0), p(10));
+        let mut new = c(200, 100, 0);
+        new.ids = [9, 10, 11, 12];
+        assert_eq!(w.tick(at(3), p(10), Some(new), p(110)), Health::Fine);
+        assert!((2..10).all(|i| w.tick(at(3 * i), p(110), Some(new), p(110)) == Health::Fine));
+        // and a reader stuck through such a reload is still caught
+        let mut w = Watch::new(t0, c(50, 40, 0), p(10));
+        assert_eq!(w.tick(at(3), p(10), Some(new), p(10)), Health::Fine);
+        assert_eq!(w.tick(at(6), p(10), Some(new), p(10)), Health::Fine);
+        assert_eq!(w.tick(at(9), p(10), Some(new), p(10)), Health::Stalled);
     }
 
     #[test]
