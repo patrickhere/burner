@@ -983,8 +983,14 @@ mod tests {
     #[test]
     fn hang_ups() {
         let mut fds = [0; 2];
-        // SAFETY: pipe(2) fills two fds
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: pipe(2) fills two fds. close-on-exec, or a child another
+        // test spawns meanwhile keeps the read end open
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            for fd in fds {
+                assert_eq!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), 0);
+            }
+        }
         assert!(!hung_up(&[fds[1]]));
         // SAFETY: closing the read end we just made
         unsafe { libc::close(fds[0]) };
