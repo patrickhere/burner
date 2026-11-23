@@ -321,18 +321,20 @@ impl Watch {
     }
 }
 
-/// linux: what one nft counter of the slot's says, None when it can't be
-/// read in COUNTER_TIMEOUT
+/// linux: the slot's log counters, all four from one `nft list`, None when
+/// they can't be read in COUNTER_TIMEOUT. one list is one snapshot (nft
+/// starts its read over when the ruleset changes under it), so a filter
+/// reload can't land between two of them and mix an old count with a new one
 #[cfg(target_os = "linux")]
-fn counter(name: &str) -> Option<u64> {
+fn live_counts(tap: &str) -> Option<Counts> {
     let out = crate::sys::run_timeout(
         std::process::Command::new("nft").args([
             "-j",
             "list",
-            "counter",
+            "counters",
+            "table",
             "inet",
             crate::net::TABLE,
-            name,
         ]),
         None,
         COUNTER_TIMEOUT,
@@ -341,28 +343,26 @@ fn counter(name: &str) -> Option<u64> {
     if !out.status.success() {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v["nftables"]
-        .as_array()?
-        .iter()
-        .find_map(|o| o.get("counter"))?["packets"]
-        .as_u64()
+    slot_counts(&out.stdout, tap)
 }
 
-/// linux: the slot's log counters. the over-limit count is read before
-/// the attempts, so traffic between the two reads can only make what was
-/// sent look more, never fewer
-#[cfg(target_os = "linux")]
-fn live_counts(tap: &str) -> Option<Counts> {
-    let over = counter(&format!("over_{tap}"))?;
-    let tries = counter(&format!("n_{tap}"))?;
-    let up = counter(&format!("up_{tap}"))?;
-    let down = counter(&format!("down_{tap}"))?;
+/// the four counters named for `tap` in an `nft -j list counters`
+#[cfg(any(target_os = "linux", test))]
+fn slot_counts(json: &[u8], tap: &str) -> Option<Counts> {
+    let v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let all = v["nftables"].as_array()?;
+    let get = |c: &str| -> Option<u64> {
+        let name = format!("{c}_{tap}");
+        all.iter()
+            .filter_map(|o| o.get("counter"))
+            .find(|c| c["name"] == name.as_str() && c["table"] == crate::net::TABLE)?["packets"]
+            .as_u64()
+    };
     Some(Counts {
-        over,
-        tries,
-        up,
-        down,
+        over: get("over")?,
+        tries: get("n")?,
+        up: get("up")?,
+        down: get("down")?,
     })
 }
 
@@ -764,6 +764,35 @@ pub(super) fn finish(cfg: &Config) -> Option<NetLog> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    #[test]
+    fn slot_counts_from_one_list() {
+        let c = |name: &str, table: &str, n: u64| {
+            format!(
+                r#"{{"counter": {{"family": "inet", "name": "{name}", "table": "{table}", "handle": 9, "packets": {n}, "bytes": 0}}}}"#
+            )
+        };
+        let list = |rows: Vec<String>| {
+            format!(
+                r#"{{"nftables": [{{"metainfo": {{"version": "1.1.3", "json_schema_version": 1}}}}, {}]}}"#,
+                rows.join(", ")
+            )
+        };
+        let all = list(vec![
+            c("n_bn1", "burner", 99),
+            c("n_bn3", "other", 98),
+            c("n_bn3", "burner", 7),
+            c("over_bn3", "burner", 2),
+            c("up_bn3", "burner", 3),
+            c("down_bn3", "burner", 4),
+        ]);
+        let got = slot_counts(all.as_bytes(), "bn3").unwrap();
+        assert_eq!((got.tries, got.over, got.up, got.down), (7, 2, 3, 4));
+        // a slot with a counter missing, or nothing that parses: unread
+        let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
+        assert!(slot_counts(part.as_bytes(), "bn3").is_none());
+        assert!(slot_counts(b"not json", "bn3").is_none());
+    }
 
     #[test]
     fn stalls() {
