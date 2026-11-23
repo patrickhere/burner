@@ -995,12 +995,6 @@ pub fn cut_to(log: &mut NetLog, cap: usize) {
 
 // ---- the old store ----
 
-/// 0.3.0 kept each run's log on its own in the state dir. the run log
-/// (runlog.rs) has it in the run's record now, so this keeps nothing
-pub fn store(_state: &std::path::Path, _log: &NetLog) -> std::io::Result<()> {
-    Ok(())
-}
-
 /// what 0.3.0 left in the state dir goes: nothing reads it any more
 pub fn clear_old(state: &std::path::Path) {
     let dir = state.join("logs");
