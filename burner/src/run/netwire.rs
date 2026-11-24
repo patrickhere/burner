@@ -362,17 +362,14 @@ fn combine(first: Counts, next: Counts) -> Option<Counts> {
     })
 }
 
-/// linux: the tables and the slot's four counters, from one nft run, which
-/// is one snapshot of the ruleset
+/// linux: burner's table, its handle and the slot's four counters, from one
+/// `nft -j list table`, which is one snapshot of the ruleset. not `nft -j -f`
+/// with two lists: nft before 1.1 prints nothing for that and exits 0
 #[cfg(target_os = "linux")]
 fn list_counts(tap: &str) -> Option<Counts> {
-    let script = format!(
-        "list tables\nlist counters table inet {}\n",
-        crate::net::TABLE
-    );
     let out = crate::sys::run_timeout(
-        std::process::Command::new("nft").args(["-j", "-f", "-"]),
-        Some(script.as_bytes()),
+        std::process::Command::new("nft").args(["-j", "list", "table", "inet", crate::net::TABLE]),
+        None,
         COUNTER_TIMEOUT,
     )
     .ok()?;
@@ -383,7 +380,7 @@ fn list_counts(tap: &str) -> Option<Counts> {
 }
 
 /// the handle of table inet burner and the four counters named for `tap`,
-/// from `nft -j` output: one json document per line, a list each. None
+/// from `nft -j` output (one json document, or several one per line). None
 /// when any of them is missing
 #[cfg(any(target_os = "linux", test))]
 fn slot_counts(json: &[u8], tap: &str) -> Option<Counts> {
@@ -843,7 +840,7 @@ mod tests {
             c("up_bn3", "burner", 3),
             c("down_bn3", "burner", 4),
         ]);
-        // nft -f with two lists writes one json document per line
+        // one document per line still reads
         let out = format!("{tables}\n{counters}\n");
         let got = slot_counts(out.as_bytes(), "bn3").unwrap();
         assert_eq!((got.tries, got.over, got.up, got.down), (7, 2, 3, 4));
@@ -853,6 +850,24 @@ mod tests {
         let part = list(vec![c("n_bn3", "burner", 7), c("over_bn3", "burner", 2)]);
         assert!(slot_counts(format!("{tables}\n{part}").as_bytes(), "bn3").is_none());
         assert!(slot_counts(b"not json", "bn3").is_none());
+    }
+
+    #[test]
+    fn counts_from_one_list_table() {
+        // what `nft -j list table inet burner` prints on nft 1.0.9 (ubuntu
+        // 24.04): one document, the table with its handle, then its counters
+        // between chains and rules
+        let t = crate::net::TABLE;
+        let out = format!(
+            r#"{{"nftables": [{{"metainfo": {{"version": "1.0.9", "release_name": "Old Doc Yak #3", "json_schema_version": 1}}}}, {{"table": {{"family": "inet", "name": "{t}", "handle": 12}}}}, {{"counter": {{"family": "inet", "name": "n_bn3", "table": "{t}", "handle": 1, "packets": 7, "bytes": 0}}}}, {{"counter": {{"family": "inet", "name": "over_bn3", "table": "{t}", "handle": 2, "packets": 2, "bytes": 0}}}}, {{"chain": {{"family": "inet", "table": "{t}", "name": "fwd", "handle": 3}}}}, {{"counter": {{"family": "inet", "name": "up_bn3", "table": "{t}", "handle": 4, "packets": 3, "bytes": 0}}}}, {{"counter": {{"family": "inet", "name": "down_bn3", "table": "{t}", "handle": 5, "packets": 4, "bytes": 0}}}}, {{"rule": {{"family": "inet", "table": "{t}", "chain": "fwd", "handle": 6, "expr": [{{"counter": "n_bn3"}}]}}}}]}}"#
+        );
+        let got = slot_counts(out.as_bytes(), "bn3").unwrap();
+        assert_eq!(
+            (got.tries, got.over, got.up, got.down, got.table),
+            (7, 2, 3, 4, 12)
+        );
+        // and what `nft -j -f` with lists printed there: nothing
+        assert!(slot_counts(b"", "bn3").is_none());
     }
 
     #[test]
